@@ -2052,8 +2052,7 @@ def cmd_uninstall(args) -> dict[str, Any]:
 
     home = Path.home().resolve()
     cwd = Path.cwd().resolve()
-    data_markers = ("credentials.json", "session.json", "config.json",
-                    "homework-seen.json")
+    data_markers = ("credentials.json", "session.json", "config.json")
 
     def refuse_reason(target: Path) -> str:
         """Why deleting ``target`` is unsafe, or "" when it is fine.

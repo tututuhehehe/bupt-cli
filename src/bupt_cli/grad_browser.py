@@ -113,6 +113,35 @@ def _first_page(port: int, timeout: float = 20.0) -> dict[str, Any]:
     raise BrowserError("Chrome 没有可用的页面 target")
 
 
+# Chrome profiles are tens to hundreds of MB each; a killed run leaves one
+# behind because no Python code gets to run. Sweep leftovers on startup so a
+# rarely-used CLI cannot quietly accumulate them.
+STALE_PROFILE_SECONDS = 6 * 3600
+
+
+def sweep_stale_profiles() -> int:
+    """Remove bupt profile dirs older than STALE_PROFILE_SECONDS."""
+    removed = 0
+    tmp = Path(tempfile.gettempdir())
+    try:
+        candidates = list(tmp.glob("bupt-grad-*"))
+    except OSError:
+        return 0
+    cutoff = time.time() - STALE_PROFILE_SECONDS
+    for candidate in candidates:
+        try:
+            if not candidate.is_dir() or candidate.is_symlink():
+                continue
+            if candidate.stat().st_mtime > cutoff:
+                continue  # possibly a concurrent run
+            shutil.rmtree(candidate, ignore_errors=True)
+            if not candidate.exists():
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 class Driver:
     """Owns one headless Chrome and one page target."""
 
@@ -121,7 +150,13 @@ class Driver:
         if not chrome:
             raise BrowserError("没有找到 Google Chrome", hint=CHROME_MISSING_HINT)
         self.port = _free_port()
+        sweep_stale_profiles()
         self.profile = Path(tempfile.mkdtemp(prefix="bupt-grad-"))
+        # Ctrl-C and uncaught exceptions still run atexit handlers; only
+        # SIGKILL escapes, which the startup sweep covers.
+        import atexit as _atexit
+
+        _atexit.register(self._remove_profile)
         args = [
             chrome,
             f"--remote-debugging-port={self.port}",
@@ -213,10 +248,17 @@ class Driver:
             ["pkill", "-f", f"remote-debugging-port={self.port}"], check=False
         )
         subprocess.run(["pkill", "-f", str(self.profile)], check=False)
+        self._remove_profile()
+
+    def _remove_profile(self) -> None:
+        """Delete the profile dir; safe to call more than once."""
+        profile = getattr(self, "profile", None)
+        if profile is None:
+            return
         for _ in range(10):
-            shutil.rmtree(self.profile, ignore_errors=True)
-            if not self.profile.exists():
-                break
+            shutil.rmtree(profile, ignore_errors=True)
+            if not profile.exists():
+                return
             time.sleep(0.1)
 
     def __enter__(self) -> "Driver":

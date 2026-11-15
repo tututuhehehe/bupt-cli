@@ -66,9 +66,6 @@ def session_path() -> Path:
     return cache_dir() / "session.json"
 
 
-def seen_state_path() -> Path:
-    return cache_dir() / "homework-seen.json"
-
 
 def _utc_iso(epoch: Optional[float]) -> Optional[str]:
     if epoch is None:

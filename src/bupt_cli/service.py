@@ -20,7 +20,6 @@ from bupt_cli._vendor.campus_api.bupt.models import (
     HomeworkItem,
 )
 from bupt_cli.errors import UsageError
-from bupt_cli.session import seen_state_path
 
 # Raw UCloud payload keys that may carry a publish/created/start timestamp,
 # in preference order. `assignmentBeginTime` is the "available from" field

@@ -263,6 +263,27 @@ bupt schedule exams           # 考试安排
 | 研究生（`role: graduate`） | `yjxt.bupt.edu.cn`，经无头 Chrome 过瑞数 | 4–8 秒 |
 | 本科生（`role: undergraduate`） | 移动教务 JSON API | 约 1 秒 |
 
+### 缓存什么时候释放
+
+`~/.bupt-cli/` 常驻 3 个文件，总共约 20 KB：
+
+| 文件 | 大小 | 说明 | 何时释放 |
+|---|---|---|---|
+| `credentials.json` | <100 B | 账号配置，不是缓存 | 只在 `uninstall`（或 `--keep-data` 时保留） |
+| `session.json` | 约 6 KB | Cookie 与 token | `bupt logout`，或 `uninstall` |
+| `timetable.json` | 约 7 KB | 课表缓存 | 会被下次抓取**覆盖**，不累积 |
+
+两个要点：
+
+1. **不会无限增长。** 三个文件都是整份覆盖写（`os.replace`），不是追加日志。用得再久，占用的也还是这 20 KB。
+2. **过期不会自动删文件，只会自动重抓。** 会话过期后命令会重新登录并覆盖 `session.json`；课表过期后下次查询重抓并覆盖 `timetable.json`。旧学期的课表不会留在磁盘上——始终只有一个学期的。
+
+唯一可能变大的是**无头 Chrome 的临时 profile**（6–150 MB），它不在 `~/.bupt-cli/` 而在系统临时目录：
+
+- 正常结束：`Driver.close()` 删除
+- Ctrl-C：`atexit` 兜底删除
+- 被 `kill -9`（或断电）：进程无法执行任何代码，会遗留；**下次运行 `bupt schedule update` 时自动清扫 6 小时前的遗留目录**
+
 ### 缓存何时失效
 
 缓存里存了 `term` 和完整的周→日期表。**今天不在缓存的任何教学周内**（学期结束、换学期）时视为过期，下次查询自动重抓；**学期中途调课或新增不会自动发现**，请用 `bupt schedule update` 手动刷新。

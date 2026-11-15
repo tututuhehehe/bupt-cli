@@ -25,7 +25,6 @@ from bupt_cli.errors import (
 )
 from bupt_cli.output import emit, emit_error
 from bupt_cli.probe import run_probe
-from bupt_cli.session import seen_state_path
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
