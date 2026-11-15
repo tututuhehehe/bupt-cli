@@ -234,11 +234,31 @@ def test_event_frames_without_id_are_ignored():
 
 
 def test_close_frame_raises_cdp_error():
+    """Assert the *close* path specifically.
+
+    A bare `pytest.raises(CDPError)` also passes if the close frame is ignored
+    and the connection later dies with "connection closed", so the message is
+    matched too.
+    """
     server = FakeChrome(frames=[server_frame(b"", opcode=0x8, fin=True)])
     try:
         cdp = CDP(server.url)
-        with pytest.raises(CDPError):
+        with pytest.raises(CDPError, match="closed by peer"):
             cdp.call("X")
+        cdp.close()
+    finally:
+        server.close()
+
+
+def test_binary_frame_is_ignored_not_grafted_onto_json():
+    """CDP is JSON-only; a binary frame must not corrupt the next text frame."""
+    good = _response({"after": "binary"})
+    server = FakeChrome(
+        frames=[server_frame(b"\x00\x01\x02", opcode=0x2, fin=True), good]
+    )
+    try:
+        cdp = CDP(server.url)
+        assert cdp.call("X") == {"after": "binary"}
         cdp.close()
     finally:
         server.close()

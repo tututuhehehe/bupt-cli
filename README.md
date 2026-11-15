@@ -180,7 +180,7 @@ bupt electricity buildings --area shahe --pretty       # 列出沙河宿舍楼
 | `bupt login [--user ID] [--password PASS] [--role ROLE] [--force] [--jwgl]` | 保存账号到 `~/.bupt-cli/credentials.json` 并登录。无参数时交互式询问。`--jwgl` 额外尝试移动教务登录（仅本科） |
 | `bupt status [--check]` | 显示缓存会话是否有效（不含机密）。`--check` 做只读在线检查 |
 | `bupt logout` | 删除 `~/.bupt-cli/session.json` |
-| `bupt courses` | 当前云邮教学空间课程 |
+| `bupt courses` | 当前云邮教学空间课程（自动翻页取全） |
 | `bupt homework list [--undone] [--course ID] [--new DAYS] [--limit N]` | 作业列表，按截止时间排序。`--undone` 只看未交；`--new N` 只看最近 N 天发布的 |
 | `bupt homework show ID [--course SITE_ID]` | 作业详情：提交状态、正文全文、附件地址 |
 | `bupt homework download ID [--dir DIR] [--force]` | 下载教师附件到 `DIR` |
@@ -189,22 +189,21 @@ bupt electricity buildings --area shahe --pretty       # 列出沙河宿舍楼
 | `bupt library search KEYWORD [--page N] [--page-size N] [--location CAMPUS] [--with-ebook]` | 图书馆书目检索（匿名）。`--with-ebook` 标出有电子版的记录 |
 | `bupt library hold RECCTRLID` | 某本书的各馆藏位置：部门、条码、索书号、状态 |
 | `bupt library ebook RECCTRLID` | 某本书的电子资源链接 |
-| `bupt schedule` | **本周课表**（读本地缓存，毫秒级）。`--today` / `--tomorrow` / `--date` / `--week N` 查指定日期；`--raw` 看原始课程网格 |
-| `bupt schedule update [--force]` | 刷新 `~/.bupt-cli/timetable.json`。研究生走浏览器（4-8 秒），本科生走移动教务 API |
+| `bupt schedule` | **本周课表**（读本地缓存，毫秒级）。`--today` / `--tomorrow` / `--date` / `--week N` 查指定日期；`--raw` 看原始课程网格；缓存过期自动重抓 |
+| `bupt schedule update` | 刷新 `~/.bupt-cli/timetable.json`。研究生走浏览器（4-8 秒），本科生走移动教务 API |
 | `bupt schedule export [--out PATH]` | 导出 iCalendar 文件（默认 `~/Downloads/bupt-<学期>.ics`），每次上课一个事件 |
 | `bupt schedule calendar` | 教学周 → 日期的对照表 |
 | `bupt schedule exams` | 考试安排（仅研究生系统，常为空） |
 | `bupt electricity [--building B] [--room R] [--floor F] [--threshold N]` | 宿舍电费余额 |
 | `bupt electricity buildings [--area shahe\|xitucheng]` | 列出某校区的宿舍楼 |
-| `bupt notices [--type notice,news,rules,ways] [--count N] [--page P]` | 门户通知。校外常不可达 |
+| `bupt notices [--type notice,news,rules,ways] [--count N]` | 门户通知。校外常不可达 |
 | `bupt notices show URL` | 通知正文 |
 | `bupt card` | 饭卡余额 |
-| `bupt schedule [--week N] [--today] [--date YYYY-MM-DD] [--source auto\|mobile\|dom]` | 本科课表（实验性，研究生不可用） |
 | `bupt exams` / `bupt scores [--semester NAME]` / `bupt classrooms [--campus 01\|04]` | 本科教务（实验性，研究生不可用） |
 | `bupt probe [--only GROUPS]` | 接口健康矩阵 |
 | `bupt update [--check] [--repo OWNER/REPO]` | 与最新 release 比对并原位替换二进制（保留 `bupt.old`） |
 | `bupt uninstall [--keep-data] [--dry-run]` | 卸载 |
-| `bupt help [command]` | `--help` 的别名，`bupt help grad` 看子命令选项 |
+| `bupt help [command]` | `--help` 的别名，例如 `bupt help schedule` |
 
 ### 会话复用与锁号安全
 
@@ -266,7 +265,7 @@ bupt schedule exams           # 考试安排
 
 ### 缓存何时失效
 
-缓存里存了 `term` 和完整的周→日期表。当**今天不在缓存的任何教学周内**（学期结束、换学期）就视为过期，下次查询会自动重抓。想手动刷新用 `bupt schedule update`，或任意查询加 `--refresh`。
+缓存里存了 `term` 和完整的周→日期表。**今天不在缓存的任何教学周内**（学期结束、换学期）时视为过期，下次查询自动重抓；**学期中途调课或新增不会自动发现**，请用 `bupt schedule update` 手动刷新。
 
 缓存文件损坏或版本不符会被忽略并重建，不会报错。
 

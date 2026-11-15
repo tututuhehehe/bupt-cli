@@ -148,6 +148,10 @@ def occurrences(
             weekday = int(course.get("weekday_index"))
         except (TypeError, ValueError):
             continue
+        # The cache file is user-editable JSON, so a stray -1 would otherwise
+        # wrap around and place the class on Sunday; 7+ would raise IndexError.
+        if not 0 <= weekday <= 6:
+            continue
         weeks = course.get("weeks") or []
         if not isinstance(weeks, list):
             continue

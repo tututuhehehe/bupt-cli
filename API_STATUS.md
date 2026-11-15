@@ -103,13 +103,13 @@ built-in default; the query output adds `"source"` for the room.
 > To test these on an undergraduate account: run `bupt login --jwgl` (no extra password needed —
 > `credentials.json`) to the **jwgl.bupt.edu.cn** password, run
 > `uv run bupt login --jwgl --force`, then `uv run bupt probe --only mobile_jwgl`
-> and `uv run bupt schedule --source mobile`.
+> and `uv run bupt schedule` (graduate system).
 
 ## DOM JWGL / legacy
 
 | System | Endpoint | Status | Evidence | Notes |
 |---|---|---|---|---|
-| JWGL DOM | `GET https://jwgl.bupt.edu.cn/jsxsd/framework/xsMain_bjyddx.jsp` | fails | TLS `UNEXPECTED_EOF_WHILE_READING` (curl 000) | Host often resets TLS from off-campus networks; `schedule --source dom` cannot work. |
+| JWGL DOM | `GET https://jwgl.bupt.edu.cn/jsxsd/framework/xsMain_bjyddx.jsp` | fails | TLS `UNEXPECTED_EOF_WHILE_READING` (curl 000) | Host often resets TLS from off-campus networks; the legacy DOM timetable cannot work. |
 | JWGL DOM | `GET https://jwgl.bupt.edu.cn/jsxsd/framework/xsdPerson.jsp` | fails | Same TLS reset | Same. |
 | JWGL DOM | `GET http://jwgl.bupt.edu.cn/` | fails | Connection timeout (curl 000) | HTTP variant also unreachable. |
 | JWGL DOM | `app.do`, `xsxk`, `kscj`, `grxx` endpoints | untested | Host unreachable | Known from reference projects; cannot reach them here. |

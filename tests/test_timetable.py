@@ -190,3 +190,40 @@ def test_fetch_undergraduate_without_dates_raises():
 
     with pytest.raises(timetable.TimetableError):
         timetable.fetch_undergraduate(Client())
+
+
+def test_occurrences_range_is_inclusive_on_both_ends():
+    """Lock the closed-interval semantics: `build_ics` relies on it.
+
+    `week_bounds` hands over the exact first and last date of the term, so an
+    open end would silently drop the last day's classes from the export. Both
+    mutations (left-open, right-open) used to leave the suite green.
+    """
+    only_day = dt.date(2026, 9, 23)  # the class on week 4
+    assert len(timetable.occurrences(ENTRY, only_day, only_day)) == 1
+
+    # Left endpoint inclusive: 09-23 .. 09-29 must keep 09-23.
+    left = timetable.occurrences(ENTRY, dt.date(2026, 9, 23), dt.date(2026, 9, 29))
+    assert [s["date"] for s in left] == ["2026-09-23"]
+
+    # Right endpoint inclusive: 09-24 .. 09-30 must keep 09-30.
+    right = timetable.occurrences(ENTRY, dt.date(2026, 9, 24), dt.date(2026, 9, 30))
+    assert [s["date"] for s in right] == ["2026-09-30"]
+
+
+def test_occurrences_ignores_out_of_range_weekdays():
+    """A hand-edited cache must not crash or wrap a class onto Sunday."""
+    entry = dict(ENTRY)
+    entry["courses"] = [
+        dict(ENTRY["courses"][0], weekday_index=-1),
+        dict(ENTRY["courses"][0], weekday_index=7),
+        dict(ENTRY["courses"][0], weekday_index=99),
+    ]
+    got = timetable.occurrences(
+        entry, dt.date(2026, 9, 20), dt.date(2026, 10, 5)
+    )
+    assert got == []
+
+
+def test_week_of_returns_none_outside_the_term():
+    assert timetable.week_of(ENTRY, dt.date(2027, 6, 1)) is None

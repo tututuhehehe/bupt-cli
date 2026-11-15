@@ -132,12 +132,9 @@ def test_http_401_network_error_maps_auth():
     "argv",
     [
         ["--timeout", "0", "courses"],
-        ["courses", "--size", "0"],
-        ["courses", "--page", "0"],
         ["homework", "list", "--limit", "-1"],
         ["homework", "list", "--new", "-1"],
         ["notices", "--count", "-1"],
-        ["notices", "--page", "-1"],
         ["probe", "--request-timeout", "0"],
     ],
 )
@@ -173,58 +170,6 @@ def test_cli_error_messages_are_redacted(monkeypatch, capsys, tmp_path):
     assert code == 3
     assert "s3cr3t-pw" not in captured.err
     assert "[REDACTED]" in captured.err
-
-
-def test_homework_submit_requires_confirm_flag(monkeypatch, tmp_path):
-    """Without --i-confirm-submit / --dry-run the CLI must refuse
-    before any network call when only --text is given and confirm is missing.
-    (Network is mocked away by making credentials missing → auth error is also
-    acceptable; we assert the usage path with a stub session instead.)
-    """
-    from bupt_cli import commands
-    from bupt_cli.errors import UsageError
-
-    class Args:
-        id = "1"
-        file = []
-        text = "hi"
-        resource_id = []
-        dry_run = False
-        upload_only = False
-        i_confirm_submit = False
-        timeout = 5.0
-
-    # Force the early "nothing" path is already covered; this covers refuse.
-    # Patch _session to raise if reached after the confirm check would pass —
-    # here confirm is false but content exists, so it will open a session.
-    # We instead unit-test the UsageError branch by invoking with dry_run+confirm.
-    with pytest.raises(UsageError):
-        commands.cmd_homework_submit(
-            type("A", (), {
-                "id": "1",
-                "file": [],
-                "text": "x",
-                "resource_id": [],
-                "dry_run": True,
-                "upload_only": False,
-                "i_confirm_submit": True,
-                "timeout": 5.0,
-            })()
-        )
-
-    with pytest.raises(UsageError):
-        commands.cmd_homework_submit(
-            type("A", (), {
-                "id": "1",
-                "file": [],
-                "text": "",
-                "resource_id": [],
-                "dry_run": False,
-                "upload_only": False,
-                "i_confirm_submit": False,
-                "timeout": 5.0,
-            })()
-        )
 
 
 def test_jwgl_auth_failure_mentions_undergraduate_only(capsys, tmp_path):

@@ -78,6 +78,10 @@ ASSET_NAME = "bupt-macos-arm64.zip"
 # `homework list --new` resolves publish times through the detail endpoint; cap
 # how many it looks up so a long course list cannot stall the command.
 PUBLISH_LOOKUP_LIMIT = 30
+# Upper bound on course-list pages fetched by `bupt courses`.
+COURSE_PAGE_LIMIT = 10
+# Page size for the same listing; the terminator compares against it.
+COURSE_PAGE_SIZE = 50
 # Seconds to wait between read-only post-submit verification attempts.
 VERIFY_WAIT_SECONDS = 5.0
 
@@ -415,7 +419,9 @@ def cmd_homework_list(args) -> dict[str, Any]:
             )
             selected = fresh
 
-        if args.limit and args.limit > 0:
+        truncated = False
+        if args.limit and args.limit > 0 and len(selected) > args.limit:
+            truncated = True
             selected = selected[: args.limit]
 
         assignments = []
@@ -449,6 +455,8 @@ def cmd_homework_list(args) -> dict[str, Any]:
                 # dated, so a "0 results" answer cannot be misread as "nothing
                 # new was assigned".
                 payload["unknown_publish_time"] = [str(i.activity_id) for i in unknown]
+            if truncated:
+                payload["truncated"] = True
             payload["note"] = _new_filter_note(
                 items_total=len(items),
                 selected_before=len(
@@ -496,7 +504,25 @@ def _new_filter_note(
             f"{unknown} 条拿不到发布时间，已排除（见 unknown_publish_time），"
             "结果可能不完整"
         )
+    if resolved and not unknown:
+        # Everything was dated; an empty result now genuinely means "nothing
+        # recent", which is worth saying so it is not read as a lookup failure.
+        parts.append("没有落在时间窗口内的作业")
     return "；".join(parts)
+
+
+def _looks_like_auth_error(exc: BaseException) -> bool:
+    """True for credential/session failures that the user must act on."""
+    from bupt_cli._vendor.campus_api import exceptions as _campus_exc
+
+    if isinstance(exc, _campus_exc.CampusAuthError):
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("401", "403", "unauthorized", "token expired",
+                       "invalid token", "login required", "not logged in")
+    )
 
 
 def _resolve_publish_times(
@@ -542,14 +568,20 @@ def _resolve_publish_times(
             continue
         if budget <= 0:
             break
-        budget -= 1
         looked_up += 1
         try:
             detail = client.get_homework_detail(activity_id)
         except Exception as exc:  # recorded below, never silent
+            # A failed lookup must not consume budget, otherwise a transient
+            # run of errors starves the assignments that would have worked.
+            # Auth failures are re-raised: reporting them as "no publish time"
+            # would tell the user to retry instead of to log in again.
+            if _looks_like_auth_error(exc):
+                raise
             failed += 1
-            last_error = f"{exc.__class__.__name__}: {exc}"
+            last_error = _short_error(exc)
             continue
+        budget -= 1
         parsed = parse_datetime(
             detail.raw.get("assignmentBeginTime")
             or detail.raw.get("publishTime")
@@ -837,10 +869,32 @@ def cmd_homework_show(args) -> dict[str, Any]:
 
 
 def cmd_courses(args) -> dict[str, Any]:
+    """Every enrolled course site, fetched across pages.
+
+    A student has a handful of current courses plus older semester sites, so
+    pagination is an implementation detail here rather than a user knob.
+    """
     session = _session(args)
     client = _client(session)
     try:
-        courses = client.get_enrolled_courses(size=args.size, page=args.page)
+        courses = []
+        seen: set[str] = set()
+        for page in range(1, COURSE_PAGE_LIMIT + 1):
+            batch = client.get_enrolled_courses(size=COURSE_PAGE_SIZE, page=page)
+            if not batch:
+                break
+            fresh = []
+            for course in batch:
+                site_id = str(getattr(course, "site_id", "") or "")
+                # Empty ids cannot be deduplicated without losing courses.
+                if site_id and site_id in seen:
+                    continue
+                if site_id:
+                    seen.add(site_id)
+                fresh.append(course)
+            courses.extend(fresh)
+            if not fresh or len(batch) < COURSE_PAGE_SIZE:
+                break
         return {
             "count": len(courses),
             "courses": [course_dict(course) for course in courses],
@@ -935,10 +989,9 @@ def _timetable_entry(args) -> tuple[dict[str, Any], bool]:
     """
     from bupt_cli import timetable
 
-    if not getattr(args, "refresh", False):
-        cached = timetable.load()
-        if cached is not None and not timetable.is_stale(cached):
-            return cached, True
+    cached = timetable.load()
+    if cached is not None and not timetable.is_stale(cached):
+        return cached, True
     return _refresh_timetable(args), False
 
 
@@ -1212,9 +1265,7 @@ def cmd_notices_list(args) -> dict[str, Any]:
     session = _session(args)
     client = _client(session)
     try:
-        notices = client.get_notices(
-            count=args.count, types=types, page=args.page
-        )
+        notices = client.get_notices(count=args.count, types=types)
         return {
             "count": len(notices),
             "types": types,

@@ -326,12 +326,7 @@ def build_parser() -> JsonArgumentParser:
         "courses",
         parents=[common],
         help="current UCloud courses",
-    )
-    courses.add_argument(
-        "--size", type=_POSITIVE_INT, default=50, help="page size"
-    )
-    courses.add_argument(
-        "--page", type=_POSITIVE_INT, default=1, help="page number"
+        description="Every enrolled course site (all pages fetched internally).",
     )
 
     schedule = sub.add_parser(
@@ -358,12 +353,6 @@ def build_parser() -> JsonArgumentParser:
         action="store_true",
         help="dump the cached course grid instead of resolved dates",
     )
-    schedule.add_argument(
-        "--refresh",
-        action="store_true",
-        help="ignore the cache and fetch again (slower; needs Chrome for "
-        "graduate accounts)",
-    )
     schedule_sub = schedule.add_subparsers(
         dest="schedule_command",
         title="schedule commands",
@@ -377,9 +366,6 @@ def build_parser() -> JsonArgumentParser:
         description="Fetch the whole term again and rewrite "
         "~/.bupt-cli/timetable.json. Graduate accounts drive a headless "
         "Chrome (4-8s); undergraduate accounts call the mobile JWGL API.",
-    )
-    sched_update.add_argument(
-        "--force", action="store_true", help="fetch even if the cache looks fresh"
     )
     sched_export = schedule_sub.add_parser(
         "export",
@@ -434,12 +420,6 @@ def build_parser() -> JsonArgumentParser:
         type=_NON_NEGATIVE_INT,
         default=10,
         help="max items (default: 10)",
-    )
-    notices.add_argument(
-        "--page",
-        type=_NON_NEGATIVE_INT,
-        default=0,
-        help="page index (default: 0)",
     )
     notices_sub = notices.add_subparsers(
         dest="notices_command",
@@ -768,7 +748,7 @@ def _network_hint(message: str) -> str:
     if "jwgl.bupt.edu.cn" in lower or "jwxt.bupt.edu.cn" in lower:
         return (
             "the legacy JWGL host is often unreachable off-campus (TLS reset/timeout); "
-            "try `bupt schedule --source mobile` or see API_STATUS.md"
+            "use `bupt schedule` (graduate system, works off-campus) or see API_STATUS.md"
         )
     return ""
 

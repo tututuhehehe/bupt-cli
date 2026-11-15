@@ -318,3 +318,58 @@ def test_dry_run_and_confirm_are_mutually_exclusive(gate, tmp_path):
             _submit_args(tmp_path, dry_run=True, i_confirm_submit=True)
         )
     assert gate.uploads == []
+
+
+def test_new_says_so_when_nothing_falls_in_the_window(monkeypatch):
+    """All dated, all outside the window: the empty result must be explained.
+
+    Otherwise `count: 0` reads the same as "I could not determine anything".
+    """
+    items = [make_item(1, published_days_ago=90, deadline_days=5)]
+    client = FakeClient({"hw1": 90})
+
+    payload = run_list(monkeypatch, items, client, new=7)
+
+    assert payload["count"] == 0
+    assert "没有落在时间窗口内" in payload["note"]
+    assert payload["publish_time"]["unknown"] == 0
+
+
+def test_failed_lookups_do_not_consume_the_budget(monkeypatch):
+    """A transient run of errors must not starve the assignments that work."""
+    # 40 assignments; the 30 newest-deadline ones all fail, older ones are dated.
+    items = [make_item(i, published_days_ago=None, deadline_days=i) for i in range(40)]
+    client = FakeClient({f"hw{i}": 1 for i in range(40)})
+    client.fail_ids = {f"hw{i}" for i in range(10, 40)}
+
+    payload = run_list(monkeypatch, items, client, new=7)
+
+    # The 10 newest-deadline ones failed; the rest still got looked up and the
+    # recent ones are returned.
+    assert payload["publish_time"]["failed"] == 30
+    assert payload["publish_time"]["unknown"] == 30
+    assert payload["count"] == 10
+
+
+def test_auth_failure_is_raised_not_reported_as_missing_publish_time(monkeypatch):
+    """An expired token must surface as an auth error, not as "no publish time"."""
+
+    class AuthClient(FakeClient):
+        def get_homework_detail(self, activity_id):
+            raise PermissionError("401 Unauthorized: token expired")
+
+    items = [make_item(1, published_days_ago=None, deadline_days=5)]
+    monkeypatch.setattr(commands, "_session", lambda args: SimpleNamespace())
+    monkeypatch.setattr(commands, "_client", lambda session: AuthClient({}))
+    monkeypatch.setattr(commands, "_persist", lambda session: None)
+    monkeypatch.setattr(
+        commands, "_load_assignments", lambda client, args: (items, "all")
+    )
+    monkeypatch.setattr(
+        commands, "_enrich_undone_courses", lambda client, items, args: None
+    )
+
+    with pytest.raises(PermissionError):
+        commands.cmd_homework_list(
+            SimpleNamespace(course=None, undone=False, new=7, limit=0)
+        )

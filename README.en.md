@@ -225,12 +225,11 @@ indentation. Errors go to stderr as
 | `bupt homework download ID [--dir DIR] [--force]` | Download teacher attachments into `DIR` (CDN URLs; no Blade-Auth). |
 | `bupt homework submit ID [--file PATH]… [--text …] [--resource-id ID]… [--dry-run | --i-confirm-submit] [--no-verify]` | Upload and/or submit. **Never auto-submits**: `--dry-run` plans only; real submit needs `--i-confirm-submit`, and without it nothing is even uploaded. A real submit is then verified with read-only calls (skip with `--no-verify`). |
 | `bupt homework verify ID [--resource-id RID]… [--text TEXT]` | Read-only check that a submission is visible upstream (submit-view + student list). Never submits and never calls a write endpoint. |
-| `bupt courses` | Current UCloud course sites. |
-| `bupt schedule [--week N] [--today] [--date YYYY-MM-DD] [--source auto\|mobile\|dom]` | Timetable. Mobile JWGL first, DOM fallback. Experimental — unavailable with the current credentials/network. |
+| `bupt courses` | Current UCloud course sites (all pages fetched internally). |
 | `bupt exams` | Exam weeks and arrangements from mobile JWGL. Experimental. |
 | `bupt scores [--semester NAME]` | Transcript/GPA from mobile JWGL (`termGPA`). Experimental. |
 | `bupt classrooms [--campus 01\|04]` | Real-time empty classrooms from mobile JWGL. Experimental. |
-| `bupt notices [--type notice,news,rules,ways] [--count N] [--page P]` | Portal notices. Experimental; portal is often unreachable from off-campus networks. |
+| `bupt notices [--type notice,news,rules,ways] [--count N]` | Portal notices. Experimental; portal is often unreachable from off-campus networks. |
 | `bupt notices show URL [--max-chars N]` | Portal notice detail. |
 | `bupt card` | Campus-card balance widget from the portal. Experimental. |
 | `bupt electricity [--building B] [--room R] [--floor F] [--threshold N]` | Dorm electricity balance. With no arguments it uses the built-in placeholder dorm (西土城 学一楼 101); set your own dorm via flag > `BUPT_DORM_*` env > `config.json` > placeholder. Output adds `"source"`. |
@@ -240,13 +239,13 @@ indentation. Errors go to stderr as
 | `bupt library hold RECCTRLID` | Per-copy holdings for one record: department, barcode, call number, status. |
 | `bupt library ebook RECCTRLID` | Electronic-resource links for one record (coverage is skewed to English titles). |
 | `bupt schedule` | **This week's timetable**, served from a local cache. `--today` / `--tomorrow` / `--date` / `--week N` for one day or week; `--raw` dumps the grid. Works for both account types. |
-| `bupt schedule update [--force]` | Refresh `~/.bupt-cli/timetable.json` (headless Chrome for graduate accounts, mobile JWGL API for undergraduates). |
+| `bupt schedule update` | Refresh `~/.bupt-cli/timetable.json` (headless Chrome for graduate accounts, mobile JWGL API for undergraduates). |
 | `bupt schedule export [--out PATH]` | Export the timetable as an iCalendar file (default `~/Downloads/bupt-<term>.ics`), one event per class occurrence. |
 | `bupt schedule calendar` | Teaching-week -> date table. |
 | `bupt schedule exams` | Exam arrangements (graduate system; often empty). |
 | `bupt update [--check] [--repo OWNER/REPO]` | Compare with the latest GitHub release and replace the installed binary in place (keeping `bupt.old`). |
 | `bupt uninstall [--keep-data] [--dry-run]` | Remove bupt binaries found on PATH and `~/.bupt-cli`. `--keep-data` keeps your credentials; `--dry-run` only lists what would go. |
-| `bupt help [command]` | Alias for `--help`; `bupt help grad` shows a subcommand's options. |
+| `bupt help [command]` | Alias for `--help`, e.g. `bupt help schedule`. |
 
 ### Session reuse and lockout safety
 

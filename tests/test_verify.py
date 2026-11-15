@@ -659,11 +659,20 @@ def test_verify_with_resource_id_still_compares_exactly(monkeypatch, capsys, sle
 
 
 def test_homework_show_reports_status(monkeypatch, capsys):
-    """`show` must expose the same status vocabulary as `list`."""
+    """`show` must expose the same status vocabulary as `list`.
+
+    The submit-view carries attachment ids, so `show` resolves their preview
+    URLs. That resolver is patched here — otherwise this test reaches the real
+    apiucloud.bupt.edu.cn, contradicting the module docstring and making the
+    suite depend on the network.
+    """
     calls = []
     client = FakeClient(_detail(), _record(), calls)
     _install(monkeypatch, client)
     _install_view_sequence(monkeypatch, [_view()])
+    monkeypatch.setattr(
+        commands, "resolve_attachment_urls", lambda attachments, *a, **k: attachments
+    )
 
     code = cli.main(["homework", "show", ASSIGNMENT_ID])
     payload = json.loads(capsys.readouterr().out)
