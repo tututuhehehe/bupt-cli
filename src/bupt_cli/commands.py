@@ -814,7 +814,25 @@ def _schedule_course(course, dates: list[str]) -> dict[str, Any]:
     }
 
 
+def _require_undergraduate(command: str) -> None:
+    """Refuse the undergraduate-JWGL commands early for graduate accounts.
+
+    Otherwise the command spends a real login attempt only to surface
+    "invalid username or password", which reads like a wrong password and
+    invites retries that can lock the account. The registrar system has no
+    record of a graduate id at all.
+    """
+    credentials = load_credentials(required=False)
+    if credentials.role == "graduate":
+        raise UsageError(
+            f"`bupt {command}` 走的是本科教务系统，研究生学号在那套系统里不存在",
+            hint="改用 `bupt grad schedule` / `bupt grad calendar` / `bupt grad ics`；"
+            "若身份登记有误，重新执行 `bupt login --role undergraduate`",
+        )
+
+
 def cmd_schedule(args) -> dict[str, Any]:
+    _require_undergraduate("schedule")
     target_date: Optional[dt.date] = None
     if args.today:
         target_date = dt.date.today()
@@ -845,6 +863,7 @@ def cmd_schedule(args) -> dict[str, Any]:
 
 
 def cmd_scores(args) -> dict[str, Any]:
+    _require_undergraduate("scores")
     session = _session(args)
     client = _client(session)
     try:
@@ -879,6 +898,7 @@ def cmd_scores(args) -> dict[str, Any]:
 
 
 def cmd_exams(args) -> dict[str, Any]:
+    _require_undergraduate("exams")
     session = _session(args)
     try:
         service = session.mobile_service(allow_login=False)
@@ -896,6 +916,7 @@ def cmd_exams(args) -> dict[str, Any]:
 
 
 def cmd_classrooms(args) -> dict[str, Any]:
+    _require_undergraduate("classrooms")
     campus = args.campus
     if campus not in {"01", "04"}:
         raise UsageError("--campus must be 01 (西土城) or 04 (沙河)")

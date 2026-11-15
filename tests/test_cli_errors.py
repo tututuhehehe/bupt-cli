@@ -621,3 +621,55 @@ def test_update_replaces_a_frozen_binary(monkeypatch, tmp_path):
     assert (tmp_path / "bupt.old").read_bytes() == b"OLD-BINARY"
     assert not (tmp_path / "bupt.new").exists()
     assert "已更新到" in result["note"]
+
+
+@pytest.mark.parametrize("command", ["schedule", "exams", "scores", "classrooms"])
+def test_undergraduate_jwgl_commands_refuse_graduate_accounts(
+    command, tmp_path, monkeypatch, capsys
+):
+    """A graduate account must be refused before any login is attempted.
+
+    Regression: the command used to try the undergraduate JWGL login, spend a
+    real attempt and report "invalid username or password" — which reads like
+    a wrong password and invites retries that lock the account.
+    """
+    import json
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("BUPT_CLI_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "credentials.json").write_text(
+        json.dumps({"username": "u", "password": "p", "role": "graduate"}),
+        encoding="utf-8",
+    )
+
+    code = cli.main([command])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+
+    assert code == 2
+    assert payload["error"]["type"] == "usage"
+    assert "本科教务" in payload["error"]["message"]
+    assert "bupt grad" in payload["error"]["hint"]
+    # Nothing should have reached the network layer.
+    assert captured.out == ""
+
+
+def test_undergraduate_role_is_not_blocked(tmp_path, monkeypatch):
+    """The guard must only fire for graduate accounts."""
+    import json
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("BUPT_CLI_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "credentials.json").write_text(
+        json.dumps({"username": "u", "password": "p", "role": "undergraduate"}),
+        encoding="utf-8",
+    )
+
+    from bupt_cli import commands
+
+    # No exception means it proceeded past the role check (the network call
+    # will fail, but that is a different error type).
+    try:
+        commands._require_undergraduate("schedule")
+    except Exception as exc:  # pragma: no cover - should not happen
+        pytest.fail(f"undergraduate role was refused: {exc}")
