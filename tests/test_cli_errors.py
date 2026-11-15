@@ -352,74 +352,51 @@ def test_looks_like_bupt_rejects_random_binary(tmp_path):
     assert str(other) not in result["removed"]
 
 
-def test_update_check_never_raises_name_error(monkeypatch):
-    """Regression: cmd_update referenced DEFAULT_REPO and Path but neither
-    existed, so `bupt update` always failed with a NameError."""
+def test_update_uses_release_redirect_not_the_api(monkeypatch):
+    """`update` must not depend on api.github.com.
+
+    Anonymous API access is capped at 60 requests/hour; relying on it would
+    force users to configure a GITHUB_TOKEN just to check for updates. The
+    version comes from the /releases/latest redirect instead.
+    """
     from bupt_cli import commands
 
-    class FakeResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self):
-            import json as _json
-
-            return _json.dumps({"tag_name": "v9.9.9", "assets": []}).encode()
-
-    import urllib.request as urlreq
-
-    monkeypatch.setattr(urlreq, "urlopen", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(commands, "_release_tag", lambda repo, **k: "v9.9.9")
     import argparse
 
     result = commands.cmd_update(argparse.Namespace(check=True, repo="owner/repo"))
     assert result["ok"] is True
-    assert result["current"]
     assert result["latest"] == "9.9.9"
+    assert result["update_available"] is True
 
 
-def test_update_install_path_uses_pathlib(monkeypatch, tmp_path):
-    """Exercise the install branch, which is where `Path` was missing.
+def test_update_reports_missing_release(monkeypatch):
+    from bupt_cli import commands
 
-    The earlier regression test only covered --check, which returns before the
-    first `Path(...)` call, so deleting the import kept the suite green.
-    """
+    monkeypatch.setattr(commands, "_release_tag", lambda repo, **k: None)
     import argparse
+
+    result = commands.cmd_update(argparse.Namespace(check=True, repo="o/r"))
+    assert result["ok"] is True
+    assert result["latest"] is None
+    assert result["update_available"] is False
+    assert "没有可用的 release" in result["note"]
+
+
+def test_update_install_path_from_source_is_honest(monkeypatch):
+    """From source there is no binary to replace; say so instead of claiming
+    success. Runs the real zip-extraction path."""
     import io
-    import urllib.request as urlreq
     import zipfile
 
     from bupt_cli import commands
 
-    # A zip holding a fake bupt binary.
+    monkeypatch.setattr(commands, "_release_tag", lambda repo, **k: "v9.9.9")
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         zf.writestr("bupt", b"#!/bin/sh\necho fake\n")
     payload = buf.getvalue()
-
-    class JsonResp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def read(self):
-            import json as _json
-
-            return _json.dumps(
-                {
-                    "tag_name": "v9.9.9",
-                    "assets": [
-                        {
-                            "name": "bupt-macos-arm64.zip",
-                            "browser_download_url": "https://example.invalid/bupt.zip",
-                        }
-                    ],
-                }
-            ).encode()
 
     class BinResp:
         def __enter__(self):
@@ -431,18 +408,51 @@ def test_update_install_path_uses_pathlib(monkeypatch, tmp_path):
         def read(self):
             return payload
 
+    import urllib.request as urlreq
+
+    seen = {}
+
     def fake_urlopen(request, *a, **k):
-        url = request.full_url if hasattr(request, "full_url") else str(request)
-        return BinResp() if url.endswith(".zip") else JsonResp()
+        seen["url"] = request.full_url if hasattr(request, "full_url") else str(request)
+        return BinResp()
 
     monkeypatch.setattr(urlreq, "urlopen", fake_urlopen)
 
+    import argparse
+
     result = commands.cmd_update(argparse.Namespace(check=False, repo="o/r"))
-    # Not frozen under pytest, so nothing is installed but the zip path ran.
     assert result["ok"] is True
-    assert result["latest"] == "9.9.9"
     assert result["installed_to"] is None
     assert "未自动安装" in result["note"]
+    # The asset URL follows the release tag, not an API call.
+    assert "/releases/download/v9.9.9/" in seen["url"]
+    assert commands.ASSET_NAME in seen["url"]
+
+
+def test_release_tag_reads_the_redirect(monkeypatch):
+    """`_release_tag` extracts the tag from the Location header."""
+    from bupt_cli import commands
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            class Resp:
+                headers = {
+                    "Location": "https://github.com/o/r/releases/tag/v1.2.3"
+                }
+                url = ""
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return Resp()
+
+    import urllib.request as urlreq
+
+    monkeypatch.setattr(urlreq, "build_opener", lambda *a, **k: FakeOpener())
+    assert commands._release_tag("o/r") == "v1.2.3"
 
 
 def test_calendar_uses_term_from_page_not_hardcoded_year(monkeypatch):
@@ -565,3 +575,49 @@ def test_probe_runs_without_credentials(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert '"ok":true' in out
+
+
+def test_update_replaces_a_frozen_binary(monkeypatch, tmp_path):
+    """The frozen path must swap the file, keep a backup and leave no .new."""
+    import io
+    import sys
+    import zipfile
+
+    from bupt_cli import commands
+
+    target = tmp_path / "bupt"
+    target.write_bytes(b"OLD-BINARY")
+    target.chmod(0o755)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("bupt", b"NEW-BINARY")
+    payload = buf.getvalue()
+
+    class BinResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return payload
+
+    import urllib.request as urlreq
+
+    monkeypatch.setattr(urlreq, "urlopen", lambda *a, **k: BinResp())
+    monkeypatch.setattr(commands, "_release_tag", lambda repo, **k: "v9.9.9")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(target))
+
+    import argparse
+
+    result = commands.cmd_update(argparse.Namespace(check=False, repo="o/r"))
+
+    assert result["installed_to"] == str(target)
+    assert target.read_bytes() == b"NEW-BINARY"
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / "bupt.old").read_bytes() == b"OLD-BINARY"
+    assert not (tmp_path / "bupt.new").exists()
+    assert "已更新到" in result["note"]

@@ -78,6 +78,8 @@ DEFAULT_DORM: dict[str, str] = {
 
 # Where `bupt update` looks for releases. Override with --repo or BUPT_CLI_REPO.
 DEFAULT_REPO = "tututuhehehe/bupt-cli"
+# Release asset name produced by build.sh + the release workflow.
+ASSET_NAME = "bupt-macos-arm64.zip"
 
 
 # ---------------------------------------------------------------------------
@@ -1548,36 +1550,53 @@ def _versions_tuple(text: str) -> tuple[int, ...]:
     return tuple(int(p) for p in parts[:3]) or (0,)
 
 
-def _github_repo_exists(repo: str) -> Optional[bool]:
-    """True/False when GitHub answers, None when it cannot be asked."""
-    import json as _json
+def _release_tag(repo: str, *, timeout: float = 20.0) -> Optional[str]:
+    """Latest release tag, read from the `/releases/latest` redirect.
+
+    Deliberately avoids api.github.com: anonymous API access is limited to 60
+    requests/hour per IP, which is easy to exhaust and would otherwise force
+    users to configure a GITHUB_TOKEN just to check for updates. The web
+    redirect has no such limit and needs no credentials.
+
+    Returns "" when the redirect works but names no tag, or None when the repo
+    has no releases (or does not exist — GitHub 404s both cases here).
+    """
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
+    class _NoRedirect(_urlreq.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):  # noqa: D102 - verbatim
+            return None
+
+    opener = _urlreq.build_opener(_NoRedirect)
     request = _urlreq.Request(
-        f"https://api.github.com/repos/{repo}",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "bupt-cli"},
+        f"https://github.com/{repo}/releases/latest",
+        method="HEAD",
+        headers={"User-Agent": "bupt-cli"},
     )
     try:
-        with _urlreq.urlopen(request, timeout=15) as resp:
-            _json.load(resp)
-        return True
+        with opener.open(request, timeout=timeout) as resp:
+            location = resp.headers.get("Location") or resp.url or ""
     except _urlerr.HTTPError as exc:
-        if exc.code == 404:
-            return False
-        return None
-    except Exception:
-        return None
+        location = exc.headers.get("Location") if exc.headers else None
+        if not location:
+            if exc.code == 404:
+                return None
+            raise
+    tag = str(location).rstrip("/").rsplit("/", 1)[-1]
+    return tag if tag and tag != "latest" else ""
 
 
 def cmd_update(args) -> dict[str, Any]:
-    """Compare against the latest GitHub release and replace the binary."""
-    import json as _json
+    """Compare against the latest GitHub release and replace the binary.
+
+    Uses the public release redirect plus the asset download URL, so no API
+    token is ever required.
+    """
     import os as _os
     import shutil as _shutil
     import sys as _sys
     import tempfile as _tempfile
-    import urllib.error as _urlerr
     import urllib.request as _urlreq
     import zipfile as _zipfile
     from pathlib import Path
@@ -1585,60 +1604,32 @@ def cmd_update(args) -> dict[str, Any]:
     from bupt_cli import __version__
 
     repo = args.repo or _os.environ.get("BUPT_CLI_REPO") or DEFAULT_REPO
-    api = f"https://api.github.com/repos/{repo}/releases/latest"
-    request = _urlreq.Request(
-        api, headers={"Accept": "application/vnd.github+json", "User-Agent": "bupt-cli"}
-    )
+    result: dict[str, Any] = {"ok": True, "current": __version__, "repo": repo}
+
     try:
-        with _urlreq.urlopen(request, timeout=20) as resp:
-            release = _json.load(resp)
-    except _urlerr.HTTPError as exc:
-        if exc.code == 404:
-            # /releases/latest 404s both when the repo is missing and when it
-            # has no releases; ask about the repo itself to tell them apart.
-            repo_exists = _github_repo_exists(repo)
-            if repo_exists is None:
-                note = f"无法确认 {repo} 的状态（GitHub 不可达）"
-            elif repo_exists:
-                note = f"仓库 {repo} 存在，但还没有发布任何 release"
-            else:
-                note = (
-                    f"仓库 {repo} 不存在或未公开；用 --repo OWNER/REPO 指定，"
-                    "或设 BUPT_CLI_REPO"
-                )
-            return {
-                "ok": True,
-                "current": __version__,
-                "latest": None,
-                "update_available": False,
-                "repo": repo,
-                "repo_exists": repo_exists,
-                "note": note,
-            }
-        if exc.code in (403, 429):
-            return {
-                "ok": True,
-                "current": __version__,
-                "latest": None,
-                "update_available": None,
-                "repo": repo,
-                "note": "GitHub API 限流，稍后再试；或设置 GITHUB_TOKEN 环境变量",
-            }
-        raise AuthError(f"检查更新失败：GitHub 返回 {exc.code}") from None
+        tag = _release_tag(repo)
     except Exception as exc:
-        raise AuthError(f"检查更新失败：{exc}") from None
+        result.update(
+            latest=None,
+            update_available=None,
+            note=f"检查更新失败：{exc}",
+        )
+        return result
 
-    latest = str(release.get("tag_name") or "").lstrip("v")
+    if tag is None:
+        result.update(
+            latest=None,
+            update_available=False,
+            note=f"{repo} 没有可用的 release（或仓库不存在）；用 --repo 指定仓库",
+        )
+        return result
+    if tag == "":
+        result.update(latest=None, update_available=None, note="release 跳转里没有版本号")
+        return result
+
+    latest = tag.lstrip("v")
     newer = _versions_tuple(latest) > _versions_tuple(__version__)
-
-    result: dict[str, Any] = {
-        "ok": True,
-        "current": __version__,
-        "latest": latest or None,
-        "update_available": newer,
-        "repo": repo,
-    }
-
+    result.update(latest=latest, update_available=newer)
     if not newer:
         result["note"] = "已经是最新版本"
         return result
@@ -1646,35 +1637,33 @@ def cmd_update(args) -> dict[str, Any]:
         result["note"] = "有新版本；去掉 --check 即可安装"
         return result
 
-    # Find a macOS/arm64 asset (zip preferred).
-    assets = release.get("assets") or []
-    asset = next(
-        (
-            a
-            for a in assets
-            if "bupt" in str(a.get("name", "")).lower()
-            and str(a.get("name", "")).lower().endswith(".zip")
-        ),
-        None,
+    asset_url = (
+        f"https://github.com/{repo}/releases/download/{tag}/{ASSET_NAME}"
     )
-    if asset is None:
-        result["note"] = "找到新版本，但 release 里没有可用的 bupt-*.zip 资产"
-        result["assets"] = [a.get("name") for a in assets]
-        return result
+    with _urlreq.urlopen(
+        _urlreq.Request(asset_url, headers={"User-Agent": "bupt-cli"}), timeout=120
+    ) as resp:
+        payload = resp.read()
 
-    # Where the running program lives; a frozen binary replaces itself.
     frozen = bool(getattr(_sys, "frozen", False))
     target = Path(_sys.executable).resolve() if frozen else None
-
-    with _urlreq.urlopen(asset["browser_download_url"], timeout=120) as resp:
-        payload = resp.read()
+    if target is None:
+        result.update(
+            installed_to=None,
+            note=(
+                f"找到新版本 {latest}，但当前不是独立二进制，未自动安装；"
+                "请下载 release 附件或运行 ./build.sh 后替换"
+            ),
+        )
+        return result
 
     with _tempfile.TemporaryDirectory() as tmp:
         archive = Path(tmp) / "bupt.zip"
         archive.write_bytes(payload)
         with _zipfile.ZipFile(archive) as zf:
             member = next(
-                (n for n in zf.namelist() if n.endswith("/bupt") or n == "bupt"), None
+                (n for n in zf.namelist() if n == "bupt" or n.endswith("/bupt")),
+                None,
             )
             if member is None:
                 raise UsageError("下载的压缩包里没有 bupt 可执行文件")
@@ -1682,23 +1671,14 @@ def cmd_update(args) -> dict[str, Any]:
             extracted.write_bytes(zf.read(member))
         extracted.chmod(0o755)
 
-        if target is not None:
-            backup = target.with_suffix(".old")
-            _shutil.copy2(target, backup)
-            incoming = target.with_suffix(".new")
-            _shutil.copy2(extracted, incoming)
-            _os.replace(incoming, target)
-            result["installed_to"] = str(target)
-            result["backup"] = str(backup)
-    if target is None:
-        # Running from source (`python -m bupt_cli`): there is no binary to
-        # replace, so do not claim success.
-        result["installed_to"] = None
-        result["note"] = (
-            f"找到新版本 {latest}，但当前不是独立二进制，未自动安装；"
-            "请重新下载或运行 ./build.sh 后再替换"
-        )
-        return result
+        backup = target.with_suffix(".old")
+        _shutil.copy2(target, backup)
+        incoming = target.with_suffix(".new")
+        _shutil.copy2(extracted, incoming)
+        _os.replace(incoming, target)
+
+    result["installed_to"] = str(target)
+    result["backup"] = str(backup)
     result["note"] = f"已更新到 {latest}，重新运行即可生效"
     return result
 
