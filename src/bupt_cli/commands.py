@@ -1881,6 +1881,14 @@ def cmd_update(args) -> dict[str, Any]:
         _shutil.copy2(extracted, incoming)
         _os.replace(incoming, target)
 
+        # Confirm the replacement actually took effect: reporting "updated"
+        # while an older binary survives is worse than failing loudly.
+        if not target.is_file() or target.stat().st_size != extracted.stat().st_size:
+            raise UsageError(
+                "替换二进制失败",
+                hint=f"旧版本已备份为 {backup}",
+            )
+
     result["installed_to"] = str(target)
     result["backup"] = str(backup)
     result["note"] = f"已更新到 {latest}，重新运行即可生效"
