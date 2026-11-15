@@ -33,7 +33,6 @@ from bupt_cli.service import (
     get_submit_view,
     load_seen_ids,
     parse_datetime,
-    parse_since,
     publish_time,
     resolve_attachment_urls,
     save_seen_ids,
@@ -80,6 +79,11 @@ DEFAULT_DORM: dict[str, str] = {
 DEFAULT_REPO = "tututuhehehe/bupt-cli"
 # Release asset name produced by build.sh + the release workflow.
 ASSET_NAME = "bupt-macos-arm64.zip"
+# `homework list --new` resolves publish times through the detail endpoint; cap
+# how many it looks up so a long course list cannot stall the command.
+PUBLISH_LOOKUP_LIMIT = 30
+# Seconds to wait between read-only post-submit verification attempts.
+VERIFY_WAIT_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -383,124 +387,108 @@ def _load_assignments(client, args) -> tuple[list, str]:
 
 
 def cmd_homework_list(args) -> dict[str, Any]:
-    since = parse_since(args.since) if args.since else None
+    """List assignments; ``--new N`` narrows to recently published ones."""
     session = _session(args)
     client = _client(session)
     try:
         items, method = _load_assignments(client, args)
         _enrich_undone_courses(client, items, args)
+
+        new_days = getattr(args, "new", None)
         selected = filter_assignments(
             items,
-            since=since,
             course_id=args.course,
             undone_only=args.undone,
         )
+
+        note = None
+        published_at: dict[str, dt.datetime] = {}
+        if new_days is not None:
+            published_at, note = _resolve_publish_times(client, items)
+            cutoff = dt.datetime.now() - dt.timedelta(days=new_days)
+            selected = [
+                item
+                for item in selected
+                if published_at.get(str(item.activity_id)) is not None
+                and published_at[str(item.activity_id)] >= cutoff
+            ]
+            selected.sort(
+                key=lambda item: published_at[str(item.activity_id)],
+                reverse=True,
+            )
+
         if args.limit and args.limit > 0:
             selected = selected[: args.limit]
-        return {
-            "count": len(selected),
+
+        assignments = []
+        for item in selected:
+            entry = assignment_dict(item)
+            stamp = published_at.get(str(item.activity_id))
+            if stamp is not None:
+                entry["published_at"] = stamp.isoformat(sep=" ")
+            assignments.append(entry)
+
+        payload: dict[str, Any] = {
+            "count": len(assignments),
             "method": method,
             "filters": {
                 "undone": bool(args.undone),
                 "course": args.course,
-                "since": since.isoformat(sep=" ") if since else None,
+                "new_days": new_days,
             },
-            "assignments": [assignment_dict(item) for item in selected],
-        }
-    finally:
-        _persist(session)
-
-
-def cmd_homework_new(args) -> dict[str, Any]:
-    if args.days is not None and args.days < 0:
-        raise UsageError("--days must be >= 0")
-    days = 7 if args.days is None else args.days
-    cutoff = dt.datetime.now() - dt.timedelta(days=days)
-
-    session = _session(args)
-    client = _client(session)
-    try:
-        items = _dedupe(
-            list(
-                client.get_all_homework(
-                    site_limit=args.max_courses, page_size=args.page_size
-                )
-            )
-        )
-        # The student list often leaves assignmentBeginTime empty while the
-        # detail endpoint carries the real publish time. Fill it in for a
-        # bounded number of items before deciding which mode to use.
-        published: dict[str, dt.datetime] = {}
-        if not any(publish_time(item) for item in items):
-            for item in items[: getattr(args, "detail_lookups", 30)]:
-                if not item.activity_id:
-                    continue
-                try:
-                    detail = client.get_homework_detail(item.activity_id)
-                except Exception:
-                    continue
-                parsed = parse_datetime(
-                    detail.raw.get("assignmentBeginTime")
-                    or detail.raw.get("publishTime")
-                    or detail.raw.get("createTime")
-                )
-                if parsed is not None:
-                    published[item.activity_id] = parsed
-
-        def _publication(item):
-            return published.get(item.activity_id) or publish_time(item)
-
-        publish_available = bool(published) or any(publish_time(item) for item in items)
-        if publish_available:
-            method = "publish_time"
-            selected = [
-                item
-                for item in items
-                if _publication(item) is not None and _publication(item) >= cutoff
-            ]
-            note = (
-                "filtered by upstream publish/start time (assignmentBeginTime, "
-                "resolved via the detail endpoint when the list omits it); items "
-                "without it are omitted"
-            )
-        else:
-            method = "seen_ids"
-            seen = load_seen_ids()
-            selected = [
-                item for item in items if item.activity_id and item.activity_id not in seen
-            ]
-            note = (
-                "upstream has no publish timestamp on this account; new items are "
-                f"assigned by ids not present in {seen_state_path()}"
-            )
-        # Always keep the fallback state current, including in publish-time mode.
-        save_seen_ids([item.activity_id for item in items if item.activity_id])
-        selected.sort(
-            key=lambda item: (
-                _publication(item) is None,
-                _publication(item) or dt.datetime.max,
-            ),
-            reverse=True,
-        )
-        if args.limit and args.limit > 0:
-            selected = selected[: args.limit]
-        assignments = []
-        for item in selected:
-            entry = assignment_dict(item)
-            publication = _publication(item)
-            if publication is not None:
-                entry["published_at"] = publication.isoformat(sep=" ")
-            assignments.append(entry)
-        return {
-            "count": len(selected),
-            "method": method,
-            "days": days,
-            "cutoff": cutoff.isoformat(sep=" "),
-            "note": note,
             "assignments": assignments,
         }
+        if note:
+            payload["note"] = note
+        return payload
     finally:
         _persist(session)
+
+
+def _resolve_publish_times(
+    client, items: list
+) -> tuple[dict[str, dt.datetime], str]:
+    """Fill in publish times via the detail endpoint.
+
+    The assignment list usually omits ``assignmentBeginTime``, so filtering by
+    "when was this set" needs one detail call per assignment. Bounded so a
+    course with hundreds of assignments cannot turn into a long crawl.
+    """
+    published: dict[str, dt.datetime] = {}
+    for item in items[:PUBLISH_LOOKUP_LIMIT]:
+        activity_id = str(getattr(item, "activity_id", "") or "")
+        if not activity_id:
+            continue
+        try:
+            detail = client.get_homework_detail(activity_id)
+        except Exception:
+            continue
+        parsed = parse_datetime(
+            detail.raw.get("assignmentBeginTime")
+            or detail.raw.get("publishTime")
+            or detail.raw.get("createTime")
+        )
+        if parsed is not None:
+            published[activity_id] = parsed
+
+    # Anything the detail call missed may still carry a time in the list row.
+    for item in items:
+        activity_id = str(getattr(item, "activity_id", "") or "")
+        if not activity_id or activity_id in published:
+            continue
+        parsed = publish_time(item)
+        if parsed is not None:
+            published[activity_id] = parsed
+
+    if not published:
+        return {}, (
+            "上游没有返回任何发布时间（详情接口也没有），--new 无法过滤；"
+            "去掉 --new 查看全部作业"
+        )
+    return published, (
+        "按发布时间过滤（列表接口通常不返回，逐个查详情补上；"
+        f"最多查 {PUBLISH_LOOKUP_LIMIT} 个）"
+    )
 
 
 def _short_error(exc: BaseException, limit: Optional[int] = 200) -> str:
@@ -625,17 +613,8 @@ def _lookup_submitted_at(client, args, detail) -> Optional[str]:
 
 
 def _verify_wait(args) -> float:
-    """Validated --verify-wait value (usage error outside 0..120)."""
-    raw = getattr(args, "verify_wait", 5.0)
-    if raw is None:
-        raw = 5.0
-    try:
-        wait = float(raw)
-    except (TypeError, ValueError) as exc:
-        raise UsageError("--verify-wait must be a number") from exc
-    if not math.isfinite(wait) or not 0.0 <= wait <= 120.0:
-        raise UsageError("--verify-wait must be between 0 and 120 seconds")
-    return wait
+    """Seconds between read-only verification attempts (fixed, not a flag)."""
+    return VERIFY_WAIT_SECONDS
 
 
 def _verification_payload(verification: dict[str, Any]) -> dict[str, Any]:
@@ -703,7 +682,7 @@ def cmd_homework_show(args) -> dict[str, Any]:
     client = _client(session)
     try:
         detail = client.get_homework_detail(args.id)
-        payload = detail_dict(detail, max_chars=args.max_chars)
+        payload = detail_dict(detail, max_chars=0)
         payload["course"] = (
             detail.raw.get("siteName")
             or detail.raw.get("site_name")
@@ -1332,8 +1311,6 @@ def cmd_homework_submit(args) -> dict[str, Any]:
     * ``--dry-run`` never uploads and never submits; it only validates inputs
       and shows the payload that would be sent.
     * Real submit requires ``--i-confirm-submit``.
-    * ``--upload-only`` uploads files and returns resource ids without
-      calling ``/work/submit``.
     """
     from pathlib import Path
 
@@ -1341,13 +1318,10 @@ def cmd_homework_submit(args) -> dict[str, Any]:
     resource_ids = [str(r) for r in (getattr(args, "resource_id", None) or [])]
     text = getattr(args, "text", None) or ""
     dry_run = bool(getattr(args, "dry_run", False))
-    upload_only = bool(getattr(args, "upload_only", False))
     confirm = bool(getattr(args, "i_confirm_submit", False))
     no_verify = bool(getattr(args, "no_verify", False))
     verify_wait = _verify_wait(args)
 
-    if dry_run and upload_only:
-        raise UsageError("--dry-run and --upload-only are mutually exclusive")
     if dry_run and confirm:
         raise UsageError("--dry-run cannot be combined with --i-confirm-submit")
     if not files and not resource_ids and not text.strip():
@@ -1407,6 +1381,15 @@ def cmd_homework_submit(args) -> dict[str, Any]:
                 "note": "no upload and no submit performed",
             }
 
+        # Gate before uploading: uploading and then refusing would leave
+        # orphaned resources upstream for no reason.
+        if not confirm:
+            raise UsageError(
+                "refusing to submit without --i-confirm-submit",
+                hint="先运行 `bupt homework submit ID --dry-run` 核对将要提交的内容，"
+                "确认无误后加 --i-confirm-submit",
+            )
+
         uploaded = []
         for path in paths:
             meta = upload_homework_file(
@@ -1425,23 +1408,6 @@ def cmd_homework_submit(args) -> dict[str, Any]:
             if rid and rid not in seen:
                 seen.add(rid)
                 attachment_ids.append(rid)
-
-        if upload_only:
-            return {
-                "upload_only": True,
-                "assignment_id": args.id,
-                "title": detail.title,
-                "uploaded": uploaded,
-                "attachment_ids": attachment_ids,
-                "note": "files uploaded; /ykt-site/work/submit NOT called",
-            }
-
-        if not confirm:
-            raise UsageError(
-                "refusing to submit without --i-confirm-submit",
-                hint="re-run with --i-confirm-submit after reviewing "
-                "`bupt homework submit ID --dry-run`, or use --upload-only",
-            )
 
         result = submit_homework(
             token,

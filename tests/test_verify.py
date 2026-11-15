@@ -533,7 +533,7 @@ def test_submit_uploaded_file_is_the_expected_attachment_set(
     assert submit_state["calls"] == 1
 
 
-def test_submit_dry_run_accepts_verify_flags_without_effect(
+def test_submit_dry_run_does_not_upload_or_submit(
     monkeypatch, capsys, sleeps
 ):
     calls = []
@@ -552,8 +552,6 @@ def test_submit_dry_run_accepts_verify_flags_without_effect(
             "--text",
             "hello",
             "--dry-run",
-            "--verify-wait",
-            "0",
             "--no-verify",
         ]
     )
@@ -565,16 +563,6 @@ def test_submit_dry_run_accepts_verify_flags_without_effect(
     assert "verification" not in payload
     assert submit_state["calls"] == 0
     assert calls == [("detail", ASSIGNMENT_ID)]
-
-
-@pytest.mark.parametrize("wait", ["-1", "200"])
-def test_invalid_verify_wait_is_usage_error(monkeypatch, capsys, wait):
-    code, captured = _run_submit(capsys, "--verify-wait", wait)
-
-    assert code == 2
-    assert captured.out == ""
-    payload = json.loads(captured.err)
-    assert payload["error"]["type"] == "usage"
 
 
 def test_verify_subcommand_pass(monkeypatch, capsys, sleeps):
@@ -590,8 +578,6 @@ def test_verify_subcommand_pass(monkeypatch, capsys, sleeps):
         "res-1",
         "--text",
         "hello world",
-        "--verify-wait",
-        "0",
     )
 
     assert code == 0
@@ -602,7 +588,7 @@ def test_verify_subcommand_pass(monkeypatch, capsys, sleeps):
     assert payload["verification"]["status"] == "passed"
     assert "submitted" not in payload
     assert submit_state["calls"] == 0
-    assert sleeps == [0.0]
+    assert sleeps == [5.0]
     lookups = [call for call in calls if call[0] == "find_list_record"]
     assert lookups == [("find_list_record", ASSIGNMENT_ID, ["site-1"])]
 
@@ -615,7 +601,7 @@ def test_verify_subcommand_failure_exits_six(monkeypatch, capsys, sleeps):
     submit_state = _install_submit(monkeypatch)
 
     code, captured = _run_verify(
-        capsys, "--resource-id", "res-1", "--verify-wait", "0"
+        capsys, "--resource-id", "res-1"
     )
 
     assert code == 6
@@ -626,7 +612,7 @@ def test_verify_subcommand_failure_exits_six(monkeypatch, capsys, sleeps):
     assert "upstream reported success" not in payload["verification"]["hint"]
     assert "could not be confirmed" in captured.err
     assert submit_state["calls"] == 0
-    assert sleeps == [0.0, 0.0]
+    assert sleeps == [5.0, 5.0]
 
 
 def test_verify_without_resource_id_accepts_visible_submission(
@@ -643,7 +629,7 @@ def test_verify_without_resource_id_accepts_visible_submission(
     _install(monkeypatch, client)
     _install_view_sequence(monkeypatch, [_view(attachmentIds=["2121920224368910337"])])
 
-    code, captured = _run_verify(capsys, "--verify-wait", "0")
+    code, captured = _run_verify(capsys)
 
     assert code == 0
     payload = json.loads(captured.out)
@@ -662,7 +648,7 @@ def test_verify_with_resource_id_still_compares_exactly(monkeypatch, capsys, sle
     _install_view_sequence(monkeypatch, [_view(attachmentIds=["other-id"])])
 
     code, captured = _run_verify(
-        capsys, "--resource-id", "res-1", "--verify-wait", "0"
+        capsys, "--resource-id", "res-1"
     )
 
     assert code == 6

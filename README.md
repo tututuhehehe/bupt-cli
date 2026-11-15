@@ -181,12 +181,11 @@ bupt electricity buildings --area shahe --pretty       # 列出沙河宿舍楼
 | `bupt status [--check]` | 显示缓存会话是否有效（不含机密）。`--check` 做只读在线检查 |
 | `bupt logout` | 删除 `~/.bupt-cli/session.json` |
 | `bupt courses` | 当前云邮教学空间课程 |
-| `bupt homework list [--undone] [--course ID] [--since ISO] [--limit N]` | 作业列表。`--undone` 走服务端未交接口 |
-| `bupt homework new [--days N]` | 最近发布的作业 |
-| `bupt homework show ID [--max-chars N]` | 作业详情：提交状态、正文、附件地址 |
+| `bupt homework list [--undone] [--course ID] [--new DAYS] [--limit N]` | 作业列表，按截止时间排序。`--undone` 只看未交；`--new N` 只看最近 N 天发布的 |
+| `bupt homework show ID [--course SITE_ID]` | 作业详情：提交状态、正文全文、附件地址 |
 | `bupt homework download ID [--dir DIR] [--force]` | 下载教师附件到 `DIR` |
-| `bupt homework submit ID [--file PATH]… [--text …] [--resource-id ID]… [--dry-run \| --upload-only \| --i-confirm-submit]` | 上传/提交。**默认绝不自动提交** |
-| `bupt homework verify ID [--resource-id RID]…` | 只读核验提交是否可见，不调用任何写接口 |
+| `bupt homework submit ID [--file PATH]… [--text …] [--dry-run \| --i-confirm-submit] [--no-verify]` | 上传/提交。**默认绝不自动提交；不带 `--i-confirm-submit` 时连文件都不上传** |
+| `bupt homework verify ID [--resource-id RID]… [--text TEXT]` | 只读核验提交是否可见，不调用任何写接口。不给参数只查"有没有交"，给了才精确比对附件/正文 |
 | `bupt library search KEYWORD [--page N] [--page-size N] [--location CAMPUS] [--with-ebook]` | 图书馆书目检索（匿名）。`--with-ebook` 标出有电子版的记录 |
 | `bupt library hold RECCTRLID` | 某本书的各馆藏位置：部门、条码、索书号、状态 |
 | `bupt library ebook RECCTRLID` | 某本书的电子资源链接 |
@@ -229,7 +228,7 @@ bupt homework submit ID --file ./答案.pdf --text '说明' --i-confirm-submit -
 - 提交后工具会做只读核验：`verified: true` + 退出 0 表示确认；退出 6 表示未能确认；退出 7 表示核验过程本身失败。这两种情况请用 `bupt homework show` 或 `bupt homework verify` 复查，**不要盲目重交**
 - 没有 `--i-confirm-submit` 时工具会拒绝真正提交（退出码 2）
 
-核验逻辑：提交成功后用只读接口再确认一次——`submit-view`（附件集合、正文）和 `student/list`（`submitTime`）。最多尝试 2 次，每次前等待 `--verify-wait` 秒（默认 5，范围 0–120）；`--no-verify` 跳过核验。
+核验逻辑：提交成功后用只读接口再确认一次——`submit-view`（附件集合、正文）和 `student/list`（`submitTime`）。最多尝试 2 次，每次前等待 5 秒；`--no-verify` 跳过核验。
 
 底层接口：
 
@@ -239,7 +238,7 @@ bupt homework submit ID --file ./答案.pdf --text '说明' --i-confirm-submit -
 - 作业详情 `/ykt-site/work/detail` **不含**学生自己的提交信息，所以 `show` 改从 `submit-view` 读 `submitted` / `submit_content` / `submit_attachments`，再用 `student/list` 的 `submitTime` 补 `submitted_at`；`submit-view` 失败时命令照常成功并带 `submit_view_error`
 - 附件在 `assignmentResource` 字段（不是 `attachmentList`）；`show` 通过 `/blade-source/resource/preview-url` 把 `resourceId` 解析成 `fileucloud.bupt.edu.cn` 下载链接。**CDN 不能带 Blade-Auth，否则 400**
 
-> 本仓库验证时只做了 `--dry-run` 与 `--upload-only`，**没有对真实作业执行过提交**。
+> 本仓库验证时只做了 `--dry-run`，**没有对真实作业执行过提交**。
 
 ## 课表与本地缓存
 
@@ -310,7 +309,7 @@ bupt schedule exams           # 考试安排
 PYTHONPATH=src:.deps ~/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bin/python3.14 -m pytest
 ```
 
-当前 **176 个测试**，覆盖：时间解析、过滤、附件归一化、`homework new` 状态、Cookie 往返、会话文件权限与脱敏、凭据优先级、CLI 错误信封与退出码、电费默认宿舍优先级与 `buildings`、提交后核验（退出码 6/7）、图书馆解析、研究生课表/日历/iCalendar（含跨年周）、CDP WebSocket 协议（假服务端，11 个场景）、自我更新（含 frozen 原位替换）、卸载护栏。
+当前 **190 个测试**，覆盖：时间解析、过滤、附件归一化、`homework list --new` 状态、Cookie 往返、会话文件权限与脱敏、凭据优先级、CLI 错误信封与退出码、电费默认宿舍优先级与 `buildings`、提交后核验（退出码 6/7）、图书馆解析、研究生课表/日历/iCalendar（含跨年周）、CDP WebSocket 协议（假服务端，11 个场景）、自我更新（含 frozen 原位替换）、卸载护栏。
 
 ## 已知限制（2026-11 实测）
 

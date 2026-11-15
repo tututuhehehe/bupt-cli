@@ -10,8 +10,7 @@ description: >-
 After install, run `bupt <command>`. Output is JSON; add `--pretty` for indented output. Once credentials are configured, login is cached and reused automatically. Run `bupt <command> --help` for the full flags.
 
 ## Common commands
-- `bupt homework list [--undone] [--course ID] [--since ISO]`: list assignments.
-- `bupt homework new [--days 7]`: assignments published recently.
+- `bupt homework list [--undone] [--course ID] [--new DAYS]`: list assignments.
 - `bupt homework show ID`: an assignment's details, attachments, and submission state (`submitted`, `submitted_at`, submitted attachments).
 - `bupt homework download ID --dir DIR`: download the teacher's attachments.
 - `bupt homework verify ID [--resource-id RID ...]`: read-only check that a submission is really there.

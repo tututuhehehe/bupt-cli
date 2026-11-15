@@ -211,6 +211,8 @@ def build_parser() -> JsonArgumentParser:
         "list",
         parents=[common],
         help="list assignments (all courses by default)",
+        description="List assignments across courses, sorted by deadline. "
+        "--new N narrows it to assignments published within N days.",
     )
     hw_list.add_argument(
         "--undone",
@@ -219,61 +221,14 @@ def build_parser() -> JsonArgumentParser:
     )
     hw_list.add_argument("--course", metavar="ID", help="filter by UCloud course/site id")
     hw_list.add_argument(
-        "--since",
-        metavar="ISO",
-        help="published/start time on or after ISO-8601 (falls back to deadline)",
+        "--new",
+        type=_NON_NEGATIVE_INT,
+        metavar="DAYS",
+        help="only assignments published within DAYS days (resolves publish "
+        "times through the detail endpoint when the list omits them)",
     )
     hw_list.add_argument(
         "--limit", type=_NON_NEGATIVE_INT, default=0, help="max results (0 = all)"
-    )
-    hw_list.add_argument(
-        "--max-courses",
-        type=_POSITIVE_INT,
-        default=30,
-        help="max courses to aggregate (default: 30)",
-    )
-    hw_list.add_argument(
-        "--page-size",
-        type=_POSITIVE_INT,
-        default=50,
-        help="upstream page size (default: 50)",
-    )
-
-    hw_new = homework_sub.add_parser(
-        "new",
-        parents=[common],
-        help="assignments published/created recently",
-        description="Show recently published assignments. Uses upstream publish "
-        "time when available, otherwise the seen-id state file "
-        f"{seen_state_path()}.",
-    )
-    hw_new.add_argument(
-        "--days",
-        type=_NON_NEGATIVE_INT,
-        default=7,
-        help="publish-time window in days (default: 7)",
-    )
-    hw_new.add_argument(
-        "--limit", type=_NON_NEGATIVE_INT, default=0, help="max results (0 = all)"
-    )
-    hw_new.add_argument(
-        "--max-courses",
-        type=_POSITIVE_INT,
-        default=30,
-        help="max courses to aggregate (default: 30)",
-    )
-    hw_new.add_argument(
-        "--page-size",
-        type=_POSITIVE_INT,
-        default=50,
-        help="upstream page size (default: 50)",
-    )
-    hw_new.add_argument(
-        "--detail-lookups",
-        type=_NON_NEGATIVE_INT,
-        default=30,
-        help="max detail fetches to recover publish times missing from lists "
-        "(default: 30)",
     )
 
     hw_show = homework_sub.add_parser(
@@ -287,12 +242,6 @@ def build_parser() -> JsonArgumentParser:
         type=_numeric_id,
         metavar="SITE_ID",
         help="only look up the submission time in this course/site id",
-    )
-    hw_show.add_argument(
-        "--max-chars",
-        type=_NON_NEGATIVE_INT,
-        default=0,
-        help="truncate content_text to N characters (0 = no limit)",
     )
 
     hw_dl = homework_sub.add_parser(
@@ -321,8 +270,9 @@ def build_parser() -> JsonArgumentParser:
         help="upload files/text and submit an assignment (gated)",
         description=(
             "Upload local files and/or text to UCloud, then submit. "
-            "NEVER auto-submits: use --dry-run to preview, --upload-only to "
-            "upload without submitting, and --i-confirm-submit for a real submit."
+            "NEVER auto-submits: use --dry-run to preview, and "
+            "--i-confirm-submit for a real submit (which replaces any previous "
+            "submission)."
         ),
     )
     hw_submit.add_argument("id", metavar="ID", help="assignment/activity id")
@@ -354,21 +304,9 @@ def build_parser() -> JsonArgumentParser:
         help="validate inputs and show planned payload; no upload, no submit",
     )
     hw_submit.add_argument(
-        "--upload-only",
-        action="store_true",
-        help="upload files and return resource ids; do NOT call /work/submit",
-    )
-    hw_submit.add_argument(
         "--i-confirm-submit",
         action="store_true",
         help="required to actually POST /ykt-site/work/submit",
-    )
-    hw_submit.add_argument(
-        "--verify-wait",
-        type=_float_in_range(0.0, 120.0, "verify-wait"),
-        default=5.0,
-        metavar="SECONDS",
-        help="wait between read-only verification attempts (default: 5)",
     )
     hw_submit.add_argument(
         "--no-verify",
@@ -399,19 +337,6 @@ def build_parser() -> JsonArgumentParser:
         metavar="TEXT",
         help="expected submitted text (plain text, whitespace-insensitive); "
         "enables the content check",
-    )
-    hw_verify.add_argument(
-        "--course",
-        type=_numeric_id,
-        metavar="SITE_ID",
-        help="only look up the student-list record in this course/site id",
-    )
-    hw_verify.add_argument(
-        "--verify-wait",
-        type=_float_in_range(0.0, 120.0, "verify-wait"),
-        default=5.0,
-        metavar="SECONDS",
-        help="wait between read-only verification attempts (default: 5)",
     )
 
     courses = sub.add_parser(

@@ -32,7 +32,7 @@ Please respect each upstream project's licence if you copy from this repo.
 ## What it does
 
 - **CAS login** (`auth.bupt.edu.cn`) with an UCloud BladeX token exchange
-- **UCloud** homework list/new/show/download, gated submit (`--dry-run` / `--upload-only` / `--i-confirm-submit`), courses
+- **UCloud** homework list/show/download, gated submit (`--dry-run` / `--i-confirm-submit`), courses
 - **Library catalogue** (`opac.bupt.edu.cn`) search + per-copy holdings,
   **anonymous** — works for undergraduates and graduate students alike
 - **Graduate system** (`yjxt.bupt.edu.cn`): semester timetable, teaching
@@ -220,12 +220,11 @@ indentation. Errors go to stderr as
 | `bupt login [--user ID] [--password PASS] [--role ROLE] [--force] [--jwgl]` | Save your account to `~/.bupt-cli/credentials.json` (mode `0600`) and authenticate. With no flags it prompts for id, password (hidden) and role. `--jwgl` additionally tries the mobile-JWGL login (undergraduate system only). |
 | `bupt status [--check]` | Show cached session validity without secrets. `--check` performs a read-only live check (ticket issuance + UCloud info); it never submits credentials. |
 | `bupt logout` | Delete `~/.bupt-cli/session.json`. |
-| `bupt homework list [--undone] [--course ID] [--since ISO] [--limit N]` | Assignments across courses. Default fetches all courses (`--max-courses`, `--page-size`); `--undone` uses the server-side undone endpoint. |
-| `bupt homework new [--days N]` | Recently published assignments (see semantics below). |
+| `bupt homework list [--undone] [--course ID] [--new DAYS] [--limit N]` | Assignments across courses. `--undone` uses the server-side undone endpoint; `--new DAYS` keeps only recently published ones. |
 | `bupt homework show ID [--max-chars N] [--course SITE_ID]` | Assignment detail, submission state (`submitted`, `submit_content`, `submit_attachments`, `submitted_at`), plain-text content and attachment URLs. Teacher attachments are resolved through the UCloud preview endpoint; `--course` limits the submission-time lookup to one course/site id. |
 | `bupt homework download ID [--dir DIR] [--force]` | Download teacher attachments into `DIR` (CDN URLs; no Blade-Auth). |
-| `bupt homework submit ID [--file PATH]… [--text …] [--resource-id ID]… [--dry-run | --upload-only | --i-confirm-submit] [--verify-wait SECONDS] [--no-verify]` | Upload and/or submit. **Never auto-submits**: `--dry-run` plans only; `--upload-only` uploads without `/work/submit`; real submit needs `--i-confirm-submit`. A real submit is then verified with read-only calls (skip with `--no-verify`). |
-| `bupt homework verify ID [--resource-id RID]… [--text TEXT] [--course SITE_ID] [--verify-wait SECONDS]` | Read-only check that a submission is visible upstream (submit-view + student list). Never submits and never calls a write endpoint. |
+| `bupt homework submit ID [--file PATH]… [--text …] [--resource-id ID]… [--dry-run | --i-confirm-submit] [--no-verify]` | Upload and/or submit. **Never auto-submits**: `--dry-run` plans only; real submit needs `--i-confirm-submit`, and without it nothing is even uploaded. A real submit is then verified with read-only calls (skip with `--no-verify`). |
+| `bupt homework verify ID [--resource-id RID]… [--text TEXT]` | Read-only check that a submission is visible upstream (submit-view + student list). Never submits and never calls a write endpoint. |
 | `bupt courses` | Current UCloud course sites. |
 | `bupt schedule [--week N] [--today] [--date YYYY-MM-DD] [--source auto\|mobile\|dom]` | Timetable. Mobile JWGL first, DOM fallback. Experimental — unavailable with the current credentials/network. |
 | `bupt exams` | Exam weeks and arrangements from mobile JWGL. Experimental. |
@@ -264,30 +263,18 @@ re-authenticate on `401`/expired tokens. The CLI also:
   with `bupt login --jwgl --force`);
 - `bupt probe` never submits credentials.
 
-### `homework list` / `--since`
+### `homework list` / `--new`
 
-`--since ISO` accepts date-only or ISO-8601 (`Z`/offsets are converted to local
-time) and filters by the assignment's publish/start time when upstream
-provides one, otherwise by its deadline. On the current account the list
-endpoint leaves `assignmentBeginTime` empty, so `--since` effectively filters
-by deadline.
+`homework list` returns assignments sorted by deadline. `--undone` switches to
+the server-side undone endpoint.
 
-### `homework new` semantics
+`--new DAYS` keeps only assignments published within `DAYS` days. UCloud's list
+record usually leaves `assignmentBeginTime` empty, so the CLI fetches up to 30
+assignment details to recover the publish time; the `note` field says so. If no
+publish time can be recovered at all, the note says the filter is unavailable
+rather than silently falling back to the deadline.
 
-The mode used is reported in the `method` field:
-
-1. **`publish_time`** — UCloud's list record has `assignmentBeginTime`; or, as
-   on the current account, the list value is empty and the CLI fetches up to
-   `--detail-lookups` (default 30) assignment details and uses the detail's
-   `assignmentBeginTime` (publish/open time). Items newer than
-   `now - --days` (default 7) are returned.
-2. **`seen_ids`** — if no publish time can be recovered, the CLI compares
-   assignment ids with `~/.bupt-cli/homework-seen.json` and returns ids
-   not seen on a previous run. In this mode `--days` does not filter (the
-   state file defines "new"); the state file is always updated, including in
-   `publish_time` mode.
-
-`--limit`, `--max-courses` and `--page-size` bound work.
+`--limit` bounds the result count.
 
 ### `homework show` submission state
 
@@ -332,10 +319,10 @@ expected text normalised the same way. If you submitted HTML with `--text`,
 pass the visible plain text as the expected `--text` (or omit it to skip the
 content check).
 
-Upstream is eventually consistent, so each attempt sleeps `--verify-wait`
+Upstream is eventually consistent, so each attempt sleeps 5 seconds
 seconds (float, `0`–`120`, default `5`) and there are at most two attempts.
 `--no-verify` skips verification. Both flags are accepted with `--dry-run` and
-`--upload-only` but have no effect there (those paths never submit). The same
+but have no effect there (that path never submits). The same
 session/token is reused — verification performs no new login and never calls a
 write endpoint.
 
@@ -369,7 +356,7 @@ codes, without the submit-only fields.
 uv run bupt login
 uv run bupt status --check --pretty
 uv run bupt homework list --undone --pretty
-uv run bupt homework new --days 3
+uv run bupt homework list --new 3
 uv run bupt homework show ASSIGNMENT_ID --pretty
 uv run bupt homework show ANOTHER_ASSIGNMENT_ID --course SITE_ID --pretty
 uv run bupt homework download ASSIGNMENT_ID --dir ./hw
@@ -414,11 +401,11 @@ uv run pytest
 ```
 
 The tests cover timestamp parsing, filtering, attachment normalization,
-`homework new` state, cookie round-tripping, session-file permissions and
+`homework list --new` state, cookie round-tripping, session-file permissions and
 redaction, credentials precedence, CLI error envelopes/exit codes, probe
 helpers, the electricity default-dorm precedence / `buildings` subcommand
 (with a stubbed electricity client, no network), and post-submit verification
-(`verify_submission`, `homework submit --verify-wait/--no-verify`, exit codes
+(`verify_submission`, `homework submit --no-verify`, exit codes
 6/7, `homework verify`).
 
 ## Known limitations (verified 2026-10-21)
