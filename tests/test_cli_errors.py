@@ -455,55 +455,244 @@ def test_release_tag_reads_the_redirect(monkeypatch):
     assert commands._release_tag("o/r") == "v1.2.3"
 
 
-def test_calendar_uses_term_from_page_not_hardcoded_year(monkeypatch):
-    """Fail the previous implementation: it hardcoded 2026 in commands.py.
+def test_timetable_calendar_uses_the_page_term(monkeypatch):
+    """The academic year must come from the page, not a hardcoded constant.
 
-    The page says 2030-2031, so week 1 must be dated 2030-xx, not 2026-xx.
+    Regression: commands.py used to call parse_calendar(..., 2026), so every
+    date would be a year off once the term rolled over.
     """
-    from bupt_cli import commands
+    from bupt_cli import timetable
 
     calendar_html = (
         '<td class="tb_line">学期：2030-2031秋学期</td>'
-        '<table id="dgData">'
-        "<tr><td>一</td>"
+        '<table id="dgData"><tr><td>一</td>'
         + "".join(f"<td>{d}&nbsp;(9月)</td>" for d in range(2, 9))
         + "</tr></table>"
     )
+    schedule_html = "<table><tr><td>节次</td><td>星期一</td></tr></table>"
+
+    from bupt_cli import grad_browser
 
     monkeypatch.setattr(
-        commands,
-        "_grad_pages",
-        lambda args, want: {"calendar": calendar_html},
+        grad_browser,
+        "collect",
+        lambda user, pwd, want=("schedule", "calendar"): {
+            "schedule": schedule_html,
+            "calendar": calendar_html,
+        },
     )
 
-    result = commands.cmd_grad_calendar(argparse_namespace())
-    assert result["term"] == "2030-2031秋学期"
-    assert result["weeks"][0]["monday"].startswith("2030-")
+    entry = timetable.fetch_graduate("u", "p")
+    assert entry["term"] == "2030-2031秋学期"
+    assert entry["calendar"]["1"][0].startswith("2030-")
 
 
-def argparse_namespace():
-    import argparse
-
-    return argparse.Namespace(dry_run=False, keep_data=False, check=False)
-
-
-def test_calendar_without_term_label_raises_instead_of_guessing(monkeypatch):
-    """An unknown year must be an error, not a silent 2026 fallback."""
-    from bupt_cli import commands
+def test_timetable_calendar_without_term_raises(monkeypatch):
+    """An unknown year must be an error, never a silent fallback."""
+    from bupt_cli import grad_browser, timetable
 
     calendar_html = (
-        "<table id=\"dgData\"><tr><td>一</td>"
+        '<table id="dgData"><tr><td>一</td>'
         + "".join(f"<td>{d}&nbsp;(9月)</td>" for d in range(2, 9))
         + "</tr></table>"
     )
     monkeypatch.setattr(
-        commands, "_grad_pages", lambda args, want: {"calendar": calendar_html}
+        grad_browser,
+        "collect",
+        lambda user, pwd, want=("schedule", "calendar"): {
+            "schedule": (
+                "<table><tr><th>节次</th><th>星期一</th></tr>"
+                "<tr><td>1</td><td></td></tr></table>"
+            ),
+            "calendar": calendar_html,
+        },
     )
 
-    from bupt_cli.errors import AuthError
+    with pytest.raises(timetable.TimetableError):
+        timetable.fetch_graduate("u", "p")
 
-    with pytest.raises(AuthError):
-        commands.cmd_grad_calendar(argparse_namespace())
+
+def test_uninstall_never_targets_source_files(tmp_path, monkeypatch):
+    """Uninstall must only consider executables that look like bupt.
+
+    Regression: the candidate scan matched any file containing "bupt_cli",
+    which included src/bupt_cli/__main__.py — deleting source code.
+    """
+    from bupt_cli import commands
+
+    fake = tmp_path / "__main__.py"
+    fake.write_text("from bupt_cli.cli import main\n", encoding="utf-8")
+
+    launcher = tmp_path / "bupt"
+    launcher.write_text("#!/bin/sh\nexec python -m bupt_cli \"$@\"\n", encoding="utf-8")
+    launcher.chmod(0o755)
+
+    # The helper is defined inside cmd_uninstall, so assert the invariant via a
+    # real dry run in an isolated HOME/PATH.
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import argparse
+
+    args = argparse.Namespace(dry_run=True, keep_data=True)
+    result = commands.cmd_uninstall(args)
+
+    removed = [str(x) for x in result.get("removed", [])]
+    assert str(fake) not in removed
+    assert all(not p.endswith("__main__.py") for p in removed)
+
+
+def test_looks_like_bupt_recognises_onefile_binary(tmp_path):
+    """Regression: only the first 8 KB was inspected, so PyInstaller's archive
+    (which lives at the end, behind the MEI cookie) was never found and
+    `bupt uninstall` silently deleted nothing."""
+    from bupt_cli import commands
+
+    # Fake a PyInstaller artifact: Mach-O magic + our name in the appendix.
+    # Larger than 64 KB so the tail-read path (seek(-65536)) is exercised.
+    blob = b"\xcf\xfa\xed\xfe" + b"\x00" * 70000
+    blob += b"MEI\x0c\x0b\x0a\x0b\x0e" + b"bupt_cli.commands\x00"
+    fake = tmp_path / "bupt"
+    fake.write_bytes(blob)
+    fake.chmod(0o755)
+
+    import argparse
+
+    # keep_data avoids touching ~/.bupt-cli; PATH/HOME point at tmp_path.
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setenv("PATH", str(tmp_path))
+        monkey.setenv("HOME", str(tmp_path))
+        args = argparse.Namespace(dry_run=True, keep_data=True)
+        result = commands.cmd_uninstall(args)
+    finally:
+        monkey.undo()
+
+    assert str(fake) in result["removed"]
+
+
+def test_looks_like_bupt_rejects_random_binary(tmp_path):
+    """A Mach-O without our marker must not be deleted."""
+    from bupt_cli import commands
+
+    other = tmp_path / "bupt"
+    other.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 20000)
+    other.chmod(0o755)
+
+    import argparse
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setenv("PATH", str(tmp_path))
+        monkey.setenv("HOME", str(tmp_path))
+        args = argparse.Namespace(dry_run=True, keep_data=True)
+        result = commands.cmd_uninstall(args)
+    finally:
+        monkey.undo()
+
+    assert str(other) not in result["removed"]
+
+
+def test_update_uses_release_redirect_not_the_api(monkeypatch):
+    """`update` must not depend on api.github.com.
+
+    Anonymous API access is capped at 60 requests/hour; relying on it would
+    force users to configure a GITHUB_TOKEN just to check for updates. The
+    version comes from the /releases/latest redirect instead.
+    """
+    from bupt_cli import commands
+
+    monkeypatch.setattr(commands, "_release_tag", lambda repo, **k: "v9.9.9")
+    import argparse
+
+    result = commands.cmd_update(argparse.Namespace(check=True, repo="owner/repo"))
+    assert result["ok"] is True
+    assert result["latest"] == "9.9.9"
+    assert result["update_available"] is True
+
+
+def test_update_reports_missing_release(monkeypatch):
+    from bupt_cli import commands
+
+    monkeypatch.setattr(commands, "_release_tag", lambda repo, **k: None)
+    import argparse
+
+    result = commands.cmd_update(argparse.Namespace(check=True, repo="o/r"))
+    assert result["ok"] is True
+    assert result["latest"] is None
+    assert result["update_available"] is False
+    assert "没有可用的 release" in result["note"]
+
+
+def test_update_install_path_from_source_is_honest(monkeypatch):
+    """From source there is no binary to replace; say so instead of claiming
+    success. Runs the real zip-extraction path."""
+    import io
+    import zipfile
+
+    from bupt_cli import commands
+
+    monkeypatch.setattr(commands, "_release_tag", lambda repo, **k: "v9.9.9")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("bupt", b"#!/bin/sh\necho fake\n")
+    payload = buf.getvalue()
+
+    class BinResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return payload
+
+    import urllib.request as urlreq
+
+    seen = {}
+
+    def fake_urlopen(request, *a, **k):
+        seen["url"] = request.full_url if hasattr(request, "full_url") else str(request)
+        return BinResp()
+
+    monkeypatch.setattr(urlreq, "urlopen", fake_urlopen)
+
+    import argparse
+
+    result = commands.cmd_update(argparse.Namespace(check=False, repo="o/r"))
+    assert result["ok"] is True
+    assert result["installed_to"] is None
+    assert "未自动安装" in result["note"]
+    # The asset URL follows the release tag, not an API call.
+    assert "/releases/download/v9.9.9/" in seen["url"]
+    assert commands.ASSET_NAME in seen["url"]
+
+
+def test_release_tag_reads_the_redirect(monkeypatch):
+    """`_release_tag` extracts the tag from the Location header."""
+    from bupt_cli import commands
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            class Resp:
+                headers = {
+                    "Location": "https://github.com/o/r/releases/tag/v1.2.3"
+                }
+                url = ""
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return Resp()
+
+    import urllib.request as urlreq
+
+    monkeypatch.setattr(urlreq, "build_opener", lambda *a, **k: FakeOpener())
+    assert commands._release_tag("o/r") == "v1.2.3"
 
 
 def test_uninstall_refuses_home_and_root(monkeypatch, tmp_path):
@@ -623,7 +812,7 @@ def test_update_replaces_a_frozen_binary(monkeypatch, tmp_path):
     assert "已更新到" in result["note"]
 
 
-@pytest.mark.parametrize("command", ["schedule", "exams", "scores", "classrooms"])
+@pytest.mark.parametrize("command", ["exams", "scores", "classrooms"])
 def test_undergraduate_jwgl_commands_refuse_graduate_accounts(
     command, tmp_path, monkeypatch, capsys
 ):
@@ -649,7 +838,7 @@ def test_undergraduate_jwgl_commands_refuse_graduate_accounts(
     assert code == 2
     assert payload["error"]["type"] == "usage"
     assert "本科教务" in payload["error"]["message"]
-    assert "bupt grad" in payload["error"]["hint"]
+    assert "bupt schedule" in payload["error"]["hint"]
     # Nothing should have reached the network layer.
     assert captured.out == ""
 
@@ -670,6 +859,6 @@ def test_undergraduate_role_is_not_blocked(tmp_path, monkeypatch):
     # No exception means it proceeded past the role check (the network call
     # will fail, but that is a different error type).
     try:
-        commands._require_undergraduate("schedule")
+        commands._require_undergraduate("exams")
     except Exception as exc:  # pragma: no cover - should not happen
         pytest.fail(f"undergraduate role was refused: {exc}")

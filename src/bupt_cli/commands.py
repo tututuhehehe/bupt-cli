@@ -826,40 +826,223 @@ def _require_undergraduate(command: str) -> None:
     if credentials.role == "graduate":
         raise UsageError(
             f"`bupt {command}` 走的是本科教务系统，研究生学号在那套系统里不存在",
-            hint="改用 `bupt grad schedule` / `bupt grad calendar` / `bupt grad ics`；"
+            hint="改用 `bupt schedule` / `bupt schedule export` / `bupt schedule exams`；"
             "若身份登记有误，重新执行 `bupt login --role undergraduate`",
         )
 
 
-def cmd_schedule(args) -> dict[str, Any]:
-    _require_undergraduate("schedule")
-    target_date: Optional[dt.date] = None
-    if args.today:
-        target_date = dt.date.today()
-    elif args.date:
-        try:
-            target_date = dt.date.fromisoformat(args.date)
-        except ValueError as exc:
-            raise UsageError(f"invalid --date '{args.date}' (use YYYY-MM-DD)") from exc
+def _refresh_timetable(args) -> dict[str, Any]:
+    """Fetch the timetable from whichever system the account belongs to."""
+    from bupt_cli import timetable
 
-    source = None if args.source == "auto" else args.source
-    session = _session(args)
-    client = _client(session)
+    credentials = load_credentials()
+    role = credentials.role
+
+    if role == "undergraduate":
+        session = _session(args)
+        client = _client(session)
+        try:
+            entry = timetable.fetch_undergraduate(client)
+        finally:
+            _persist(session)
+        timetable.save(entry)
+        return entry
+
+    # Graduate (and unknown roles: try the verified path first).
     try:
-        overview = client.get_schedule(week=args.week, source=source)
-        courses = overview.courses
-        if target_date is not None:
-            courses = overview.get_day_courses(target_date.weekday())
+        entry = timetable.fetch_graduate(
+            credentials.username, credentials.password
+        )
+    except timetable.TimetableError:
+        raise
+    except Exception as exc:
+        hint = "检查 ~/.bupt-cli/credentials.json 的账号与 role；研究生系统需要 Chrome"
+        if role == "":
+            hint = (
+                "账号身份未登记；`bupt login --role graduate` 或 "
+                "`--role undergraduate` 后重试"
+            )
+        raise AuthError(f"获取课表失败：{exc}", hint=hint) from None
+    timetable.save(entry)
+    return entry
+
+
+def _timetable_entry(args) -> tuple[dict[str, Any], bool]:
+    """Cached timetable, refreshing only when needed.
+
+    Returns ``(entry, from_cache)``. The whole point of the cache is that
+    "what do I have today" costs a file read instead of a browser launch.
+    """
+    from bupt_cli import timetable
+
+    if not getattr(args, "refresh", False):
+        cached = timetable.load()
+        if cached is not None and not timetable.is_stale(cached):
+            return cached, True
+    return _refresh_timetable(args), False
+
+
+def cmd_schedule(args) -> dict[str, Any]:
+    """Timetable queries, served from the local cache when possible."""
+    from bupt_cli import timetable
+
+    sub = getattr(args, "schedule_command", None)
+    if sub == "update":
+        entry = _refresh_timetable(args)
+        bounds = timetable.week_bounds(entry)
         return {
-            "week": overview.week,
-            "dates": overview.dates,
-            "source": overview.source,
-            "day": target_date.isoformat() if target_date else None,
-            "count": len(courses),
-            "courses": [_schedule_course(course, overview.dates) for course in courses],
+            "ok": True,
+            "updated": True,
+            "role": entry.get("role"),
+            "source": entry.get("source"),
+            "term": entry.get("term"),
+            "courses": len(entry.get("courses") or []),
+            "weeks": len(entry.get("calendar") or {}),
+            "range": [bounds[0].isoformat(), bounds[1].isoformat()] if bounds else None,
+            "path": str(timetable.cache_path()),
         }
-    finally:
-        _persist(session)
+    if sub == "export":
+        return cmd_schedule_export(args)
+    if sub == "calendar":
+        return cmd_schedule_calendar(args)
+    if sub == "exams":
+        return cmd_schedule_exams(args)
+
+    entry, from_cache = _timetable_entry(args)
+    today = dt.date.today()
+
+    # Which dates?
+    if getattr(args, "raw", False):
+        return {
+            "term": entry.get("term"),
+            "role": entry.get("role"),
+            "from_cache": from_cache,
+            "count": len(entry.get("courses") or []),
+            "courses": entry.get("courses"),
+        }
+
+    if getattr(args, "date", None):
+        try:
+            day = dt.date.fromisoformat(args.date)
+        except ValueError:
+            raise UsageError(f"invalid --date '{args.date}' (use YYYY-MM-DD)") from None
+        start = end = day
+        label = day.isoformat()
+    elif getattr(args, "today", False):
+        start = end = today
+        label = today.isoformat()
+    elif getattr(args, "tomorrow", False):
+        start = end = today + dt.timedelta(days=1)
+        label = start.isoformat()
+    elif getattr(args, "week", None):
+        key = str(args.week)
+        week_dates = (entry.get("calendar") or {}).get(key) or []
+        if not week_dates:
+            raise UsageError(
+                f"第 {args.week} 周不在缓存的学期范围内",
+                hint="用 `bupt schedule update` 刷新，或 `bupt schedule --raw` 查看课程周次",
+            )
+        dates = [d for d in week_dates if d]
+        start = dt.date.fromisoformat(dates[0])
+        end = dt.date.fromisoformat(dates[-1])
+        label = f"第 {args.week} 周"
+    else:
+        start, end = timetable.day_range(entry, today)
+        label = "本周"
+
+    sessions = timetable.occurrences(entry, start, end)
+    return {
+        "term": entry.get("term"),
+        "role": entry.get("role"),
+        "from_cache": from_cache,
+        "range": [start.isoformat(), end.isoformat()],
+        "week": timetable.week_of(entry, start),
+        "label": label,
+        "count": len(sessions),
+        "classes": sessions,
+    }
+
+
+def cmd_schedule_calendar(args) -> dict[str, Any]:
+    """The teaching-week -> date table backing the cache."""
+    from bupt_cli import timetable
+
+    entry, from_cache = _timetable_entry(args)
+    calendar = entry.get("calendar") or {}
+    return {
+        "term": entry.get("term"),
+        "role": entry.get("role"),
+        "from_cache": from_cache,
+        "week_count": len(calendar),
+        "weeks": [
+            {
+                "week": int(week),
+                "monday": dates[0] if dates else "",
+                "sunday": dates[-1] if dates else "",
+                "dates": dates,
+            }
+            for week, dates in sorted(
+                calendar.items(), key=lambda kv: int(kv[0])
+            )
+            if isinstance(dates, list)
+        ],
+    }
+
+
+def cmd_schedule_export(args) -> dict[str, Any]:
+    """Write the cached timetable to an .ics file."""
+    from pathlib import Path
+
+    from bupt_cli import timetable
+
+    entry, from_cache = _timetable_entry(args)
+    try:
+        content = timetable.build_ics(entry)
+    except timetable.TimetableError as exc:
+        raise UsageError(str(exc), hint=getattr(exc, "hint", "")) from None
+
+    if getattr(args, "out", None):
+        out = Path(args.out).expanduser()
+    else:
+        safe = re.sub(r"[^\w\u4e00-\u9fa5-]+", "-", str(entry.get("term") or "课表")).strip("-")
+        out = Path.home() / "Downloads" / f"bupt-{safe}.ics"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(content, encoding="utf-8")
+
+    if not getattr(args, "no_open_folder", False):
+        import subprocess as _sp
+
+        _sp.run(
+            ["open", "-R", str(out)],
+            check=False,
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+        )
+
+    return {
+        "ok": True,
+        "term": entry.get("term"),
+        "from_cache": from_cache,
+        "courses": len(entry.get("courses") or []),
+        "weeks": len(entry.get("calendar") or {}),
+        "events": content.count("BEGIN:VEVENT"),
+        "path": str(out),
+        "hint": "在日历 App 里双击导入；重复导入会生成重复事件",
+    }
+
+
+def cmd_schedule_exams(args) -> dict[str, Any]:
+    """Exam arrangements come from the graduate system only."""
+    from bupt_cli import grad
+
+    credentials = load_credentials(required=False)
+    if credentials.role == "undergraduate":
+        raise UsageError(
+            "`bupt schedule exams` 目前只读研究生系统的考试安排",
+            hint="本科生的考试安排请查看教务处或信息门户",
+        )
+    pages = _grad_pages(args, ("exams",))
+    return grad.parse_exams(pages.get("exams", ""))
 
 
 def cmd_scores(args) -> dict[str, Any]:
@@ -1466,104 +1649,6 @@ def _calendar_year(grad_module, term: str) -> int:
             hint="页面结构可能已变；请运行 `bupt grad calendar` 查看原始返回",
         )
     return year
-
-
-def cmd_grad_schedule(args) -> dict[str, Any]:
-    """Semester timetable, via the browser."""
-    from bupt_cli import grad
-
-    pages = _grad_pages(args, ("schedule",))
-    try:
-        entries = grad.merge_periods(grad.parse_timetable(pages["schedule"]))
-        opts = grad.term_options(pages["schedule"])
-    except grad.GradError as exc:
-        raise AuthError(str(exc), hint=getattr(exc, "hint", "")) from None
-    return {
-        "term": opts[0][1] if opts else "",
-        "count": len(entries),
-        "courses": entries,
-    }
-
-
-def cmd_grad_calendar(args) -> dict[str, Any]:
-    """Teaching calendar: teach week -> real dates."""
-    from bupt_cli import grad
-
-    pages = _grad_pages(args, ("calendar",))
-    if "calendar" not in pages:
-        raise AuthError("没能取到教学日历页面")
-    term = grad.term_from_html(pages["calendar"])
-    try:
-        weeks = grad.parse_calendar(pages["calendar"], _calendar_year(grad, term))
-    except grad.GradError as exc:
-        raise AuthError(str(exc), hint=getattr(exc, "hint", "")) from None
-    return {
-        "term": term,
-        "week_count": len(weeks),
-        "weeks": [
-            {"week": w, "monday": d[0], "sunday": d[-1], "dates": d}
-            for w, d in sorted(weeks.items())
-        ],
-    }
-
-
-def cmd_grad_exams(args) -> dict[str, Any]:
-    """Exam arrangements (the table is often empty for graduate courses)."""
-    from bupt_cli import grad
-
-    pages = _grad_pages(args, ("exams",))
-    return grad.parse_exams(pages.get("exams", ""))
-
-
-def cmd_grad_ics(args) -> dict[str, Any]:
-    """Export the timetable as an .ics file into ~/Downloads."""
-    from pathlib import Path
-
-    from bupt_cli import grad
-
-    pages = _grad_pages(args, ("schedule", "calendar"))
-    if "calendar" not in pages:
-        raise AuthError("没能取到教学日历，无法把周次换成日期")
-
-    courses = grad.merge_periods(grad.parse_timetable(pages["schedule"]))
-    # The calendar page is the authority for week -> date, so its term wins; the
-    # timetables's dropdown label is only a fallback for the calendar name.
-    opts = grad.term_options(pages["schedule"])
-    calendar_term = grad.term_from_html(pages["calendar"])
-    term = calendar_term or (opts[0][1] if opts else "")
-    try:
-        weeks = grad.parse_calendar(pages["calendar"], _calendar_year(grad, term))
-    except grad.GradError as exc:
-        raise AuthError(str(exc), hint=getattr(exc, "hint", "")) from None
-
-    content = grad.build_ics(courses, weeks, term=term)
-    if args.out:
-        out = Path(args.out).expanduser()
-    else:
-        safe = re.sub(r"[^\w\u4e00-\u9fa5-]+", "-", term).strip("-")
-        out = Path.home() / "Downloads" / f"bupt-{safe}.ics"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(content, encoding="utf-8")
-
-    if not getattr(args, "no_open_folder", False):
-        import subprocess as _sp
-
-        _sp.run(
-            ["open", "-R", str(out)],
-            check=False,
-            stdout=_sp.DEVNULL,
-            stderr=_sp.DEVNULL,
-        )
-
-    return {
-        "ok": True,
-        "term": term,
-        "courses": len(courses),
-        "weeks": len(weeks),
-        "events": content.count("BEGIN:VEVENT"),
-        "path": str(out),
-        "hint": "在日历 App 里双击该文件导入；重复导入会生成重复事件",
-    }
 
 
 def _versions_tuple(text: str) -> tuple[int, ...]:

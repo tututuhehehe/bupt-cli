@@ -13,7 +13,7 @@
 - **统一身份认证（CAS）登录**：交互式保存账号，一套账号密码通用于北邮各系统
 - **云邮教学空间（UCloud）**：课程列表、作业列表/详情/附件下载；提交需二次确认
 - **图书馆**（`opac.bupt.edu.cn`）：书目检索、馆藏位置、电子版链接。**匿名接口**，本科生研究生都能用
-- **研究生系统**（`yjxt.bupt.edu.cn`）：学期课表、教学日历、考试安排，以及 **`bupt grad ics`** 导出带真实日期的日历文件
+- **研究生系统**（`yjxt.bupt.edu.cn`）：学期课表、教学日历、考试安排，以及 **`bupt schedule export`** 导出带真实日期的日历文件
 - **信息门户**（`my.bupt.edu.cn`）：通知公告、饭卡余额
 - **宿舍电费**（`app.bupt.edu.cn`）：沙河 / 西土城
 - **`bupt probe`**：全部接口的实时健康矩阵
@@ -190,10 +190,11 @@ bupt electricity buildings --area shahe --pretty       # 列出沙河宿舍楼
 | `bupt library search KEYWORD [--page N] [--page-size N] [--location CAMPUS] [--with-ebook]` | 图书馆书目检索（匿名）。`--with-ebook` 标出有电子版的记录 |
 | `bupt library hold RECCTRLID` | 某本书的各馆藏位置：部门、条码、索书号、状态 |
 | `bupt library ebook RECCTRLID` | 某本书的电子资源链接 |
-| `bupt grad schedule` | 研究生学期课表：星期、节次、时间、教室、周次 |
-| `bupt grad calendar` | 教学日历：每个教学周对应的真实日期 |
-| `bupt grad ics [--out PATH] [--no-open-folder]` | 导出 iCalendar 文件（默认 `~/Downloads/bupt-<学期>.ics`），每次上课一个事件 |
-| `bupt grad exams` | 考试安排。常为空：研究生课程多为论文/大作业考核 |
+| `bupt schedule` | **本周课表**（读本地缓存，毫秒级）。`--today` / `--tomorrow` / `--date` / `--week N` 查指定日期；`--raw` 看原始课程网格 |
+| `bupt schedule update [--force]` | 刷新 `~/.bupt-cli/timetable.json`。研究生走浏览器（4-8 秒），本科生走移动教务 API |
+| `bupt schedule export [--out PATH]` | 导出 iCalendar 文件（默认 `~/Downloads/bupt-<学期>.ics`），每次上课一个事件 |
+| `bupt schedule calendar` | 教学周 → 日期的对照表 |
+| `bupt schedule exams` | 考试安排（仅研究生系统，常为空） |
 | `bupt electricity [--building B] [--room R] [--floor F] [--threshold N]` | 宿舍电费余额 |
 | `bupt electricity buildings [--area shahe\|xitucheng]` | 列出某校区的宿舍楼 |
 | `bupt notices [--type notice,news,rules,ways] [--count N] [--page P]` | 门户通知。校外常不可达 |
@@ -240,20 +241,48 @@ bupt homework submit ID --file ./答案.pdf --text '说明' --i-confirm-submit -
 
 > 本仓库验证时只做了 `--dry-run` 与 `--upload-only`，**没有对真实作业执行过提交**。
 
-## 研究生课表与日历导出
+## 课表与本地缓存
 
-研究生系统位于**瑞数（Riversafe）**动态防护之后，纯 HTTP 客户端拿不到数据。因此这几个命令会自动启动一个**无头 Chrome**（不显示窗口）完成登录并读取页面，约 4–8 秒，无需你手动操作。
+课表查询走**本地缓存**，第一次执行抓取整个学期并写入 `~/.bupt-cli/timetable.json`，之后查询都是读文件（约 0.1 秒，不开浏览器）。
 
 ```bash
-bupt grad schedule --pretty   # 课表
-bupt grad calendar --pretty   # 教学日历
-bupt grad ics                 # 导出到 ~/Downloads/bupt-<学期>.ics
-bupt grad exams --pretty      # 考试安排
+bupt schedule                 # 本周
+bupt schedule --today         # 今天
+bupt schedule --tomorrow      # 明天
+bupt schedule --date 2026-11-20
+bupt schedule --week 12       # 第 12 周
+bupt schedule --raw           # 原始课程网格（不分日期）
+bupt schedule update          # 刷新缓存
+bupt schedule export          # 导出 .ics 到 ~/Downloads
+bupt schedule calendar        # 教学周 → 日期对照表
+bupt schedule exams           # 考试安排
 ```
 
-`bupt grad ics` 会按**实际周次**把每门课展开成每周一个事件。例如"光纤通信原理"在第 4–19 周每周三 08:00–09:35 各一条，共 16 条。日期来自教学日历（`TermCalender.aspx`），不是推算。
+**两种身份都支持**，命令相同，数据源按 `role` 自动选择：
 
-技术要点：
+| 身份 | 数据源 | 抓取耗时 |
+|---|---|---|
+| 研究生（`role: graduate`） | `yjxt.bupt.edu.cn`，经无头 Chrome 过瑞数 | 4–8 秒 |
+| 本科生（`role: undergraduate`） | 移动教务 JSON API | 约 1 秒 |
+
+### 缓存何时失效
+
+缓存里存了 `term` 和完整的周→日期表。当**今天不在缓存的任何教学周内**（学期结束、换学期）就视为过期，下次查询会自动重抓。想手动刷新用 `bupt schedule update`，或任意查询加 `--refresh`。
+
+缓存文件损坏或版本不符会被忽略并重建，不会报错。
+
+### 日期是从哪来的
+
+- 研究生：`TermCalender.aspx` 教学日历页，**权威数据**（2026-2027 秋学期第 1 周 = 2026-08-31）
+- 本科生：移动教务 `get_curriculum()` 返回的 `SjdDay`，每个教学周都带 `zc`（周次）和 `mxrq`（真实日期）
+
+两条路都**不靠推算**。
+
+> ⚠️ **本科生那条路尚未在真实账号上验证**（写这段代码时没有本科生账号）。数据模型是从 vendored SDK 读出来的，但"一次调用是否返回全部教学周"这点未验证。你在本科账号上跑一次 `bupt schedule update`，然后 `bupt schedule calendar` 检查周数是否合理即可判断。
+
+### 研究生系统的技术细节
+
+研究生系统位于**瑞数（Riversafe）**动态防护之后，纯 HTTP 客户端拿不到数据，所以用无头 Chrome：
 
 - 只依赖系统里的 **Google Chrome**，不需要 Playwright / Selenium / agent-browser——本项目自己写了 CDP 客户端（`src/bupt_cli/cdp.py`，仅标准库）
 - 无头模式的关键：默认无头 UA 含 `HeadlessChrome`，CAS 页会**拒绝渲染登录表单**，必须覆盖成桌面 UA
@@ -287,7 +316,7 @@ PYTHONPATH=src:.deps ~/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bi
 
 - `my.bupt.edu.cn` 在公共 DNS 上解析到校内私网地址 `10.3.55.84`。校外 HTTP 超时、HTTPS TLS 被重置 → `notices` / `card` 校外不可用。这是网络范围限制，**不是接口改版**。WebVPN（`webvpn.bupt.edu.cn`）可访问，但用户名密码登录处于维护中（仅支持企业微信扫码），本 CLI 无法代登
 - `jwgl.bupt.edu.cn` / `jwxt.bupt.edu.cn` 在校园网外 TLS 重置 → DOM 课表/成绩不可用
-- `jwglweixin.bupt.edu.cn` 仅 HTTPS 可达。该后端是**本科**教务，研究生账号不存在，请改用 `bupt grad *`
+- `jwglweixin.bupt.edu.cn` 仅 HTTPS 可达。该后端是**本科**教务，研究生账号不存在，请改用 `bupt schedule`
 - 云邮附件在 `assignmentResource` 字段（不是 `attachmentList`），vendored 解析器已打补丁
 - 研究生系统有瑞数防护，必须真实浏览器；**无头模式必须覆盖 UA**，且 CAS 表单在 iframe 内，点击要从 iframe 内部派发
 - 图书馆电子版覆盖率偏向英文书（英文科技书约八成有，老中文教材基本没有）
@@ -312,7 +341,7 @@ PYTHONPATH=src:.deps ~/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bi
 | [Yokumii/bupt-api-collected](https://github.com/Yokumii/bupt-api-collected) | Apache-2.0 | 移动教务是 AES 而非 CAS；考试成绩接口名 |
 | ZeroCore-Zero/BUPT_APIS、YouXam/ucloud | MIT | 端点线索 |
 
-研究生系统接入（`bupt grad *`）、图书馆客户端、iCalendar 导出、无头 CDP 驱动与瑞数应对是为本项目写的，均在 2026-11 实测验证。
+研究生系统接入（`bupt schedule`）、图书馆客户端、iCalendar 导出、无头 CDP 驱动与瑞数应对是为本项目写的，均在 2026-11 实测验证。
 
 如果要从本仓库拷贝代码，请同时遵守上游项目的许可。
 

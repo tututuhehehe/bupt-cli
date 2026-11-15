@@ -22,7 +22,7 @@ against) these projects:
 | [`wzekin/bupt-api`](https://github.com/wzekin/bupt-api) | MIT | Early evidence that the CAS form posts the password in clear text behind hidden inputs |
 | [`Yokumii/bupt-api-collected`](https://github.com/Yokumii/bupt-api-collected) | Apache-2.0 | Confirmation that the mobile JWGL login is AES-based, not CAS; exam/score endpoint names |
 
-The graduate-system integration (`bupt grad *`), the library client, the
+The timetable integration (`bupt schedule`), the library client, the
 iCalendar exporter, the headless-CDP driver and the Riversafe workaround were
 written for this project. Each was verified live in 2026-11; see
 [`API_STATUS.md`](API_STATUS.md) for the evidence.
@@ -36,7 +36,7 @@ Please respect each upstream project's licence if you copy from this repo.
 - **Library catalogue** (`opac.bupt.edu.cn`) search + per-copy holdings,
   **anonymous** — works for undergraduates and graduate students alike
 - **Graduate system** (`yjxt.bupt.edu.cn`): semester timetable, teaching
-  calendar, exam arrangements, and **`bupt grad ics`** which exports the
+  calendar, exam arrangements, and **`bupt schedule export`** which exports the
   timetable as an iCalendar file with real dates. Sits behind Riversafe, so a
   headless Chrome is driven over CDP to read it
 - **Dorm electricity** (沙河 / 西土城) via `app.bupt.edu.cn`; with no
@@ -73,8 +73,8 @@ The four JWGL commands go to `jwgl.bupt.edu.cn` / `jwglweixin.bupt.edu.cn`,
 which are the *undergraduate* academic system. A graduate-student id is not
 present there, so these commands fail with an auth error. The error hint now
 says so explicitly — **do not retry with other passwords**, because repeated
-failures can lock the account. For graduate accounts, use the `bupt grad *`
-commands instead — they query `yjxt.bupt.edu.cn`, the graduate system behind
+failures can lock the account. For graduate accounts, use the
+`bupt schedule` commands instead — they query `yjxt.bupt.edu.cn`, the graduate system behind
 the portal's "研究生系统" entry.
 
 > Unofficial and not production software. Campus systems may change at any
@@ -240,10 +240,11 @@ indentation. Errors go to stderr as
 | `bupt library search KEYWORD [--page N] [--page-size N] [--location CAMPUS] [--with-ebook]` | Library catalogue search (`opac.bupt.edu.cn`), anonymous. `--with-ebook` marks records that have online full text (one extra request each). |
 | `bupt library hold RECCTRLID` | Per-copy holdings for one record: department, barcode, call number, status. |
 | `bupt library ebook RECCTRLID` | Electronic-resource links for one record (coverage is skewed to English titles). |
-| `bupt grad schedule` | Graduate timetable (`yjxt.bupt.edu.cn`) — weekday, period range, clock times, room, weeks. |
-| `bupt grad calendar` | Teaching calendar: which real dates belong to each teach week. |
-| `bupt grad ics [--out PATH] [--no-open-folder]` | Export the timetable as an iCalendar file (default `~/Downloads/bupt-<term>.ics`), one event per class occurrence. |
-| `bupt grad exams` | Exam arrangements. Often empty: graduate courses are assessed by coursework. |
+| `bupt schedule` | **This week's timetable**, served from a local cache. `--today` / `--tomorrow` / `--date` / `--week N` for one day or week; `--raw` dumps the grid. Works for both account types. |
+| `bupt schedule update [--force]` | Refresh `~/.bupt-cli/timetable.json` (headless Chrome for graduate accounts, mobile JWGL API for undergraduates). |
+| `bupt schedule export [--out PATH]` | Export the timetable as an iCalendar file (default `~/Downloads/bupt-<term>.ics`), one event per class occurrence. |
+| `bupt schedule calendar` | Teaching-week -> date table. |
+| `bupt schedule exams` | Exam arrangements (graduate system; often empty). |
 | `bupt update [--check] [--repo OWNER/REPO]` | Compare with the latest GitHub release and replace the installed binary in place (keeping `bupt.old`). |
 | `bupt uninstall [--keep-data] [--dry-run]` | Remove bupt binaries found on PATH and `~/.bupt-cli`. `--keep-data` keeps your credentials; `--dry-run` only lists what would go. |
 | `bupt help [command]` | Alias for `--help`; `bupt help grad` shows a subcommand's options. |
@@ -431,7 +432,7 @@ helpers, the electricity default-dorm precedence / `buildings` subcommand
 - `jwglweixin.bupt.edu.cn` is only reachable over **HTTPS** (HTTP times out);
   the vendored SDK was patched accordingly. The mobile backend rejects the CAS
   password (`该帐号不存在或密码错误`), so `schedule/exams/scores/classrooms`
-  query `yjxt.bupt.edu.cn` via `bupt grad *` instead.
+  query `yjxt.bupt.edu.cn` via `bupt schedule` instead.
 - UCloud attachments live in `assignmentResource` (not `attachmentList`);
   the vendored parser was patched to surface them.
 - The UCloud OAuth ticket exchange must not follow the redirect into

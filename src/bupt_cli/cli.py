@@ -429,20 +429,74 @@ def build_parser() -> JsonArgumentParser:
     schedule = sub.add_parser(
         "schedule",
         parents=[common],
-        help="course timetable (experimental)",
-        description="Course timetable. Prefers the mobile JWGL JSON backend and "
-        "falls back to DOM JWGL (jwgl.bupt.edu.cn, often unreachable).",
+        help="timetable: today / this week / any date (cached)",
+        description="Course timetable, served from a local cache. Works for "
+        "both account types: graduate (yjxt) and undergraduate (mobile JWGL). "
+        "The first run fetches and caches the whole term; later queries are "
+        "instant. Use `bupt schedule update` to refresh.",
     )
     schedule.add_argument(
-        "--week", type=_POSITIVE_INT, help="academic week (1-25)"
+        "--today", action="store_true", help="only today's classes"
     )
-    schedule.add_argument("--today", action="store_true", help="only today's courses")
-    schedule.add_argument("--date", help="only courses on YYYY-MM-DD")
     schedule.add_argument(
-        "--source",
-        choices=["auto", "mobile", "dom"],
-        default="auto",
-        help="force a backend (default: auto)",
+        "--tomorrow", action="store_true", help="only tomorrow's classes"
+    )
+    schedule.add_argument("--date", metavar="YYYY-MM-DD", help="classes on one date")
+    schedule.add_argument(
+        "--week", type=_POSITIVE_INT, metavar="N", help="classes in teaching week N"
+    )
+    schedule.add_argument(
+        "--raw",
+        action="store_true",
+        help="dump the cached course grid instead of resolved dates",
+    )
+    schedule.add_argument(
+        "--refresh",
+        action="store_true",
+        help="ignore the cache and fetch again (slower; needs Chrome for "
+        "graduate accounts)",
+    )
+    schedule_sub = schedule.add_subparsers(
+        dest="schedule_command",
+        title="schedule commands",
+        metavar="<subcommand>",
+        parser_class=JsonArgumentParser,
+    )
+    sched_update = schedule_sub.add_parser(
+        "update",
+        parents=[common],
+        help="refresh the cached timetable for this term",
+        description="Fetch the whole term again and rewrite "
+        "~/.bupt-cli/timetable.json. Graduate accounts drive a headless "
+        "Chrome (4-8s); undergraduate accounts call the mobile JWGL API.",
+    )
+    sched_update.add_argument(
+        "--force", action="store_true", help="fetch even if the cache looks fresh"
+    )
+    sched_export = schedule_sub.add_parser(
+        "export",
+        parents=[common],
+        help="export the cached timetable as an .ics file",
+        description="Write one VEVENT per class occurrence to ~/Downloads by "
+        "default.",
+    )
+    sched_export.add_argument("--out", metavar="PATH", help="output file")
+    sched_export.add_argument(
+        "--no-open-folder",
+        action="store_true",
+        help="do not reveal the file in Finder",
+    )
+    schedule_sub.add_parser(
+        "calendar",
+        parents=[common],
+        help="teaching-week -> date table used by the cache",
+        description="Show which real dates belong to each teaching week. "
+        "Handy for checking that the cached term is the right one.",
+    )
+    schedule_sub.add_parser(
+        "exams",
+        parents=[common],
+        help="exam arrangements (graduate system; often empty)",
     )
 
     sub.add_parser(
@@ -609,60 +663,6 @@ def build_parser() -> JsonArgumentParser:
         help="only list what would be removed",
     )
 
-    grad = sub.add_parser(
-        "grad",
-        parents=[common],
-        help="graduate system: timetable, calendar, exam arrangements (yjxt.bupt.edu.cn)",
-        description="Graduate student system (yjxt.bupt.edu.cn). Uses the same "
-        "CAS session as `bupt login` — no separate password. For graduate "
-        "accounts only; undergraduate JWGL commands are separate.",
-    )
-    grad_sub = grad.add_subparsers(
-        dest="grad_command",
-        title="grad commands",
-        metavar="<subcommand>",
-        parser_class=JsonArgumentParser,
-    )
-    grad_sched = grad_sub.add_parser(
-        "schedule",
-        parents=[common],
-        help="semester timetable (weekday, periods, room, weeks)",
-        description="Read the semester timetable grid. Each entry carries the "
-        "weekday, period range and the clock times from the official period "
-        "table, plus teacher, room and the weeks the class runs.",
-    )
-    grad_cal = grad_sub.add_parser(
-        "calendar",
-        parents=[common],
-        help="teaching calendar: which dates belong to each teach week",
-        description="Read TermCalender.aspx, the authoritative week-to-date "
-        "mapping (e.g. week 1 starts 2026-08-31).",
-    )
-    grad_ics = grad_sub.add_parser(
-        "ics",
-        parents=[common],
-        help="export the timetable as an .ics calendar into ~/Downloads",
-        description="Combine the timetable with the teaching calendar and write "
-        "one VEVENT per class occurrence, then save it to ~/Downloads.",
-    )
-    grad_ics.add_argument(
-        "--out",
-        metavar="PATH",
-        help="output file (default: ~/Downloads/bupt-<term>.ics)",
-    )
-    grad_ics.add_argument(
-        "--no-open-folder",
-        action="store_true",
-        help="do not reveal the file in Finder",
-    )
-    grad_exam = grad_sub.add_parser(
-        "exams",
-        parents=[common],
-        help="exam arrangements (often empty for graduate courses)",
-        description="Read 学期考核信息查询. The header is returned even when no "
-        "rows exist; graduate courses are usually assessed by coursework.",
-    )
-
     library = sub.add_parser(
         "library",
         parents=[common],
@@ -811,20 +811,6 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         return commands.cmd_uninstall(args)
     if command == "update":
         return commands.cmd_update(args)
-    if command == "grad":
-        sub = getattr(args, "grad_command", None)
-        if sub == "schedule":
-            return commands.cmd_grad_schedule(args)
-        if sub == "calendar":
-            return commands.cmd_grad_calendar(args)
-        if sub == "ics":
-            return commands.cmd_grad_ics(args)
-        if sub == "exams":
-            return commands.cmd_grad_exams(args)
-        raise UsageError(
-            "grad needs a subcommand",
-            hint="try `bupt grad schedule`, `bupt grad ics` or `bupt grad exams`",
-        )
     if command == "library":
         sub = getattr(args, "library_command", None)
         if sub == "search":
