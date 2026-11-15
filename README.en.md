@@ -221,7 +221,7 @@ indentation. Errors go to stderr as
 | `bupt status [--check]` | Show cached session validity without secrets. `--check` performs a read-only live check (ticket issuance + UCloud info); it never submits credentials. |
 | `bupt logout` | Delete `~/.bupt-cli/session.json`. |
 | `bupt homework list [--undone] [--course ID] [--new DAYS] [--limit N]` | Assignments across courses. `--undone` uses the server-side undone endpoint; `--new DAYS` keeps only recently published ones. |
-| `bupt homework show ID [--max-chars N] [--course SITE_ID]` | Assignment detail, submission state (`submitted`, `submit_content`, `submit_attachments`, `submitted_at`), plain-text content and attachment URLs. Teacher attachments are resolved through the UCloud preview endpoint; `--course` limits the submission-time lookup to one course/site id. |
+| `bupt homework show ID [--course SITE_ID]` | Assignment detail, submission state (`submitted`, `submit_content`, `submit_attachments`, `submitted_at`), plain-text content and attachment URLs. Teacher attachments are resolved through the UCloud preview endpoint; `--course` limits the submission-time lookup to one course/site id. |
 | `bupt homework download ID [--dir DIR] [--force]` | Download teacher attachments into `DIR` (CDN URLs; no Blade-Auth). |
 | `bupt homework submit ID [--file PATH]… [--text …] [--resource-id ID]… [--dry-run | --i-confirm-submit] [--no-verify]` | Upload and/or submit. **Never auto-submits**: `--dry-run` plans only; real submit needs `--i-confirm-submit`, and without it nothing is even uploaded. A real submit is then verified with read-only calls (skip with `--no-verify`). |
 | `bupt homework verify ID [--resource-id RID]… [--text TEXT]` | Read-only check that a submission is visible upstream (submit-view + student list). Never submits and never calls a write endpoint. |
@@ -319,12 +319,11 @@ expected text normalised the same way. If you submitted HTML with `--text`,
 pass the visible plain text as the expected `--text` (or omit it to skip the
 content check).
 
-Upstream is eventually consistent, so each attempt sleeps 5 seconds
-seconds (float, `0`–`120`, default `5`) and there are at most two attempts.
-`--no-verify` skips verification. Both flags are accepted with `--dry-run` and
-but have no effect there (that path never submits). The same
-session/token is reused — verification performs no new login and never calls a
-write endpoint.
+Upstream is eventually consistent, so verification waits 5 seconds between
+attempts and makes at most two. `--no-verify` skips verification entirely; it
+is accepted with `--dry-run` too, where it has no effect because that path
+never submits. The same session/token is reused — verification performs no new
+login and never calls a write endpoint.
 
 The submit result gains:
 
@@ -401,7 +400,7 @@ uv run pytest
 ```
 
 The tests cover timestamp parsing, filtering, attachment normalization,
-`homework list --new` state, cookie round-tripping, session-file permissions and
+`homework list --new` filtering, cookie round-tripping, session-file permissions and
 redaction, credentials precedence, CLI error envelopes/exit codes, probe
 helpers, the electricity default-dorm precedence / `buildings` subcommand
 (with a stubbed electricity client, no network), and post-submit verification

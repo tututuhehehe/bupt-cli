@@ -309,7 +309,7 @@ bupt schedule exams           # 考试安排
 PYTHONPATH=src:.deps ~/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bin/python3.14 -m pytest
 ```
 
-当前 **190 个测试**，覆盖：时间解析、过滤、附件归一化、`homework list --new` 状态、Cookie 往返、会话文件权限与脱敏、凭据优先级、CLI 错误信封与退出码、电费默认宿舍优先级与 `buildings`、提交后核验（退出码 6/7）、图书馆解析、研究生课表/日历/iCalendar（含跨年周）、CDP WebSocket 协议（假服务端，11 个场景）、自我更新（含 frozen 原位替换）、卸载护栏。
+当前 **190 个测试**，覆盖：时间解析、过滤、附件归一化、`homework list --new` 的过滤与降级、Cookie 往返、会话文件权限与脱敏、凭据优先级、CLI 错误信封与退出码、电费默认宿舍优先级与 `buildings`、提交后核验（退出码 6/7）、图书馆解析、研究生课表/日历/iCalendar（含跨年周）、CDP WebSocket 协议（假服务端，11 个场景）、自我更新（含 frozen 原位替换）、卸载护栏。
 
 ## 已知限制（2026-11 实测）
 

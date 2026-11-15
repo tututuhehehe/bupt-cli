@@ -80,16 +80,6 @@ def parse_datetime(value: Any) -> Optional[datetime]:
     return parsed
 
 
-def parse_since(value: str) -> datetime:
-    parsed = parse_datetime(value)
-    if parsed is None:
-        raise UsageError(
-            f"invalid --since timestamp '{value}'",
-            hint="use ISO-8601, e.g. 2026-08-01 or 2026-08-01T12:00:00",
-        )
-    return parsed
-
-
 def publish_time(item: HomeworkItem) -> Optional[datetime]:
     """Best available publish/start time for an assignment."""
     for key in PUBLISH_TIME_KEYS:
@@ -156,7 +146,6 @@ def assignment_dict(item: HomeworkItem) -> dict[str, Any]:
 def filter_assignments(
     items: Iterable[HomeworkItem],
     *,
-    since: Optional[datetime] = None,
     course_id: Optional[str] = None,
     undone_only: bool = False,
 ) -> list[HomeworkItem]:
@@ -166,10 +155,6 @@ def filter_assignments(
             continue
         if undone_only and item.is_submitted:
             continue
-        if since is not None:
-            marker = publish_time(item) or deadline(item)
-            if marker is None or marker < since:
-                continue
         selected.append(item)
 
     def sort_key(item: HomeworkItem):
@@ -336,12 +321,11 @@ def resolve_attachment_urls(
     return attachments
 
 
-def detail_dict(detail: HomeworkDetail, max_chars: int = 0) -> dict[str, Any]:
+def detail_dict(detail: HomeworkDetail) -> dict[str, Any]:
+    # Assignment descriptions are short; a long one would be an attachment, so
+    # the content is always returned in full.
     content = detail.content_text
     truncated = False
-    if max_chars and len(content) > max_chars:
-        content = content[:max_chars]
-        truncated = True
     attachments = [
         normalize_attachment(entry, index)
         for index, entry in enumerate(detail.attachments or [])
@@ -366,49 +350,6 @@ def detail_dict(detail: HomeworkDetail, max_chars: int = 0) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # "new homework" seen-state (fallback when upstream has no publish time).
-# ---------------------------------------------------------------------------
-
-
-def load_seen_ids() -> set[str]:
-    path = seen_state_path()
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return set()
-    ids = data.get("ids") if isinstance(data, dict) else None
-    if not isinstance(ids, list):
-        return set()
-    return {str(item) for item in ids if item}
-
-
-def save_seen_ids(ids: Iterable[str]) -> None:
-    path = seen_state_path()
-    directory = path.parent
-    directory.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
-    # Keep the newest entries bounded; upstream ids are opaque strings.
-    ordered = list(dict.fromkeys(str(item) for item in ids if item))[-5000:]
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(
-            {"ids": ordered, "updated_at": int(time.time())},
-            handle,
-            ensure_ascii=False,
-        )
-    os.replace(tmp, path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# UCloud homework upload / submit (write paths).
 # ---------------------------------------------------------------------------
 
 

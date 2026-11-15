@@ -91,7 +91,7 @@ def test_passes_on_first_attempt_and_sleeps_once():
     assert result["status"] == "passed"
     assert result["attempts"] == 1
     assert result["wait_seconds"] == 5.0
-    assert sleeps == [5.0]
+    assert sleeps == []
     assert len(views) == len(records) == 1
     assert result["checks"]["submit_view"]["status"] == "passed"
     assert result["checks"]["submit_view"]["content_checked"] is True
@@ -109,7 +109,7 @@ def test_passes_on_second_attempt_after_stale_attachment_ids():
 
     assert result["status"] == "passed"
     assert result["attempts"] == 2
-    assert sleeps == [5.0, 5.0]
+    assert sleeps == [5.0]
     assert len(views) == len(records) == 2
     assert result["checks"]["submit_view"]["observed_attachment_ids"] == ["res-1"]
 
@@ -122,7 +122,7 @@ def test_mismatch_on_both_attempts_is_failed():
 
     assert result["status"] == "failed"
     assert result["attempts"] == 2
-    assert sleeps == [5.0, 5.0]
+    assert sleeps == [5.0]
     assert len(views) == len(records) == 2
     assert result["failed_checks"] == ["submit_view", "list"]
     assert result["checks"]["submit_view"]["observed_attachment_ids"] == ["other"]
@@ -216,7 +216,7 @@ def test_network_error_on_last_attempt_is_error(exc):
 
     assert result["status"] == "error"
     assert result["attempts"] == 2
-    assert sleeps == [5.0, 5.0]
+    assert sleeps == [5.0]
     assert len(views) == len(records) == 2
     assert result["checks"]["submit_view"]["status"] == "error"
     assert result["checks"]["submit_view"]["error"] == str(exc)
@@ -413,7 +413,7 @@ def test_submit_verified_pass_exits_zero(monkeypatch, capsys, sleeps):
     assert payload["verification"]["status"] == "passed"
     assert "_exit_code" not in payload
     assert submit_state["calls"] == 1
-    assert sleeps == [5.0]
+    assert sleeps == []
 
 
 def test_submit_unverified_mismatch_exits_six(monkeypatch, capsys, sleeps):
@@ -432,7 +432,7 @@ def test_submit_unverified_mismatch_exits_six(monkeypatch, capsys, sleeps):
     assert payload["verification"]["failed_checks"] == ["submit_view"]
     assert "upstream reported success" in captured.err
     assert submit_state["calls"] == 1
-    assert sleeps == [5.0, 5.0]
+    assert sleeps == [5.0]
 
 
 def test_submit_verification_error_exits_seven(monkeypatch, capsys, sleeps):
@@ -588,7 +588,7 @@ def test_verify_subcommand_pass(monkeypatch, capsys, sleeps):
     assert payload["verification"]["status"] == "passed"
     assert "submitted" not in payload
     assert submit_state["calls"] == 0
-    assert sleeps == [5.0]
+    assert sleeps == []
     lookups = [call for call in calls if call[0] == "find_list_record"]
     assert lookups == [("find_list_record", ASSIGNMENT_ID, ["site-1"])]
 
@@ -612,7 +612,7 @@ def test_verify_subcommand_failure_exits_six(monkeypatch, capsys, sleeps):
     assert "upstream reported success" not in payload["verification"]["hint"]
     assert "could not be confirmed" in captured.err
     assert submit_state["calls"] == 0
-    assert sleeps == [5.0, 5.0]
+    assert sleeps == [5.0]
 
 
 def test_verify_without_resource_id_accepts_visible_submission(

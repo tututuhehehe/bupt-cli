@@ -65,23 +65,6 @@ def _float_at_least(minimum: float, label: str = "value"):
     return parse
 
 
-def _float_in_range(minimum: float, maximum: float, label: str = "value"):
-    """Argparse type for a finite float in an inclusive range."""
-
-    def parse(value: str) -> float:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            raise argparse.ArgumentTypeError(f"{label} must be a number") from None
-        if not math.isfinite(number) or not minimum <= number <= maximum:
-            raise argparse.ArgumentTypeError(
-                f"{label} must be between {minimum:g} and {maximum:g}"
-            )
-        return number
-
-    return parse
-
-
 def _positive_float(value: str) -> float:
     """Argparse type for a finite float greater than zero."""
 
@@ -692,8 +675,6 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
         sub = getattr(args, "homework_command", None)
         if sub == "list":
             return commands.cmd_homework_list(args)
-        if sub == "new":
-            return commands.cmd_homework_new(args)
         if sub == "show":
             return commands.cmd_homework_show(args)
         if sub == "download":
@@ -704,7 +685,7 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return commands.cmd_homework_verify(args)
         raise UsageError(
             "homework requires a subcommand",
-            hint="choose one of: list, new, show, download, submit, verify",
+            hint="choose one of: list, show, download, submit, verify",
         )
     if command == "courses":
         return commands.cmd_courses(args)

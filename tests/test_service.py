@@ -9,12 +9,9 @@ from bupt_cli.service import (
     assignment_dict,
     detail_dict,
     filter_assignments,
-    load_seen_ids,
     normalize_attachment,
     parse_datetime,
-    parse_since,
     publish_time,
-    save_seen_ids,
 )
 
 
@@ -43,11 +40,6 @@ def test_parse_datetime_formats():
     assert parse_datetime("") is None
     assert parse_datetime("not-a-date") is None
     assert parse_datetime(None) is None
-
-
-def test_parse_since_rejects_bad_value():
-    with pytest.raises(UsageError):
-        parse_since("yesterday-ish")
 
 
 def test_publish_time_prefers_assignment_begin_time():
@@ -81,14 +73,12 @@ def test_assignment_dict_status_and_fields():
     assert assignment_dict(overdue)["status"] == "overdue"
 
 
-def test_filter_assignments_course_since_and_limit_semantics():
+def test_filter_assignments_course_and_undone_semantics():
     items = [
         make_item(activity_id="a1", site_id="s1", end_time="2026-11-01 00:00"),
         make_item(activity_id="a2", site_id="s2", end_time="2026-12-01 00:00"),
         make_item(activity_id="a3", site_id="s1", end_time="2026-10-01 00:00"),
     ]
-    filtered = filter_assignments(items, since=datetime(2026, 10, 15))
-    assert [item.activity_id for item in filtered] == ["a1", "a2"]
     by_course = filter_assignments(items, course_id="s1")
     assert [item.activity_id for item in by_course] == ["a3", "a1"]
     submitted_as_undone = filter_assignments(
@@ -121,19 +111,6 @@ def test_detail_dict_truncates_content():
     assert full["content_text"] == "hello world"
     assert full["content_truncated"] is False
     assert full["attachments"][0]["resource_id"] == "r1"
-
-    truncated = detail_dict(detail, max_chars=5)
-    assert truncated["content_text"] == "hello"
-    assert truncated["content_truncated"] is True
-
-
-def test_seen_state_roundtrip(monkeypatch, tmp_path):
-    monkeypatch.setenv("BUPT_CLI_CACHE_DIR", str(tmp_path))
-    save_seen_ids(["a", "b", "a"])
-    assert load_seen_ids() == {"a", "b"}
-    path = tmp_path / "homework-seen.json"
-    assert path.exists()
-    assert (path.stat().st_mode & 0o777) == 0o600
 
 
 def test_cookie_snapshot_and_restore():

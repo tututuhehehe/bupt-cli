@@ -183,7 +183,9 @@ def verify_submission(
 ) -> dict[str, Any]:
     """Read-only verification of a submission.
 
-    Each attempt sleeps ``wait`` seconds, then runs both checks. The upstream
+    The first attempt runs immediately; ``wait`` seconds are slept only before
+    a *retry*, since waiting before the first try just delays the answer. The
+    upstream
     is eventually consistent, so a failed first attempt is retried once by
     default. The final status is decided from the *last* attempt:
 
@@ -200,7 +202,8 @@ def verify_submission(
     checks: dict[str, Any] = {}
     last_attempt = 0
     for attempt in range(1, max(1, int(attempts)) + 1):
-        sleep(wait)
+        if attempt > 1:
+            sleep(wait)
         last_attempt = attempt
         checks = {
             "submit_view": _check_submit_view(

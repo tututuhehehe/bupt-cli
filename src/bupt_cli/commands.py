@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import math
 import os
 import re
 import time
@@ -31,11 +30,9 @@ from bupt_cli.service import (
     download_url_to_path,
     filter_assignments,
     get_submit_view,
-    load_seen_ids,
     parse_datetime,
     publish_time,
     resolve_attachment_urls,
-    save_seen_ids,
     status_for,
     submit_homework,
     upload_homework_file,
@@ -43,7 +40,6 @@ from bupt_cli.service import (
 from bupt_cli.session import (
     BuptSession,
     delete_session,
-    seen_state_path,
     session_path,
 )
 from bupt_cli.verify import (
@@ -401,21 +397,23 @@ def cmd_homework_list(args) -> dict[str, Any]:
             undone_only=args.undone,
         )
 
-        note = None
         published_at: dict[str, dt.datetime] = {}
+        unknown: list = []
+        stats: dict[str, Any] = {}
         if new_days is not None:
-            published_at, note = _resolve_publish_times(client, items)
             cutoff = dt.datetime.now() - dt.timedelta(days=new_days)
-            selected = [
+            published_at, unknown, stats = _resolve_publish_times(client, selected)
+            fresh = [
                 item
                 for item in selected
                 if published_at.get(str(item.activity_id)) is not None
                 and published_at[str(item.activity_id)] >= cutoff
             ]
-            selected.sort(
+            fresh.sort(
                 key=lambda item: published_at[str(item.activity_id)],
                 reverse=True,
             )
+            selected = fresh
 
         if args.limit and args.limit > 0:
             selected = selected[: args.limit]
@@ -438,30 +436,119 @@ def cmd_homework_list(args) -> dict[str, Any]:
             },
             "assignments": assignments,
         }
-        if note:
-            payload["note"] = note
+        if new_days is not None:
+            payload["publish_time"] = {
+                "looked_up": stats.get("looked_up", 0),
+                "resolved": len(published_at),
+                "unknown": len(unknown),
+                "failed": stats.get("failed", 0),
+                "lookup_limit": PUBLISH_LOOKUP_LIMIT,
+            }
+            if unknown:
+                # Never drop assignments silently: say how many could not be
+                # dated, so a "0 results" answer cannot be misread as "nothing
+                # new was assigned".
+                payload["unknown_publish_time"] = [str(i.activity_id) for i in unknown]
+            payload["note"] = _new_filter_note(
+                items_total=len(items),
+                selected_before=len(
+                    filter_assignments(
+                        items,
+                        course_id=args.course,
+                        undone_only=args.undone,
+                    )
+                ),
+                stats=stats,
+                unknown=len(unknown),
+            )
         return payload
     finally:
         _persist(session)
 
 
-def _resolve_publish_times(
-    client, items: list
-) -> tuple[dict[str, dt.datetime], str]:
-    """Fill in publish times via the detail endpoint.
+def _new_filter_note(
+    *,
+    items_total: int,
+    selected_before: int,
+    stats: dict[str, Any],
+    unknown: int,
+) -> str:
+    """Explain what ``--new`` did, including anything it could not decide."""
+    if items_total == 0:
+        return "没有作业（上游返回空列表）"
+    if selected_before == 0:
+        return "过滤条件（--course / --undone）下没有作业"
+    resolved = stats.get("resolved", 0)
+    looked_up = stats.get("looked_up", 0)
+    failed = stats.get("failed", 0)
+    parts = [
+        f"按发布时间过滤：{selected_before} 条候选中解析出 {resolved} 条发布时间"
+    ]
+    if looked_up:
+        parts.append(f"逐个查详情 {looked_up} 次（上限 {PUBLISH_LOOKUP_LIMIT}）")
+    if failed:
+        parts.append(f"{failed} 次详情请求失败")
+        error = stats.get("last_error")
+        if error:
+            parts.append(f"最后一个错误：{error}")
+    if unknown:
+        parts.append(
+            f"{unknown} 条拿不到发布时间，已排除（见 unknown_publish_time），"
+            "结果可能不完整"
+        )
+    return "；".join(parts)
 
-    The assignment list usually omits ``assignmentBeginTime``, so filtering by
-    "when was this set" needs one detail call per assignment. Bounded so a
-    course with hundreds of assignments cannot turn into a long crawl.
+
+def _resolve_publish_times(
+    client, targets: list
+) -> tuple[dict[str, dt.datetime], list, dict[str, Any]]:
+    """Recover publish times for the assignments we are about to filter.
+
+    ``targets`` must already be narrowed by --course/--undone: spending the
+    lookup budget on assignments the caller filtered out would starve the ones
+    that actually matter.
+
+    Ordered newest-deadline-first because publication order tracks deadlines,
+    so a truncated budget still finds the recent batches. Everything that could
+    not be dated is returned separately instead of being dropped silently.
     """
+    ordered = sorted(
+        targets,
+        key=lambda item: (
+            item.parsed_end_time is None,
+            item.parsed_end_time or dt.datetime.min,
+        ),
+        reverse=True,
+    )
+
     published: dict[str, dt.datetime] = {}
-    for item in items[:PUBLISH_LOOKUP_LIMIT]:
+    looked_up = 0
+    failed = 0
+    last_error: Optional[str] = None
+    budget = PUBLISH_LOOKUP_LIMIT
+
+    # A list row that already carries a publish time needs no detail call.
+    for item in ordered:
         activity_id = str(getattr(item, "activity_id", "") or "")
         if not activity_id:
             continue
+        parsed = publish_time(item)
+        if parsed is not None:
+            published[activity_id] = parsed
+
+    for item in ordered:
+        activity_id = str(getattr(item, "activity_id", "") or "")
+        if not activity_id or activity_id in published:
+            continue
+        if budget <= 0:
+            break
+        budget -= 1
+        looked_up += 1
         try:
             detail = client.get_homework_detail(activity_id)
-        except Exception:
+        except Exception as exc:  # recorded below, never silent
+            failed += 1
+            last_error = f"{exc.__class__.__name__}: {exc}"
             continue
         parsed = parse_datetime(
             detail.raw.get("assignmentBeginTime")
@@ -471,24 +558,18 @@ def _resolve_publish_times(
         if parsed is not None:
             published[activity_id] = parsed
 
-    # Anything the detail call missed may still carry a time in the list row.
-    for item in items:
-        activity_id = str(getattr(item, "activity_id", "") or "")
-        if not activity_id or activity_id in published:
-            continue
-        parsed = publish_time(item)
-        if parsed is not None:
-            published[activity_id] = parsed
-
-    if not published:
-        return {}, (
-            "上游没有返回任何发布时间（详情接口也没有），--new 无法过滤；"
-            "去掉 --new 查看全部作业"
-        )
-    return published, (
-        "按发布时间过滤（列表接口通常不返回，逐个查详情补上；"
-        f"最多查 {PUBLISH_LOOKUP_LIMIT} 个）"
-    )
+    unknown = [
+        item
+        for item in targets
+        if str(getattr(item, "activity_id", "") or "") not in published
+    ]
+    stats = {
+        "looked_up": looked_up,
+        "resolved": len(published),
+        "failed": failed,
+        "last_error": last_error,
+    }
+    return published, unknown, stats
 
 
 def _short_error(exc: BaseException, limit: Optional[int] = 200) -> str:
@@ -682,7 +763,7 @@ def cmd_homework_show(args) -> dict[str, Any]:
     client = _client(session)
     try:
         detail = client.get_homework_detail(args.id)
-        payload = detail_dict(detail, max_chars=0)
+        payload = detail_dict(detail)
         payload["course"] = (
             detail.raw.get("siteName")
             or detail.raw.get("site_name")

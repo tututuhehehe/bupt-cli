@@ -134,11 +134,8 @@ def test_http_401_network_error_maps_auth():
         ["--timeout", "0", "courses"],
         ["courses", "--size", "0"],
         ["courses", "--page", "0"],
-        ["homework", "list", "--page-size", "0"],
-        ["homework", "list", "--max-courses", "0"],
         ["homework", "list", "--limit", "-1"],
-        ["homework", "new", "--detail-lookups", "-1"],
-        ["homework", "show", "1", "--max-chars", "-1"],
+        ["homework", "list", "--new", "-1"],
         ["notices", "--count", "-1"],
         ["notices", "--page", "-1"],
         ["probe", "--request-timeout", "0"],
@@ -179,7 +176,7 @@ def test_cli_error_messages_are_redacted(monkeypatch, capsys, tmp_path):
 
 
 def test_homework_submit_requires_confirm_flag(monkeypatch, tmp_path):
-    """Without --i-confirm-submit / --dry-run / --upload-only the CLI must refuse
+    """Without --i-confirm-submit / --dry-run the CLI must refuse
     before any network call when only --text is given and confirm is missing.
     (Network is mocked away by making credentials missing → auth error is also
     acceptable; we assert the usage path with a stub session instead.)

@@ -43,7 +43,7 @@ Probe summary: **22 ok, 6 fail, 11 skipped (39 checks)**.
 | UCloud | attachments in `assignmentResource` | works | `assignmentResource[0].resourceId/resourceName` | **Not** `attachmentList` (null on this account); vendored parser patched. |
 | UCloud | `GET /ykt-site/work/submit-view?assignmentId=…` | works | HTTP 200, `status=2`, empty content | Read-only current submission view, the source of `homework show` submission fields. Submitted: `assignmentId=<id>`, non-empty `attachmentIds`; not submitted: `assignmentId=-1`, empty `attachmentIds`, `assignmentStatus=99`. Also used by `homework submit --dry-run`, post-submit verification, and `homework verify`. |
 | UCloud | `POST /blade-source/resource/upload/biz` (`bizType=3`) | works | HTTP 200, `success=true`, `data=<resourceId>` | Multipart `file` + `userId` + `bizType`. Verified with a throwaway `.txt` (sword `Authorization: Basic c3dvcmQ6…`). Does **not** attach to homework by itself. |
-| UCloud | `POST /ykt-site/work/submit` | implemented, not live-fired | Body shape from YouXam/ucloud + Yokumii | `{assignmentId, assignmentType:0, assignmentContent, attachmentIds, userId, groupId:"", commitId:""}`. CLI requires `--i-confirm-submit`; dry-run / upload-only verified; **no real assignment was submitted**. After a real submit the CLI follows with read-only verification (`submit-view` + `student/list`) and reports `verified` / `verification`; verification never calls a write endpoint. |
+| UCloud | `POST /ykt-site/work/submit` | implemented, not live-fired | Body shape from YouXam/ucloud + Yokumii | `{assignmentId, assignmentType:0, assignmentContent, attachmentIds, userId, groupId:"", commitId:""}`. CLI requires `--i-confirm-submit` (checked *before* any upload); dry-run verified; **no real assignment was submitted**. After a real submit the CLI follows with read-only verification (`submit-view` + `student/list`) and reports `verified` / `verification`; verification never calls a write endpoint. |
 | UCloud | `GET fileucloud.bupt.edu.cn/ucloud/document/…` | works | HTTP 200 PDF (≈101 KB / ≈1.2 MB) | Teacher attachment CDN. Must **not** send Blade-Auth (CDN returns 400). `homework download` strips auth for this host. |
 
 ## Dorm electricity (`app.bupt.edu.cn`)
@@ -131,15 +131,13 @@ bupt status --check                ok (CAS ticket yes, UCloud info 200)
 bupt homework list                 ok (3 assignments)
 bupt homework list --undone        ok (2 pending, course names resolved)
 bupt homework list --course ID     ok
-bupt homework list --since DATE    ok
-bupt homework new --days 7         ok (method=publish_time, 2 items)
+bupt homework list --new 7         ok (publish_time filter, 1 item)
 bupt homework show ID              ok (content, course, PDF attachment URL, submit-view state, submitted_at)
 bupt homework show ID --course ID  ok (submission-time lookup restricted to one site)
 bupt homework download ID --dir D  ok (PDFs saved; CDN without Blade-Auth)
 bupt homework submit … --dry-run   ok (planned payload; no upload/submit)
-bupt homework submit … --upload-only ok (resourceId returned; /work/submit NOT called)
 bupt homework submit (no flag)     ok (refuses; usage error, exit 2)
-bupt homework submit … --i-confirm-submit [--verify-wait N] [--no-verify]
+bupt homework submit … --i-confirm-submit [--no-verify]
                                    implemented, offline-tested only (no live submit fired)
 bupt homework verify ID            implemented, offline-tested only (read-only; not live-run)
 bupt courses                       ok (11 courses)
