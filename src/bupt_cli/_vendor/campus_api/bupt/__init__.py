@@ -1,0 +1,82 @@
+"""bupt - BUPT campus services module."""
+
+from bupt_cli._vendor.campus_api.bupt.client import AsyncBuptClient, BuptClient
+from bupt_cli._vendor.campus_api.bupt.constants import BuptBuilding, CampusArea, NoticeType
+from bupt_cli._vendor.campus_api.bupt.electricity import AsyncElectricityService, ElectricityService
+from bupt_cli._vendor.campus_api.bupt.homework import AsyncHomeworkService, HomeworkService
+from bupt_cli._vendor.campus_api.bupt.mobile_jwgl import (
+    AsyncMobileJwglService,
+    AsyncMobileJwglSessionManager,
+    MobileJwglService,
+    MobileJwglSessionManager,
+    SjdClassroomEntry,
+    SjdCourse,
+    SjdCourseScore,
+    SjdCurriculumWeek,
+    SjdDay,
+    SjdKeyedValue,
+    SjdKbMode,
+    SjdNode,
+    SjdScoreReport,
+    curriculum_to_overview,
+    expand_week_numbers,
+    parse_course_slots,
+)
+from bupt_cli._vendor.campus_api.bupt.models import (
+    CampusCardBalance,
+    ContentBlock,
+    CourseItem,
+    CourseSite,
+    ElectricityInfo,
+    HomeworkDetail,
+    HomeworkItem,
+    HomeworkOverview,
+    NoticeDetail,
+    NoticeItem,
+    ScheduleOverview,
+)
+from bupt_cli._vendor.campus_api.bupt.portal import AsyncPortalService, PortalService
+from bupt_cli._vendor.campus_api.bupt.schedule import AsyncScheduleService, ScheduleService
+
+__all__ = [
+    "BuptClient",
+    "AsyncBuptClient",
+    "BuptBuilding",
+    "CampusArea",
+    "NoticeType",
+    "ElectricityInfo",
+    "CampusCardBalance",
+    "ElectricityService",
+    "AsyncElectricityService",
+    "HomeworkService",
+    "AsyncHomeworkService",
+    "HomeworkItem",
+    "HomeworkOverview",
+    "HomeworkDetail",
+    "CourseSite",
+    "ScheduleService",
+    "AsyncScheduleService",
+    "CourseItem",
+    "ScheduleOverview",
+    "PortalService",
+    "AsyncPortalService",
+    "NoticeItem",
+    "NoticeDetail",
+    "ContentBlock",
+    "MobileJwglService",
+    "AsyncMobileJwglService",
+    "MobileJwglSessionManager",
+    "AsyncMobileJwglSessionManager",
+    "SjdCurriculumWeek",
+    "SjdCourse",
+    "SjdDay",
+    "SjdNode",
+    "SjdKbMode",
+    "SjdKeyedValue",
+    "SjdClassroomEntry",
+    "SjdCourseScore",
+    "SjdScoreReport",
+    "curriculum_to_overview",
+    "expand_week_numbers",
+    "parse_course_slots",
+]

@@ -1,0 +1,25 @@
+# Third-party notices
+
+This project vendors and adapts code from **Windy-Dance/campus-api**
+(https://github.com/Windy-Dance/campus-api), Python SDK
+`python/campus_api/`, which is licensed under the MIT License.
+
+The vendored copy lives at `src/bupt_cli/_vendor/campus_api/` and its
+license text is kept at `src/bupt_cli/_vendor/campus_api/LICENSE`.
+
+Copyright (c) Windy-Dance and contributors.
+
+The CLI wrapper (`src/bupt_cli/`), tests and documentation in this repository
+are provided under the MIT License as well.
+
+Endpoint research also referenced these MIT/other licensed community
+projects (no code copied):
+
+- ZeroCore-Zero/BUPT_APIS
+- YouXam/ucloud
+- Yokumii/bupt-api-collected
+- wzekin/bupt-api
+- uarix/BUPT-API-Collection
+
+All campus systems remain the property of Beijing University of Posts and
+Telecommunications. This project is unofficial and not production software.

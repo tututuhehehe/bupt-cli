@@ -1,0 +1,24 @@
+.venv/
+.deps/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.uv/
+credentials.json
+credentials *.json
+config.json
+session.json
+homework-seen.json
+.env
+*.local.json
+
+# macOS
+.DS_Store
+
+# Runtime leftovers if BUPT_CLI_CONFIG_DIR points inside the repo
+yjxt-cookies.json
+*.ics
