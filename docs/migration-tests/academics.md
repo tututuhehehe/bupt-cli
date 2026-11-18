@@ -12,7 +12,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 
 1. **课表快照归属**：用例假设 Rust 快照格式为 v2，顶层带 `username` 和既有 `role`。只有 `username` 等于当前凭据、`role` 等于当前身份时才可服务 `schedule` / `schedule calendar` / `schedule export`。v1 没有 `username`，属于“无法确认归属”，必须提示 `schedule update`，不能按 `role` 猜测后继续。
 2. **缓存位置**：沿用旧行为，fixture 写到 `BUPT_CLI_CACHE_DIR/timetable.json`；凭据写到 `BUPT_CLI_CONFIG_DIR/credentials.json`。
-3. **不联网**：所有用例通过共享 `Sandbox` 隔离 HOME/config/cache，并把 `HTTP(S)_PROXY`/`ALL_PROXY` 指向关闭的本地端口。这样即使实现意外尝试刷新，也不会到达真实校园网。
+3. **网络隔离边界**：共享 `Sandbox` 只隔离 HOME/config/cache。把 `HTTP(S)_PROXY`/`ALL_PROXY` 指向关闭的本地端口是 best-effort，只对遵守这些环境变量的 HTTP 客户端生效；它不覆盖浏览器/非 HTTP 流量，也不能证明“没有发起网络请求”。真正的 no-calls 断言必须放在后续注入 transport/browser 的场景里（见下）。
 4. **动态日期**：快照的教学周围绕 UTC 当天生成（前后各数周），避免测试在学期结束后因“过期”而误判；断言的具体日期由同一套日期算法算出。
 
 ## 用例映射
@@ -26,8 +26,8 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `cached_calendar_is_week_ordered_and_monday_anchored` | `test_timetable.py::test_build_calendar_is_monday_anchored`、`test_week_of_and_day_range` | `schedule calendar` 输出按周排序、周一到周日、日期数量正确；不重写缓存 |
 | `cached_week_query_resolves_real_dates_and_inclusive_range` | `test_timetable.py::test_occurrences_range_is_inclusive_on_both_ends` | `--week N` 使用真实日期表，范围两端包含；只返回该周课程 |
 | `cached_export_writes_an_anonymized_ics_with_real_dates` | `test_timetable.py::test_build_ics_emits_one_event_per_session`、`test_build_ics_is_crlf_and_folded` | `schedule export` 每个 occurrence 一个 VEVENT；真实日期、开始/结束时间、SUMMARY/LOCATION、CRLF、折叠宽度、末周课程也导出 |
-| `ics_folds_long_utf8_lines` | `test_timetable.py::test_build_ics_is_crlf_and_folded`、`test_grad.py::test_build_ics_is_crlf_and_folded` | 长中文 SUMMARY 按 UTF-8 八位字节折行，每行不超过 76 字节 |
-| `export_succeeds_even_when_opening_the_folder_fails` | 合同“导出文件成功不因打开系统文件管理器失败变成导出失败” | Unix 下伪造 `open` 退出 9，`schedule export` 仍成功且文件存在 |
+| `ics_folds_long_utf8_lines` | `test_timetable.py::test_build_ics_is_crlf_and_folded`、`test_grad.py::test_build_ics_is_crlf_and_folded` | 长中文 SUMMARY 按 UTF-8 八位字节折行，每行不超过 76 字节；按 RFC 5545 去折行后必须逐字节还原完整 SUMMARY，拒绝截断或省略 |
+| `export_succeeds_even_when_opening_the_folder_fails` | 合同“导出文件成功不因打开系统文件管理器失败变成导出失败” | Unix 下伪造 `open` 写 sentinel 后退出 9：证明 opener 确实被调用，同时 `schedule export` 仍成功且文件存在；真实 Windows reveal 仍未实测 |
 | `corrupt_and_wrong_version_caches_require_an_explicit_update` | `test_timetable.py::test_load_rejects_corrupt_or_wrong_version` | 损坏 JSON、未来版本、缺 `courses` 的快照不导致 panic/假成功；提示 `schedule update`；不重写缓存 |
 | `unattributed_v1_cache_is_refused_instead_of_guessed` | 合同“不能确认旧快照归属时提示刷新” | v1 有 `role` 但无账号：query/calendar/export 全部拒绝，提示刷新，不生成导出文件 |
 | `cache_owned_by_another_account_is_refused` | 合同“只读当前学号及身份的可用课表快照” | v2 快照属于另一学号：三种读取命令全部拒绝，不泄漏/导出旧账号课表 |
@@ -45,6 +45,8 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 ## 暂不能黑盒验证的场景与最小测试缝
 
 以下场景需要整合者先同意一个可注入的依赖缝；本轮不写假断言，也不猜公开字段。
+
+**注入缝的硬性断言**：`schedule` / `schedule calendar` / `schedule export` 的成功与拒绝路径都必须断言 transport/browser 调用日志为 0 次；`schedule update`、`exams` 等显式取数路径则断言目标与调用次数。仅把代理指向关闭端口不满足这一要求，也不能代替调用日志。
 
 1. **研究生课表/教学日历解析**（`test_grad.py::test_parse_timetable_*`、`test_merge_periods_collapses_consecutive_blocks`、`test_parse_course_cell_*`、`test_parse_calendar_*`、`test_term_from_html_*`；`test_cli_errors.py::test_timetable_calendar_uses_the_page_term`、`test_timetable_calendar_without_term_raises`）
    - 需要可替换 `grad_browser.collect` 的页面来源（或明确的本地 fixture transport），把 `timetable_graduate.html` / `calendar_graduate.html` 喂给 `schedule update`。
@@ -66,6 +68,6 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 8. **本周/今天/明天的时钟边界**
    - 需要可注入时钟或固定 `--date` 已覆盖单日；跨周（周日/周一）、学期外 fallback 仍待确定语义后补。
 9. **Windows 下打开导出目录失败**
-   - 当前只在 Unix 伪造 `open` 失败；Windows 的 explorer 启动失败需在 Windows 验收或实现侧的启动器抽象中覆盖。
+   - 当前 Unix 用 sentinel 证明伪造 `open` 被调用且退出 9 后导出仍成功；Windows 的 explorer 路径与启动失败仍未实测，需在 Windows 验收或实现侧的启动器抽象中覆盖。
 10. **课表/考试页面真实上游结构**
     - 属于校园网真实验收，按合同另行记录并经用户确认后运行；不得混入离线测试。

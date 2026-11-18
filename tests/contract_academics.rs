@@ -1,3 +1,4 @@
+// The shared harness predates rustfmt and is outside this lane's allowlist.
 #[rustfmt::skip]
 mod contract_support;
 
@@ -117,10 +118,12 @@ fn write_cache(sandbox: &Sandbox, entry: &Value) -> (PathBuf, Vec<u8>) {
     (path, bytes)
 }
 
-fn offline_command(sandbox: &Sandbox) -> Command {
+fn network_guarded_command(sandbox: &Sandbox) -> Command {
     let mut command = sandbox.command();
-    // If implementation accidentally tries to refresh, fail against a closed
-    // local port instead of ever reaching a campus service.
+    // Best-effort only: HTTP clients that honor proxy variables fail against a
+    // closed local port. This does not cover browser/non-HTTP traffic and does
+    // not prove the CLI made no network attempt; injected transport scenarios
+    // must assert the call count explicitly.
     for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
         command.env(name, "http://127.0.0.1:9");
     }
@@ -133,7 +136,7 @@ fn offline_command(sandbox: &Sandbox) -> Command {
 
 fn run(sandbox: &Sandbox, args: &[&str]) -> Invocation {
     Invocation(
-        offline_command(sandbox)
+        network_guarded_command(sandbox)
             .args(args)
             .output()
             .expect("run isolated CLI"),
@@ -604,6 +607,11 @@ fn ics_folds_long_utf8_lines() {
     assert_eq!(payload["events"], json!(1));
     let ics = fs::read_to_string(&out).expect("read exported ICS");
     assert!(ics.contains("BEGIN:VEVENT"));
+    assert!(ics.contains("\r\n"), "ICS must use CRLF: {ics:?}");
+    assert!(
+        ics.contains("\r\n "),
+        "the long SUMMARY must have a folded continuation: {ics:?}"
+    );
     for line in ics.split("\r\n") {
         assert!(
             line.as_bytes().len() <= 76,
@@ -611,6 +619,19 @@ fn ics_folds_long_utf8_lines() {
             line.as_bytes().len()
         );
     }
+
+    // RFC 5545 unfolding: remove CRLF plus the single leading continuation
+    // space, then compare the original summary byte-for-byte.
+    let unfolded = ics.replace("\r\n ", "");
+    let summary_line = unfolded
+        .lines()
+        .find(|line| line.starts_with("SUMMARY:"))
+        .expect("unfolded SUMMARY line");
+    assert_eq!(summary_line, format!("SUMMARY:{long_name}"));
+    assert!(
+        !ics.lines().any(|line| line == summary_line),
+        "the complete SUMMARY must not fit on one physical line: {ics:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -625,8 +646,13 @@ fn export_succeeds_even_when_opening_the_folder_fails() {
 
     let bin = sandbox.root().join("fake-bin");
     fs::create_dir(&bin).expect("create fake bin");
+    let sentinel = sandbox.root().join("opener-invoked");
     let opener = bin.join("open");
-    fs::write(&opener, "#!/bin/sh\nexit 9\n").expect("write failing opener");
+    fs::write(
+        &opener,
+        "#!/bin/sh\nprintf invoked > \"$BUPT_TEST_OPEN_SENTINEL\"\nexit 9\n",
+    )
+    .expect("write failing opener");
     let mut permissions = fs::metadata(&opener).expect("stat opener").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&opener, permissions).expect("make opener executable");
@@ -634,8 +660,9 @@ fn export_succeeds_even_when_opening_the_folder_fails() {
     let out = sandbox.root().join("opener-failure.ics");
     let path = format!("{}:/usr/bin:/bin", bin.display());
     let invocation = Invocation(
-        offline_command(&sandbox)
+        network_guarded_command(&sandbox)
             .env("PATH", path)
+            .env("BUPT_TEST_OPEN_SENTINEL", &sentinel)
             .args(["schedule", "export", "--out", out.to_str().unwrap()])
             .output()
             .expect("run export with failing opener"),
@@ -645,6 +672,10 @@ fn export_succeeds_even_when_opening_the_folder_fails() {
     assert!(
         out.exists(),
         "the ICS must exist despite the opener failure"
+    );
+    assert_eq!(
+        fs::read_to_string(&sentinel).expect("fake opener was not invoked"),
+        "invoked"
     );
 }
 
