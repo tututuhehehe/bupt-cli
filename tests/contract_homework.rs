@@ -2,6 +2,7 @@ mod contract_support;
 
 use contract_support::{Invocation, Sandbox};
 use serde_json::Value;
+use std::fs;
 
 const SCHEMA: &str = "bupt.v1";
 const ASSIGNMENT_ID: &str = "1000000000000000001";
@@ -32,6 +33,12 @@ fn assert_error(inv: &Invocation, code: i32, error_type: &str) -> Value {
         describe(inv)
     );
     document
+}
+
+#[test]
+fn courses_reaches_the_auth_boundary_without_credentials() {
+    let sandbox = Sandbox::new();
+    assert_error(&sandbox.run(&["courses"]), 3, "auth");
 }
 
 #[test]
@@ -112,6 +119,74 @@ fn submit_rejects_dry_run_with_confirmation_before_credentials() {
         ]),
         2,
         "usage",
+    );
+}
+
+#[test]
+fn homework_subcommands_accept_documented_flags_before_credentials() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.root().join("answer.pdf"), b"synthetic answer\n")
+        .expect("write synthetic answer file");
+    for args in [
+        vec!["homework", "show", ASSIGNMENT_ID, "--course", "123"],
+        vec![
+            "homework",
+            "download",
+            ASSIGNMENT_ID,
+            "--dir",
+            "downloads",
+            "--force",
+        ],
+        vec![
+            "homework",
+            "verify",
+            ASSIGNMENT_ID,
+            "--resource-id",
+            "resource-1",
+            "--text",
+            "synthetic",
+        ],
+        vec![
+            "homework",
+            "submit",
+            ASSIGNMENT_ID,
+            "--file",
+            "answer.pdf",
+            "--text",
+            "synthetic",
+            "--resource-id",
+            "resource-1",
+            "--i-confirm-submit",
+            "--no-verify",
+        ],
+    ] {
+        assert_error(&sandbox.run(&args), 3, "auth");
+    }
+}
+
+#[test]
+fn submit_without_confirmation_is_usage_before_credentials() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.root().join("answer.pdf"), b"synthetic answer\n")
+        .expect("write synthetic answer file");
+    let error = assert_error(
+        &sandbox.run(&[
+            "homework",
+            "submit",
+            ASSIGNMENT_ID,
+            "--file",
+            "answer.pdf",
+            "--text",
+            "synthetic",
+        ]),
+        2,
+        "usage",
+    );
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--i-confirm-submit")),
+        "the gate must name the required confirmation flag: {error}"
     );
 }
 
