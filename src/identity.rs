@@ -1,6 +1,7 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -143,14 +144,34 @@ impl LocalProfile {
     }
 }
 
+struct LoginRequest {
+    username: String,
+    password: String,
+    role: Role,
+}
+
+impl fmt::Debug for LoginRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoginRequest")
+            .field("username", &self.username)
+            .field("role", &self.role)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 fn run_login(matches: &ArgMatches) -> CliResult<Outcome> {
-    let (_username, _password, _role) = login_arguments(matches)?;
-    // Credential verification needs the campus transport. The local
-    // milestone deliberately stops before reading or writing account state.
+    let request = login_arguments(matches)?;
+    // Read every validated field so production builds retain the same request
+    // shape even though registration is compiled only for synthetic tests.
+    let _ = (request.username, request.password, request.role);
+    // The verified registration path is compiled only for synthetic tests until
+    // the production transport and live-wiring gate are approved.
     Err(CliError::pending())
 }
 
-fn login_arguments(matches: &ArgMatches) -> CliResult<(String, String, Role)> {
+fn login_arguments(matches: &ArgMatches) -> CliResult<LoginRequest> {
     let username = matches
         .get_one::<String>("user")
         .map(|value| value.trim())
@@ -166,7 +187,226 @@ fn login_arguments(matches: &ArgMatches) -> CliResult<(String, String, Role)> {
         .get_one::<String>("role")
         .and_then(|value| Role::parse(value))
         .ok_or_else(|| CliError::usage("login requires --role graduate or --role undergraduate"))?;
-    Ok((username, password, role))
+    Ok(LoginRequest {
+        username,
+        password,
+        role,
+    })
+}
+
+// Offline verification-to-registration orchestration. Production CAS remains
+// disabled; this module exists only for synthetic tests until live wiring is
+// approved.
+#[cfg(test)]
+mod registration {
+    use super::*;
+    use crate::transport::Transport;
+    #[cfg(unix)]
+    use std::io::Write;
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::process;
+
+    /// Proof that the supplied password completed CAS verification.
+    ///
+    /// The constructor is private to this module; only `verify_login` can make
+    /// one. It intentionally carries no ticket, cookie, token or redirect URL.
+    struct VerifiedLogin;
+
+    pub(super) fn verify_and_register(
+        config_dir: &Path,
+        transport: &mut dyn Transport,
+        request: &LoginRequest,
+    ) -> CliResult<()> {
+        let verified = verify_login(transport, request)?;
+        register_verified_login(config_dir, request, verified)
+    }
+
+    fn verify_login(
+        transport: &mut dyn Transport,
+        request: &LoginRequest,
+    ) -> CliResult<VerifiedLogin> {
+        // Always verify the supplied password against CAS. No cached session or
+        // previous credential is consulted here.
+        let login = cas::cas_login(transport, &request.username, &request.password)?;
+        // Drop protocol material immediately; only a zero-sized proof survives.
+        drop(login);
+        Ok(VerifiedLogin)
+    }
+
+    fn register_verified_login(
+        config_dir: &Path,
+        request: &LoginRequest,
+        _verified: VerifiedLogin,
+    ) -> CliResult<()> {
+        // Only credentials.json is written. Invalidating or rewriting the
+        // session cache is a separate decision; doing both here would create an
+        // unsafe cross-file transaction with no atomic rollback.
+        write_credentials_atomic(config_dir, request)
+    }
+
+    fn write_credentials_atomic(config_dir: &Path, request: &LoginRequest) -> CliResult<()> {
+        let mut credentials = read_credentials_for_update(config_dir)?;
+        credentials.insert("username".to_owned(), json!(request.username));
+        credentials.insert("password".to_owned(), json!(request.password));
+        credentials.insert("role".to_owned(), json!(role_name(request.role)));
+        let mut bytes = serde_json::to_vec_pretty(&Value::Object(credentials))
+            .map_err(|_| write_error("cannot encode the local credentials file"))?;
+        bytes.push(b'\n');
+        write_credentials_file(config_dir, &config_dir.join(CREDENTIALS_FILENAME), &bytes)
+    }
+
+    fn read_credentials_for_update(config_dir: &Path) -> CliResult<Map<String, Value>> {
+        let path = config_dir.join(CREDENTIALS_FILENAME);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+            Err(_) => return Err(write_error("cannot inspect the local credentials file")),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(write_error(
+                "refusing to replace a symlink at the local credentials path",
+            ));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(write_error(
+                "refusing to replace a non-regular local credentials file",
+            ));
+        }
+        // A verified login may repair a malformed or unreadable regular file.
+        // Only a valid JSON object contributes unknown keys to the replacement.
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(Map::new());
+        };
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(credentials)) => Ok(credentials),
+            _ => Ok(Map::new()),
+        }
+    }
+
+    fn role_name(role: Role) -> &'static str {
+        match role {
+            Role::Graduate => "graduate",
+            Role::Undergraduate => "undergraduate",
+        }
+    }
+
+    fn write_error(message: &'static str) -> CliError {
+        CliError::new(
+            3,
+            "auth",
+            message,
+            "Check the config directory and credentials.json permissions, then retry.",
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_credentials_file(config_dir: &Path, path: &Path, bytes: &[u8]) -> CliResult<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        ensure_private_directory(config_dir)?;
+        ensure_replaceable(path)?;
+        for attempt in 0..100 {
+            let temporary = config_dir.join(format!(
+                ".{CREDENTIALS_FILENAME}.tmp.{}.{attempt}",
+                process::id()
+            ));
+            let file = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(write_error("cannot create a temporary credentials file")),
+            };
+            let result = finish_atomic_write(file, &temporary, path, bytes);
+            if result.is_err() {
+                let _ = fs::remove_file(&temporary);
+            }
+            return result;
+        }
+        Err(write_error(
+            "cannot create a unique temporary credentials file",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn ensure_private_directory(path: &Path) -> CliResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(path)
+                    .map_err(|_| write_error("cannot create the config directory"))?;
+                let metadata = fs::symlink_metadata(path)
+                    .map_err(|_| write_error("cannot inspect the config directory"))?;
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    return Err(write_error("refusing to use an unsafe config directory"));
+                }
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .map_err(|_| write_error("cannot make the config directory user-private"))?;
+                return Ok(());
+            }
+            Err(_) => return Err(write_error("cannot inspect the config directory")),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(write_error(
+                "refusing to use a symlink as the config directory",
+            ));
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(write_error("the config directory is not a directory"));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn ensure_replaceable(path: &Path) -> CliResult<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(write_error(
+                "refusing to replace a symlink at the local credentials path",
+            )),
+            Ok(metadata) if !metadata.file_type().is_file() => Err(write_error(
+                "refusing to replace a non-regular local credentials file",
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(write_error("cannot inspect the local credentials file")),
+        }
+    }
+
+    #[cfg(unix)]
+    fn finish_atomic_write(
+        mut file: fs::File,
+        temporary: &Path,
+        path: &Path,
+        bytes: &[u8],
+    ) -> CliResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| write_error("cannot make the credentials file user-private"))?;
+        file.write_all(bytes)
+            .map_err(|_| write_error("cannot write the credentials file"))?;
+        file.sync_all()
+            .map_err(|_| write_error("cannot flush the credentials file"))?;
+        drop(file);
+        fs::rename(temporary, path)
+            .map_err(|_| write_error("cannot replace the local credentials file"))
+    }
+
+    #[cfg(not(unix))]
+    fn write_credentials_file(_config_dir: &Path, _path: &Path, _bytes: &[u8]) -> CliResult<()> {
+        Err(CliError::new(
+            5,
+            "upstream",
+            "secure credential writes are not implemented on this platform",
+            "Do not treat this platform as supported until its user-only file protections are verified.",
+        ))
+    }
 }
 
 fn run_status(context: &mut Context<'_>) -> CliResult<Outcome> {
@@ -801,13 +1041,32 @@ fn base64url_decode(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::registration::verify_and_register;
     use super::*;
+    use crate::transport::Response;
+    use crate::transport::testing::Scripted;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(unix)]
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     const PROFILE_PASSWORD: &str = "TEST-ONLY-PROFILE-PASSWORD-4a7c";
     const PROFILE_COOKIE: &str = "TEST-ONLY-PROFILE-COOKIE-b8d2";
     const PROFILE_TOKEN: &str = "TEST-ONLY-PROFILE-TOKEN-c9e3";
+
+    const REGISTER_USER: &str = "2026000001";
+    const REGISTER_OLD_PASSWORD: &str = "TEST-ONLY-REGISTER-OLD-PASSWORD-1a2b";
+    const REGISTER_NEW_PASSWORD: &str = "TEST-ONLY-REGISTER-NEW-PASSWORD-3c4d";
+    const REGISTER_LOGIN_URL: &str = "https://auth.bupt.edu.cn/authserver/login";
+    const REGISTER_EXECUTION: &str = "TEST-ONLY-REGISTER-EXECUTION-9i0j";
+    const REGISTER_COOKIE: &str = "TEST-ONLY-REGISTER-CAS_SESSION-e5f6";
+    const REGISTER_CASTGC: &str = "TEST-ONLY-REGISTER-CASTGC-m3n4";
+    const REGISTER_TICKET: &str = "ST-TEST-ONLY-REGISTER-TICKET-g7h8";
+    const REGISTER_TICKET_URL: &str =
+        "https://ucloud.bupt.edu.cn/uclass?ticket=ST-TEST-ONLY-REGISTER-TICKET-g7h8";
+    const REGISTER_SESSION_SECRET: &str = "TEST-ONLY-REGISTER-SESSION-SECRET-k1l2";
 
     fn write_profile(directory: &Path, value: &Value) {
         let text = serde_json::to_string_pretty(value).expect("serialize profile");
@@ -816,6 +1075,196 @@ mod tests {
 
     fn load_isolated_profile(directory: &Path) -> CliResult<Option<LocalProfile>> {
         load_profile(directory)
+    }
+
+    fn register_request(password: &str, role: Role) -> LoginRequest {
+        LoginRequest {
+            username: REGISTER_USER.to_owned(),
+            password: password.to_owned(),
+            role,
+        }
+    }
+
+    fn register_response(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
+        Response {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn register_enqueue(
+        transport: &mut Scripted,
+        method: &'static str,
+        url: &str,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) {
+        transport.expected.push_back((
+            method,
+            url.to_owned(),
+            Ok(register_response(status, headers, body)),
+        ));
+    }
+
+    fn register_login_page_body() -> String {
+        format!(
+            "<html><form><input value='{REGISTER_EXECUTION}' type='hidden' name='execution'></form></html>"
+        )
+    }
+
+    fn register_login_page() -> Response {
+        let cookie = format!("CAS_SESSION={REGISTER_COOKIE}; Path=/authserver; Secure; HttpOnly");
+        register_response(
+            200,
+            &[("Set-Cookie", cookie.as_str())],
+            &register_login_page_body(),
+        )
+    }
+
+    fn successful_verification_script() -> Scripted {
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "GET",
+            REGISTER_LOGIN_URL.to_owned(),
+            Ok(register_login_page()),
+        ));
+        register_enqueue(
+            &mut transport,
+            "POST",
+            REGISTER_LOGIN_URL,
+            302,
+            &[("Location", REGISTER_TICKET_URL)],
+            "",
+        );
+        register_enqueue(
+            &mut transport,
+            "GET",
+            REGISTER_TICKET_URL,
+            200,
+            &[],
+            "<html><body>synthetic UCloud workspace</body></html>",
+        );
+        register_enqueue(
+            &mut transport,
+            "GET",
+            CAS_SERVICE_URL,
+            302,
+            &[("Location", REGISTER_TICKET_URL)],
+            "",
+        );
+        transport
+    }
+
+    fn verification_script_with_form_status(status: u16) -> Scripted {
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "GET",
+            REGISTER_LOGIN_URL.to_owned(),
+            Ok(register_login_page()),
+        ));
+        register_enqueue(&mut transport, "POST", REGISTER_LOGIN_URL, status, &[], "");
+        transport
+    }
+
+    fn verification_script_with_login_page_after_post() -> Scripted {
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "GET",
+            REGISTER_LOGIN_URL.to_owned(),
+            Ok(register_login_page()),
+        ));
+        register_enqueue(
+            &mut transport,
+            "POST",
+            REGISTER_LOGIN_URL,
+            200,
+            &[],
+            &register_login_page_body(),
+        );
+        transport
+    }
+
+    fn verification_script_with_network_failure() -> Scripted {
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "GET",
+            REGISTER_LOGIN_URL.to_owned(),
+            Err(CliError::new(
+                4,
+                "network",
+                "synthetic connection failure",
+                "Check the network connection and retry.",
+            )),
+        ));
+        transport
+    }
+
+    fn entry_names(directory: &Path) -> Vec<String> {
+        if !directory.exists() {
+            return Vec::new();
+        }
+        let mut names = fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+            .map(|entry| {
+                entry
+                    .expect("read directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn assert_error_redacted(error: &CliError, secrets: &[&str], paths: &[&Path]) {
+        let rendered = format!("{error:?}");
+        for secret in secrets {
+            assert!(
+                !rendered.contains(secret),
+                "error leaked a synthetic secret: {rendered}"
+            );
+        }
+        for path in paths {
+            let path = path.to_string_lossy();
+            assert!(
+                !rendered.contains(path.as_ref()),
+                "error leaked an unsafe path: {rendered}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn seed_register_file(directory: &Path, name: &str, contents: &str) -> PathBuf {
+        fs::create_dir_all(directory).expect("create registration directory");
+        let path = directory.join(name);
+        fs::write(&path, contents).expect("write registration fixture");
+        set_register_mode(&path, 0o600);
+        path
+    }
+
+    #[cfg(unix)]
+    fn set_register_mode(path: &Path, mode: u32) {
+        let mut permissions = fs::metadata(path)
+            .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()))
+            .permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions)
+            .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+    }
+
+    #[cfg(unix)]
+    fn register_mode(path: &Path) -> u32 {
+        fs::metadata(path)
+            .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
     }
 
     #[test]
@@ -892,6 +1341,506 @@ mod tests {
             load_isolated_profile(directory.path())
                 .expect("load profile")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn login_request_debug_redacts_password() {
+        let request = register_request(REGISTER_NEW_PASSWORD, Role::Graduate);
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(REGISTER_NEW_PASSWORD));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains(REGISTER_USER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_registration_writes_private_credentials_and_preserves_unknown_keys() {
+        let root = tempdir().expect("create registration root");
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&config).expect("create config directory");
+        fs::create_dir_all(&cache).expect("create cache directory");
+
+        let existing = serde_json::json!({
+            "username": REGISTER_USER,
+            "password": REGISTER_OLD_PASSWORD,
+            "role": "graduate",
+            "preserved": {"nested": true}
+        });
+        let credentials_path = seed_register_file(
+            &config,
+            CREDENTIALS_FILENAME,
+            &serde_json::to_string_pretty(&existing).expect("serialize existing credentials"),
+        );
+        set_register_mode(&credentials_path, 0o644);
+        let session_text = serde_json::to_string_pretty(&serde_json::json!({
+            "version": 2,
+            "username": REGISTER_USER,
+            "role": "undergraduate",
+            "cookies": [{
+                "name": "CASTGC",
+                "value": REGISTER_SESSION_SECRET,
+                "domain": "auth.bupt.edu.cn"
+            }],
+            "cas_logins_total": 2
+        }))
+        .expect("serialize session");
+        let session_path = seed_register_file(&cache, SESSION_FILENAME, &session_text);
+        let session_before = fs::read(&session_path).expect("read session before registration");
+
+        let mut transport = successful_verification_script();
+        verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect("verified registration succeeds");
+
+        assert_eq!(transport.calls.len(), 4);
+        let post = &transport.calls[1];
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.url, REGISTER_LOGIN_URL);
+        let post_body = String::from_utf8_lossy(&post.body);
+        assert!(post_body.contains(REGISTER_NEW_PASSWORD));
+        assert!(!post_body.contains(REGISTER_OLD_PASSWORD));
+
+        assert_eq!(register_mode(&credentials_path), 0o600);
+        let bytes = fs::read(&credentials_path).expect("read registered credentials");
+        let saved: Value = serde_json::from_slice(&bytes).expect("registered credentials are JSON");
+        assert_eq!(saved["username"], serde_json::json!(REGISTER_USER));
+        assert_eq!(saved["password"], serde_json::json!(REGISTER_NEW_PASSWORD));
+        assert_eq!(saved["role"], serde_json::json!("undergraduate"));
+        assert_eq!(saved["preserved"]["nested"], serde_json::json!(true));
+        let saved_object = saved.as_object().expect("credentials are an object");
+        for transient in [
+            "ticket",
+            "final_url",
+            "redirect_url",
+            "cookies",
+            "access_token",
+            "refresh_token",
+        ] {
+            assert!(
+                !saved_object.contains_key(transient),
+                "registered credentials persisted {transient}"
+            );
+        }
+        let text = String::from_utf8(bytes).expect("credentials are UTF-8");
+        for secret in [
+            REGISTER_OLD_PASSWORD,
+            REGISTER_COOKIE,
+            REGISTER_CASTGC,
+            REGISTER_TICKET,
+            REGISTER_TICKET_URL,
+            CAS_SERVICE_URL,
+        ] {
+            assert!(!text.contains(secret), "credentials persisted {secret}");
+        }
+
+        assert_eq!(
+            fs::read(&session_path).expect("read session"),
+            session_before
+        );
+        assert_eq!(entry_names(&config), vec![CREDENTIALS_FILENAME.to_owned()]);
+        assert_eq!(entry_names(&cache), vec![SESSION_FILENAME.to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn change_password_verification_uses_supplied_password_and_never_cached_session() {
+        let root = tempdir().expect("create change-password root");
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&config).expect("create config directory");
+        fs::create_dir_all(&cache).expect("create cache directory");
+
+        let credentials_path = seed_register_file(
+            &config,
+            CREDENTIALS_FILENAME,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "username": REGISTER_USER,
+                "password": REGISTER_OLD_PASSWORD,
+                "role": "undergraduate"
+            }))
+            .expect("serialize old credentials"),
+        );
+        let session_text = serde_json::to_string_pretty(&serde_json::json!({
+            "version": 2,
+            "username": REGISTER_USER,
+            "role": "undergraduate",
+            "cookies": [{
+                "name": "CASTGC",
+                "value": REGISTER_SESSION_SECRET,
+                "domain": "auth.bupt.edu.cn"
+            }],
+            "cas_logins_total": 3
+        }))
+        .expect("serialize cached session");
+        let session_path = seed_register_file(&cache, SESSION_FILENAME, &session_text);
+        let session_before = fs::read(&session_path).expect("read session before registration");
+
+        let mut transport = successful_verification_script();
+        verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect("change-password registration succeeds");
+
+        assert_eq!(transport.calls.len(), 4);
+        let post_body = String::from_utf8_lossy(&transport.calls[1].body);
+        assert!(post_body.contains(REGISTER_NEW_PASSWORD));
+        assert!(!post_body.contains(REGISTER_OLD_PASSWORD));
+        for call in &transport.calls {
+            let mut rendered = format!("{} {} ", call.method, call.url);
+            for (name, value) in &call.headers {
+                rendered.push_str(name);
+                rendered.push(':');
+                rendered.push_str(value);
+                rendered.push('\n');
+            }
+            rendered.push_str(&String::from_utf8_lossy(&call.body));
+            assert!(
+                !rendered.contains(REGISTER_OLD_PASSWORD),
+                "cached old password reached the network: {rendered}"
+            );
+            assert!(
+                !rendered.contains(REGISTER_SESSION_SECRET),
+                "cached session secret reached the network: {rendered}"
+            );
+        }
+
+        let saved: Value = serde_json::from_slice(
+            &fs::read(&credentials_path).expect("read registered credentials"),
+        )
+        .expect("registered credentials are JSON");
+        assert_eq!(saved["password"], serde_json::json!(REGISTER_NEW_PASSWORD));
+        assert_eq!(
+            fs::read(&session_path).expect("read session"),
+            session_before,
+            "registration must not rewrite the session cache"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_verification_preserves_credentials_and_session_bytes() {
+        let cases: [(&str, Scripted, u8, &str); 4] = [
+            (
+                "rejected credentials",
+                verification_script_with_form_status(401),
+                3,
+                "auth",
+            ),
+            (
+                "login page returned after POST",
+                verification_script_with_login_page_after_post(),
+                3,
+                "auth",
+            ),
+            (
+                "rate limited",
+                verification_script_with_form_status(429),
+                5,
+                "upstream",
+            ),
+            (
+                "connection failure",
+                verification_script_with_network_failure(),
+                4,
+                "network",
+            ),
+        ];
+
+        for (label, mut transport, expected_code, expected_kind) in cases {
+            let root = tempdir().expect("create failure root");
+            let config = root.path().join("config");
+            let cache = root.path().join("cache");
+            fs::create_dir_all(&config).expect("create config directory");
+            fs::create_dir_all(&cache).expect("create cache directory");
+
+            let credentials_path = seed_register_file(
+                &config,
+                CREDENTIALS_FILENAME,
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "username": REGISTER_USER,
+                    "password": REGISTER_OLD_PASSWORD,
+                    "role": "undergraduate"
+                }))
+                .expect("serialize existing credentials"),
+            );
+            set_register_mode(&credentials_path, 0o640);
+            let session_path = seed_register_file(
+                &cache,
+                SESSION_FILENAME,
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "version": 2,
+                    "username": REGISTER_USER,
+                    "role": "undergraduate",
+                    "cookie": REGISTER_SESSION_SECRET,
+                    "cas_logins_total": 3
+                }))
+                .expect("serialize existing session"),
+            );
+            let credentials_before =
+                fs::read(&credentials_path).expect("read credentials before failure");
+            let session_before = fs::read(&session_path).expect("read session before failure");
+
+            let error = verify_and_register(
+                &config,
+                &mut transport,
+                &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+            )
+            .expect_err(label);
+            assert_eq!(error.code, expected_code, "{label}: {error:?}");
+            assert_eq!(error.kind, expected_kind, "{label}: {error:?}");
+            if expected_code == 5 {
+                assert!(
+                    !error.hint.to_ascii_lowercase().contains("password"),
+                    "HTTP 5xx/429 must not prompt a password retry: {error:?}"
+                );
+            }
+            assert_error_redacted(
+                &error,
+                &[
+                    REGISTER_OLD_PASSWORD,
+                    REGISTER_NEW_PASSWORD,
+                    REGISTER_COOKIE,
+                    REGISTER_TICKET,
+                    REGISTER_TICKET_URL,
+                    REGISTER_SESSION_SECRET,
+                ],
+                &[
+                    credentials_path.as_path(),
+                    session_path.as_path(),
+                    config.as_path(),
+                ],
+            );
+
+            assert_eq!(
+                fs::read(&credentials_path).expect("read credentials after failure"),
+                credentials_before,
+                "{label}: credentials changed"
+            );
+            assert_eq!(
+                fs::read(&session_path).expect("read session after failure"),
+                session_before,
+                "{label}: session changed"
+            );
+            assert_eq!(register_mode(&credentials_path), 0o640);
+            assert_eq!(entry_names(&config), vec![CREDENTIALS_FILENAME.to_owned()]);
+            assert_eq!(entry_names(&cache), vec![SESSION_FILENAME.to_owned()]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_refuses_symlinked_credentials_without_touching_target() {
+        let root = tempdir().expect("create symlink root");
+        let config = root.path().join("config");
+        fs::create_dir_all(&config).expect("create config directory");
+        let target = seed_register_file(
+            root.path(),
+            "target-credentials.json",
+            "TEST-ONLY-TARGET-CREDENTIALS-n5o6",
+        );
+        let credentials_path = config.join(CREDENTIALS_FILENAME);
+        symlink(&target, &credentials_path).expect("create credentials symlink");
+        let target_before = fs::read(&target).expect("read symlink target");
+
+        let mut transport = successful_verification_script();
+        let error = verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect_err("symlinked credentials must be rejected");
+
+        assert_eq!(error.code, 3, "{error:?}");
+        assert_eq!(error.kind, "auth", "{error:?}");
+        assert!(error.message.contains("symlink"), "{error:?}");
+        assert_error_redacted(
+            &error,
+            &[
+                REGISTER_OLD_PASSWORD,
+                REGISTER_NEW_PASSWORD,
+                REGISTER_COOKIE,
+                REGISTER_TICKET,
+                REGISTER_SESSION_SECRET,
+            ],
+            &[
+                credentials_path.as_path(),
+                target.as_path(),
+                config.as_path(),
+            ],
+        );
+        assert!(
+            fs::symlink_metadata(&credentials_path)
+                .expect("inspect credentials symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            target_before
+        );
+        assert_eq!(entry_names(&config), vec![CREDENTIALS_FILENAME.to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_refuses_symlinked_config_directory() {
+        let root = tempdir().expect("create config-symlink root");
+        let real_config = root.path().join("real-config");
+        fs::create_dir_all(&real_config).expect("create real config directory");
+        let config = root.path().join("config");
+        symlink(&real_config, &config).expect("create config symlink");
+
+        let mut transport = successful_verification_script();
+        let error = verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect_err("symlinked config directories must be rejected");
+
+        assert_eq!(error.code, 3, "{error:?}");
+        assert_eq!(error.kind, "auth", "{error:?}");
+        assert!(
+            error.message.contains("symlink"),
+            "expected a symlink refusal: {error:?}"
+        );
+        assert_error_redacted(
+            &error,
+            &[REGISTER_NEW_PASSWORD, REGISTER_TICKET],
+            &[
+                config.as_path(),
+                real_config.as_path(),
+                config.join(CREDENTIALS_FILENAME).as_path(),
+            ],
+        );
+        assert!(
+            fs::symlink_metadata(&config)
+                .expect("inspect config symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            entry_names(&real_config).is_empty(),
+            "registration wrote through the config symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_refuses_non_regular_credentials_path() {
+        let root = tempdir().expect("create non-regular root");
+        let config = root.path().join("config");
+        fs::create_dir_all(&config).expect("create config directory");
+        let credentials_path = config.join(CREDENTIALS_FILENAME);
+        fs::create_dir(&credentials_path).expect("create directory at credentials path");
+
+        let mut transport = successful_verification_script();
+        let error = verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect_err("non-regular credentials must be rejected");
+
+        assert_eq!(error.code, 3, "{error:?}");
+        assert_eq!(error.kind, "auth", "{error:?}");
+        assert!(error.message.contains("non-regular"), "{error:?}");
+        assert_error_redacted(
+            &error,
+            &[REGISTER_NEW_PASSWORD, REGISTER_TICKET],
+            &[credentials_path.as_path(), config.as_path()],
+        );
+        assert!(
+            fs::symlink_metadata(&credentials_path)
+                .expect("inspect credentials path")
+                .is_dir()
+        );
+        assert_eq!(entry_names(&config), vec![CREDENTIALS_FILENAME.to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_creates_user_private_config_directory_and_file() {
+        let root = tempdir().expect("create missing-directory root");
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).expect("create cache directory");
+
+        let mut transport = successful_verification_script();
+        verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect("registration creates missing config directory");
+
+        assert_eq!(register_mode(&config), 0o700);
+        let credentials_path = config.join(CREDENTIALS_FILENAME);
+        assert_eq!(register_mode(&credentials_path), 0o600);
+        assert_eq!(entry_names(&config), vec![CREDENTIALS_FILENAME.to_owned()]);
+        assert!(entry_names(&cache).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_replaces_malformed_credentials_after_verified_login() {
+        let root = tempdir().expect("create malformed root");
+        let config = root.path().join("config");
+        fs::create_dir_all(&config).expect("create config directory");
+        let malformed = "TEST-ONLY-MALFORMED-CREDENTIALS-q1w2 { not json";
+        let credentials_path = seed_register_file(&config, CREDENTIALS_FILENAME, malformed);
+
+        let mut transport = successful_verification_script();
+        verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect("verified login repairs malformed credentials");
+
+        let saved: Value = serde_json::from_slice(
+            &fs::read(&credentials_path).expect("read repaired credentials"),
+        )
+        .expect("repaired credentials are JSON");
+        assert_eq!(saved["username"], serde_json::json!(REGISTER_USER));
+        assert_eq!(saved["password"], serde_json::json!(REGISTER_NEW_PASSWORD));
+        assert_eq!(saved["role"], serde_json::json!("undergraduate"));
+        let text = fs::read_to_string(&credentials_path).expect("read repaired credentials");
+        assert!(!text.contains("TEST-ONLY-MALFORMED-CREDENTIALS-q1w2"));
+        assert_eq!(register_mode(&credentials_path), 0o600);
+        assert_eq!(entry_names(&config), vec![CREDENTIALS_FILENAME.to_owned()]);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn registration_fails_closed_without_verified_platform_protections() {
+        let root = tempdir().expect("create unsupported-platform root");
+        let config = root.path().join("config");
+        let mut transport = successful_verification_script();
+        let error = verify_and_register(
+            &config,
+            &mut transport,
+            &register_request(REGISTER_NEW_PASSWORD, Role::Undergraduate),
+        )
+        .expect_err("unsupported platforms must fail closed");
+
+        assert_eq!(error.code, 5, "{error:?}");
+        assert_eq!(error.kind, "upstream", "{error:?}");
+        assert_error_redacted(
+            &error,
+            &[REGISTER_NEW_PASSWORD, REGISTER_TICKET],
+            &[config.as_path()],
+        );
+        assert!(
+            entry_names(&config).is_empty(),
+            "unsupported platform wrote local state"
         );
     }
 }
