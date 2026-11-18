@@ -131,7 +131,8 @@ fn get_data(
         body: Vec::new(),
     })?;
 
-    if response.status == 401 || response.status == 403 {
+    let status = response.status;
+    if status == 401 || status == 403 {
         return Err(CliError::new(
             3,
             "auth",
@@ -139,11 +140,19 @@ fn get_data(
             "Run `bupt login --force`, then retry.",
         ));
     }
-    if !(200..300).contains(&response.status) {
+    if (400..600).contains(&status) {
+        return Err(CliError::new(
+            5,
+            "upstream",
+            format!("{operation} was explicitly refused with HTTP {status}"),
+            "The command did not retry.",
+        ));
+    }
+    if !(200..300).contains(&status) {
         return Err(CliError::new(
             4,
             "network",
-            format!("{operation} failed with HTTP {}", response.status),
+            format!("{operation} failed with HTTP {status}"),
             "The command did not retry.",
         ));
     }
@@ -208,8 +217,11 @@ fn parse_course_page(data: &Value) -> CliResult<(Vec<Course>, usize)> {
             )
         })?;
         courses.push(Course {
-            site_id: first_truthy_string(record, &["siteId", "id"]),
-            site_name: first_truthy_string(record, &["siteName", "className"]),
+            // Match Python `_first_present(record, ...) or ""`: an explicit
+            // zero/false is present, then becomes empty; it must not fall back
+            // to the generic key. Only null/empty-string values fall through.
+            site_id: first_present_or_empty(record, &["siteId", "id"]),
+            site_name: first_present_or_empty(record, &["siteName", "className"]),
             teacher_name: format_teacher_name(first_present(record, &["teacherName", "teachers"])),
         });
     }
@@ -308,6 +320,13 @@ fn first_present<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'
         }
     }
     None
+}
+
+fn first_present_or_empty(object: &Map<String, Value>, keys: &[&str]) -> String {
+    first_present(object, keys)
+        .filter(|value| is_truthy(value))
+        .and_then(value_as_string)
+        .unwrap_or_default()
 }
 
 fn first_truthy_string(object: &Map<String, Value>, keys: &[&str]) -> String {
@@ -688,7 +707,87 @@ mod tests {
     }
 
     #[test]
-    fn upstream_course_error_is_a_single_network_failure() {
+    fn course_mapping_does_not_replace_explicit_zero_or_false_with_fallback_keys() {
+        let body = json!({
+            "code": 200,
+            "data": {
+                "records": [
+                    {
+                        "siteId": 0,
+                        "id": "fallback-id",
+                        "siteName": false,
+                        "className": "fallback-name"
+                    },
+                    {
+                        "siteId": "",
+                        "id": "id-from-empty",
+                        "siteName": "",
+                        "className": "name-from-empty"
+                    },
+                    {
+                        "siteId": "site-1",
+                        "id": "ignored-id",
+                        "siteName": "课程一",
+                        "className": "ignored-name"
+                    }
+                ],
+                "total": 3
+            }
+        });
+        let mut transport = scripted(vec![("GET", course_url(1), json_response(200, body))]);
+        let courses = fetch_courses(&mut transport, &session()).expect("course mapping");
+
+        assert_eq!(courses[0].site_id, "", "explicit zero must not use id");
+        assert_eq!(
+            courses[0].site_name, "",
+            "explicit false must not use className"
+        );
+        assert_eq!(courses[1].site_id, "id-from-empty");
+        assert_eq!(courses[1].site_name, "name-from-empty");
+        assert_eq!(courses[2].site_id, "site-1");
+        assert_eq!(courses[2].site_name, "课程一");
+        assert_single_call(&transport, "GET", &course_url(1));
+    }
+
+    #[test]
+    fn http_503_is_upstream_5_without_retry() {
+        let mut transport = scripted(vec![(
+            "GET",
+            course_url(1),
+            json_response(
+                503,
+                json!({"msg": "synthetic unavailable synthetic-access-token"}),
+            ),
+        )]);
+        let error = fetch_courses(&mut transport, &session()).expect_err("HTTP 503");
+
+        assert_eq!(error.code, 5);
+        assert_eq!(error.kind, "upstream");
+        assert_eq!(transport.calls.len(), 1);
+        assert!(!error.message.contains("synthetic-access-token"));
+    }
+
+    #[test]
+    fn transport_error_remains_network_4_without_retry() {
+        let mut transport = scripted(vec![(
+            "GET",
+            course_url(1),
+            Err(CliError::new(
+                4,
+                "network",
+                "synthetic transport unavailable",
+                "synthetic transport hint",
+            )),
+        )]);
+        let error = fetch_courses(&mut transport, &session()).expect_err("transport error");
+
+        assert_eq!(error.code, 4);
+        assert_eq!(error.kind, "network");
+        assert_eq!(transport.calls.len(), 1);
+    }
+
+    #[test]
+    fn api_envelope_error_remains_network_4_without_retry() {
         let mut transport = scripted(vec![(
             "GET",
             course_url(1),
@@ -697,9 +796,10 @@ mod tests {
                 json!({"code": 500, "msg": "synthetic upstream failure"}),
             ),
         )]);
-        let error = fetch_courses(&mut transport, &session()).expect_err("upstream error");
+        let error = fetch_courses(&mut transport, &session()).expect_err("API envelope error");
 
         assert_eq!(error.code, 4);
+        assert_eq!(error.kind, "network");
         assert_eq!(transport.calls.len(), 1);
         assert!(!error.message.contains("synthetic-access-token"));
     }

@@ -44,13 +44,14 @@
 
 这些用例共用真实进程 `Sandbox`，不安装任何假上游，也无法断言业务数据成功路径。
 
-### 源内只读单元用例（`src/homework/read.rs`）
+### 源内只读单元用例（`src/homework/read.rs`，synthetic slice）
 
-这些用例直接调用只读 helper，只替换 transport 与 session，不启动第二个进程：
+这些用例直接调用只读 helper，只替换 transport 与 session，不启动第二个进程。本切片只用合成 `Scripted` transport 和合成 session，不接真实 transport/session，也不是运行时回放。
 
 | 用例 | 覆盖点 |
 |---|---|
 | `courses_first_page_keeps_all_eleven_unique_site_ids` | 合成首屏 11 行、site id 全部存在且唯一；短页后只请求一次 |
+| `course_mapping_does_not_replace_explicit_zero_or_false_with_fallback_keys` | 显式 `siteId=0` / `siteName=false` 先命中 `_first_present`，再按 `or ""` 变成空，不错误回退到 `id` / `className`；空字符串仍回退 |
 | `courses_short_page_stops_without_a_second_request` | 2 行短页后立即停止，不猜测还有下一页 |
 | `courses_empty_page_stops_without_a_second_request` | 空页返回 `count=0` 和空数组，不报错、不请求第二页 |
 | `courses_concatenate_pages_and_deduplicate_repeated_ids` | 跨页保持页序，只去掉重复的非空 id；重复项不覆盖首条元数据 |
@@ -58,17 +59,21 @@
 | `courses_stop_when_a_full_page_adds_no_new_ids` | 整页都是重复 id 时停止，不无限翻页 |
 | `courses_stop_at_the_ten_page_safety_limit` | 10 页安全上限，最多 500 行，不请求第 11 页 |
 | `unauthorized_courses_and_undone_stop_after_one_request` | 401/403 都退鉴权 3，courses 和 undone 各只请求一次，不重试 |
+| `http_503_is_upstream_5_without_retry` | 实际 HTTP 503 退 upstream 5，只读一次，不重试，不回显原始 `msg` / token |
+| `transport_error_remains_network_4_without_retry` | `transport.send` 返回 network 类错误时保持 4，只读一次，不重试 |
 | `unexpected_course_payloads_are_parse_errors_without_retry` | 缺 `data`、非对象、坏 records、坏 total 都退 parse 5，只请求一次 |
-| `upstream_course_error_is_a_single_network_failure` | 上游 `code` 非 0/200 退网络 4，只请求一次，不回显原始 `msg` |
+| `api_envelope_error_remains_network_4_without_retry` | JSON API envelope 的 `code` 非 0/200 仍按 Python `_request` 基线退网络 4，只请求一次，不回显原始 `msg` |
 | `undone_mapping_matches_the_python_fields` | 现有 undone fixture 的 activity/site/begin/end 映射、计数和 `submitted=false` |
 | `undone_mapping_keeps_python_fallback_rules_without_course_enrichment` | `id`/`assignmentTitle` 回退、`siteId=0` 视为缺失、`-1` 原样保留；不伪造课程或截止时间 |
 | `empty_undone_is_success_and_not_an_auth_error` | 空 `undoneList` 是成功结果，`siteNum=0`、`undoneNum=0`，不是鉴权失败 |
 | `unexpected_undone_payloads_are_parse_errors_without_retry` | 非对象 data、缺 `undoneList`、非对象记录都退 parse 5，只请求一次 |
 | `undone_without_user_id_fails_before_transport` | 合成 session 缺 `user_id` 时退鉴权 3，transport 零调用 |
 
-与 Python `cmd_courses` 对齐的分页规则：`size=50`、最多 10 页、按页序拼接、只对非空 `siteId` 去重、空页/短页/整页无新 id 时停止。`get_courses` 本身不按 `total` 终止，但 Python 解析器会拒绝畸形 total，这里同样校验。
+与 Python `cmd_courses` 对齐的分页规则：`size=50`、最多 10 页、按页序拼接、只对非空 `siteId` 去重、空页/短页/整页无新 id 时停止。`get_courses` 本身不按 `total` 终止，但 Python 解析器会拒绝畸形 total，这里同样校验。课程 `siteId` / `siteName` 按 Python `_first_present(record, ...) or ""` 映射：显式 `0`/`false` 是 present，随后变成空值，**不能**被通用的 `id` / `className` 回退替换；只有 `null` 或空字符串继续尝试下一个键。
 
-与 Python `get_undone` 对齐的映射规则：GET `/ykt-site/site/student/undone?userId=...`，`activityId`/`id` 与 `activityName`/`assignmentTitle` 依次回退，`siteId=0` 视为缺失，`is_submitted` 固定 false，`siteNum` / `undoneNum` 默认值分别为 0 / 列表长度。**课程富化暂不实现**：真实非空 undone 可能出现 `siteId=-1` 和空 `siteName`，Python 的 `_enrich_undone_courses` 需要再扫全部课程作业并按 activity id 回填；本批没有真实非空 undone 证据，也没有接上 `get_all_homework`，因此明确延期，不声称 parity，`-1` 与空名称保持原样。
+错误分层按 Python `errors.from_campus_error` 的公开行为切分：`transport.send` 的 network failure 保持 4；实际 HTTP 401/403 退鉴权 3；实际 HTTP 4xx/5xx（含 503）退 upstream 5；两者都只请求一次、不重试。JSON API envelope 的 `code` 非 0/200 走另一条基线（`_request` 抛 `CampusNetworkError`），仍退网络 4，不因 envelope code 是 5xx 就升级为 upstream 5。
+
+与 Python `get_undone` 对齐的映射规则：GET `/ykt-site/site/student/undone?userId=...`，`activityId`/`id` 与 `activityName`/`assignmentTitle` 依次回退，`siteId=0` 视为缺失，`is_submitted` 固定 false，`siteNum` / `undoneNum` 默认值分别为 0 / 列表长度。undone 的回退语义保持不变。**课程富化暂不实现**：真实非空 undone 可能出现 `siteId=-1` 和空 `siteName`，Python 的 `_enrich_undone_courses` 需要再扫全部课程作业并按 activity id 回填；本批没有真实非空 undone 证据，也没有接上 `get_all_homework`，因此明确延期，不声称 parity，`-1` 与空名称保持原样。
 
 Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust 这里没有身份 lane 的续期适配器，因此只请求一次并退鉴权 3。重试/续期必须等真实 session 适配器接入后单独验证；当前“不循环”的行为已由测试固定。
 
@@ -201,8 +206,8 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 ## 当前验证状态
 
 - `cargo fmt --check`：通过。
-- `cargo test --locked --offline --lib`：56 个通过（2 个共享 CLI + 11 个 homework 提交 helper + 15 个 homework 只读 helper + 28 个其它 lane 单元用例）。
+- `cargo test --locked --offline --lib`：59 个通过（2 个共享 CLI + 11 个 homework 提交 helper + 18 个 homework 只读 helper + 28 个其它 lane 单元用例）。
 - `cargo test --locked --offline --test contract_homework`：14 个通过。
-- `cargo test --locked --offline`：全绿；56 单元 + 25 academics + 33 campus + 14 homework + 28 identity + 23 lifecycle 契约用例全部通过。
+- `cargo test --locked --offline`：全绿；59 单元 + 25 academics + 33 campus + 14 homework + 28 identity + 23 lifecycle 契约用例全部通过。
 - `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此 30 个草稿全部不可运行，也没有伪装通过。
-- 未运行真实校园网、浏览器会话、上传或提交；没有新增环境变量回放开关。
+- 本批仍是 synthetic-only slice：未接真实 transport/session，真实非空 undone 富化和运行时回放继续 pending；未运行真实校园网、浏览器会话、上传或提交，也没有新增环境变量回放开关。
