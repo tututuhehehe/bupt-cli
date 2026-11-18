@@ -7,10 +7,11 @@
 - `tests/test_homework_show.py`
 - `tests/test_verify.py`
 
-测试分两层：
+测试分三层：
 
-- `tests/contract_homework.rs`：当前**可运行**的本地契约用例，只使用共享 `Sandbox`（隔离家目录/配置/缓存）和公开进程 CLI。覆盖解析器、无凭据鉴权边界、参数门禁，不访问上游。
-- `tests/homework_replay/cases.rs`：**草稿，未被 Cargo 自动发现，也尚不可运行**。它保留合成录制驱动的业务用例，等待库内部的注入式 transport/clock/session 测试缝接入。没有运行时环境变量回放，没有真实网络/凭据/浏览器。
+- `tests/contract_homework.rs`：当前**可运行**的公开进程 CLI 契约用例，只使用共享 `Sandbox`（隔离家目录/配置/缓存）。覆盖解析器、无凭据鉴权边界、参数门禁，不访问上游。
+- `src/homework/submit.rs` 的 `#[cfg(test)]` 单元用例：当前**可运行**的进程内缝，使用共享 `transport::testing::Scripted`、合成 session 和临时文件。覆盖提交门禁、零次/一次/未知 upload/submit 结果和确认回执分类；不读取真实凭据，不回退到网络。命令规格与本地校验保留在较小的 `src/homework.rs`。
+- `tests/homework_replay/cases.rs`：**草稿，未被 Cargo 自动发现，也尚不可运行**。它保留完整合成录制驱动的业务用例，等待库内部的注入式 transport/clock/session 测试缝接入。没有运行时环境变量回放，没有真实网络/凭据/浏览器。
 
 ## 有意变化
 
@@ -25,16 +26,47 @@
 
 | 用例 | 覆盖点 |
 |---|---|
+| `courses_reaches_the_auth_boundary_without_credentials` | `courses` 接受无参数形式并进入凭据层（auth，退出 3） |
 | `homework_defaults_to_the_list_command` | 无凭据时 `homework` 已进入会话层（auth，退出 3），不是“需要子命令” |
 | `explicit_homework_list_alias_is_rejected_as_usage` | `homework list` 在凭据/网络前退 2 |
 | `default_homework_accepts_the_list_flags` | 默认列表接受 `--undone` / `--limit` / `--course` / `--new`（继续到 auth 层） |
 | `invalid_list_values_are_usage_errors_before_credentials` | 负 `--limit` / `--new` 退 2 |
+| `homework_subcommands_accept_documented_flags_before_credentials` | `show` / `download` / `verify` / `submit` 的文档参数均可解析并继续到凭据层 |
 | `show_rejects_a_non_numeric_course_id_before_credentials` | 非数字 `--course` 退 2 |
 | `submit_rejects_an_empty_payload_before_credentials` | 无文件/正文/资源 id 退 2 |
 | `submit_rejects_dry_run_with_confirmation_before_credentials` | `--dry-run` 与 `--i-confirm-submit` 互斥，退 2 |
+| `submit_without_confirmation_is_usage_before_credentials` | 有文件/正文但缺少 `--i-confirm-submit` 时在凭据与网络前退 2，错误点名确认 flag |
 | `submit_rejects_a_missing_file_before_credentials` | 缺失文件在凭据/网络前退 2 |
 
 这些用例共用真实进程 `Sandbox`，不安装任何假上游，也无法断言业务数据成功路径。
+
+### 源内单元用例（`src/homework/submit.rs`）
+
+这些用例直接调用提交 helper，只替换 transport 与 session，不启动第二个进程：
+
+| 用例 | 覆盖点 |
+|---|---|
+| `submit_without_confirmation_never_contacts_transport` | 未确认时退 2，`transport.calls` 为空；门禁先于任何读取或写入 |
+| `submit_dry_run_reads_the_plan_without_writes` | 只发 detail / submit-view 两个 GET；计划含已有附件；无 POST、无 verification |
+| `confirmed_submit_without_verification_uploads_then_submits_once` | 写入序列恰为 `[upload, submit]`；submit 正文/附件正确；`--no-verify` 返回 `verification.status=skipped` |
+| `explicit_success_flag_or_code_alone_is_accepted` | 只有明确 `success: true` 或 `code=200` 时才算肯定回执，不把缺省值当成功 |
+| `empty_submit_acknowledgement_is_ambiguous_and_verify_only` | 2xx `{}` 退 6，`submitted=null`，warning/diagnostic 只指向 `verify`；写入恰为 `[upload, submit]` |
+| `invalid_submit_acknowledgement_is_ambiguous_and_verify_only` | 非法 `success` 标志、互相矛盾的 success/code 等畸形回执退 6，不报 `submitted=true`；不重发 submit |
+| `non_json_submit_response_is_ambiguous_and_verify_only` | 2xx 非 JSON 响应退 6，`submitted=null`，verify-only 指引；不重发 submit |
+| `timeout_server_error_and_redirect_statuses_after_submit_are_ambiguous_and_not_retried` | 302 / 408 / 502 退 6，`submitted=null`，verify-only 指引；恰一次 submit，不重发 |
+| `explicit_http_and_upstream_refusals_are_not_ambiguous_and_not_retried` | 明确 400 与 JSON 负回执走错误（HTTP/上游 5，401/403 鉴权 3），不回显原始 `msg`/token，不重发 |
+| `lost_submit_response_is_ambiguous_and_never_retried` | 恰好一次 submit；超时/断连退 6，`submitted`/`verified` 为 null，verify-only 指引；无自动重发 |
+| `upstream_message_echoing_token_is_redacted_at_the_boundary` | 上游 `msg` 回显合成 token 时，结果边界统一替换为 `[REDACTED]` |
+
+回执判定只接受肯定证据：显式 `success: true`，或认可的 `code`（0/200）。空对象、缺失/非法指示、互相矛盾的 success/code、2xx 非 JSON、408、5xx、意外重定向以及没有确认响应的 transport failure 都退 6 且 `submitted=null`，并只指向只读 `verify`。明确 4xx（408 除外）、JSON 负回执和 401/403 仍走显式错误（HTTP/上游 5，鉴权 3），不伪装成 unknown。所有分支都不自动重发 submit；transport failure 只说明没有收到确认响应，不回显原始诊断。
+
+当前真实 CLI 在提交 helper 之前没有会话适配器，因此带凭据时仍以“session wiring 未实现”退 5，绝不发起 HTTP。`courses`、作业列表、`show`、`download`、`verify` 同样在通过凭据检查后以 unsupported 退 5；本批没有课程分页、列表、详情、下载或只读核验实现，`verify` 保持 pending。成功提交但未跑 `--no-verify` 时 helper 也返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`。
+
+结果里不序列化 detail 原始对象或 session 结构；接受的 `upstream.msg` 和错误文本在输出边界统一脱敏，`Session` 不实现 `Debug`。新增 fixture `homework_submit_echo_token.json` 让上游回显合成 token，供后续进程级 seam 复用；当前对应边界测试已在源内通过。
+
+### Scaffold 边界
+
+`src/homework/submit.rs` 的 multipart renderer 和固定 boundary 只用于隔离的 transport journal 测试。`upload_file` 目前整文件读入内存；在连接真实 transport 前必须替换为经过审查的 multipart encoder，并加上有界/流式读取。本批没有连接它，真实 CLI 仍停在 session wiring。
 
 ## 草稿：合成录制与注入式测试缝
 
@@ -58,7 +90,7 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 
 ## 草稿覆盖矩阵
 
-以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。
+以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。其中提交门禁、dry-run、确认一次写入、响应丢失四类已有上面源内单元用例覆盖 helper 层；草稿仍保留为后续完整进程级录制验收。
 
 ### courses
 
@@ -120,12 +152,22 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 - `show` 的空 submit-view 回退、学生列表查询失败时 `submitted_at=null`、`--course` 限制站点查找：尚无单独录制。
 - `preview_filename` 的 RFC 5987 `filename*=UTF-8''`、引号、文件名内分号等变体。
 - verify 的“第二次尝试才通过”、无 `--text` 时忽略正文、空正文跳过正文检查、sentinel `assignmentId=-1` 且无附件、非网络意外异常、expected/observed 文本 200 字截断。
+- verify 草稿仍带公开 CLI 不存在的 `--course`；接线前要按详情目标课程重做参数与录制，不能为了草稿直接新增该参数。
 - 固定 5 秒重试等待未做墙钟断言；草稿只保留 `attempts` 与退出码边界。
 - 上传失败、submit-view 401 后的续期、真实校园网上游验收未运行。真实提交/上传不在本阶段执行，校园网验收需用户单独确认。
 
+## 下一批接线顺序
+
+1. 由 identity lane 提供真实 session 适配器，替换 `homework::submit::load_session` 的 unsupported 退出；提交 helper 已通过 `Context.transport` 注入，接线时不得新增环境变量回放。
+2. 先把源内提交用例接到 fixture/进程级 seam（含 `homework_submit_echo_token.json`），再为 empty/invalid/refusal 回执补录制，并补 `submit_confirmed_uploads_submits_once_and_verifies`、`submit_unverified_exits_six_without_resubmitting`、`submit_verification_error_exits_seven_without_resubmitting`。
+3. 按 `courses` 分页、列表/`--new`、详情/下载、只读 `verify` 的顺序接线；每类先实现只读请求，再引入写请求。
+4. 校园网真实提交/上传与双平台验收单独执行，需用户确认。
+
 ## 当前验证状态
 
-- `tests/contract_homework.rs`：`cargo test --offline --test contract_homework --no-run` 通过；受控红跑中 8 个本用例均因空实现 `exit=78` 失败。没有编译错误、联网、`#[ignore]` 或 `#[should_panic]`。
-- `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此草稿不可运行。草稿仅做过一次性临时 wrapper 编译检查，最终树中不保留 wrapper。
-- `tests/contract_homework.rs` 与 `tests/homework_replay/cases.rs` 均通过 `rustfmt --check --config skip_children=true`。
-- 仓库级 `cargo fmt --check` 仍会报共享 `tests/contract_support/mod.rs` 既有格式差异；该文件属于整合者，本 lane 未修改。
+- `cargo fmt --check`：通过。
+- `cargo test --locked --offline --lib`：13 个通过（2 个共享 CLI + 11 个 homework 提交 helper）。
+- `cargo test --locked --offline --test contract_homework`：11 个通过。
+- `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此 30 个草稿全部不可运行，也没有伪装通过。
+- 同一 worktree 的 `contract_lifecycle` 红跑仍有 12 个失败，均属于 `status` / `update` / `uninstall` 等其它 lane 的空实现；`homework` 入口、帮助树、移除别名相关用例已通过。该红跑不是本 lane 的验收门禁。
+- 未运行真实校园网、浏览器会话、上传或提交；没有新增环境变量回放开关。
