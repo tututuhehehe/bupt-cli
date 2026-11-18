@@ -1,0 +1,315 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "c0",
+                "siteName": "合成课程 0",
+                "teacherName": "合成老师"
+              },
+              {
+                "siteId": "c1",
+                "siteName": "合成课程 1",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c2",
+                "siteName": "合成课程 2",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c3",
+                "siteName": "合成课程 3",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c4",
+                "siteName": "合成课程 4",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c5",
+                "siteName": "合成课程 5",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c6",
+                "siteName": "合成课程 6",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c7",
+                "siteName": "合成课程 7",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c8",
+                "siteName": "合成课程 8",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c9",
+                "siteName": "合成课程 9",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c10",
+                "siteName": "合成课程 10",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c11",
+                "siteName": "合成课程 11",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c12",
+                "siteName": "合成课程 12",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c13",
+                "siteName": "合成课程 13",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c14",
+                "siteName": "合成课程 14",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c15",
+                "siteName": "合成课程 15",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c16",
+                "siteName": "合成课程 16",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c17",
+                "siteName": "合成课程 17",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c18",
+                "siteName": "合成课程 18",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c19",
+                "siteName": "合成课程 19",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c20",
+                "siteName": "合成课程 20",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c21",
+                "siteName": "合成课程 21",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c22",
+                "siteName": "合成课程 22",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c23",
+                "siteName": "合成课程 23",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c24",
+                "siteName": "合成课程 24",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c25",
+                "siteName": "合成课程 25",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c26",
+                "siteName": "合成课程 26",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c27",
+                "siteName": "合成课程 27",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c28",
+                "siteName": "合成课程 28",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c29",
+                "siteName": "合成课程 29",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c30",
+                "siteName": "合成课程 30",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c31",
+                "siteName": "合成课程 31",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c32",
+                "siteName": "合成课程 32",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c33",
+                "siteName": "合成课程 33",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c34",
+                "siteName": "合成课程 34",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c35",
+                "siteName": "合成课程 35",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c36",
+                "siteName": "合成课程 36",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c37",
+                "siteName": "合成课程 37",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c38",
+                "siteName": "合成课程 38",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c39",
+                "siteName": "合成课程 39",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c40",
+                "siteName": "合成课程 40",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c41",
+                "siteName": "合成课程 41",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c42",
+                "siteName": "合成课程 42",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c43",
+                "siteName": "合成课程 43",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c44",
+                "siteName": "合成课程 44",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c45",
+                "siteName": "合成课程 45",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c46",
+                "siteName": "合成课程 46",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c47",
+                "siteName": "合成课程 47",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c48",
+                "siteName": "合成课程 48",
+                "teacherName": ""
+              },
+              {
+                "siteId": "c49",
+                "siteName": "合成课程 49",
+                "teacherName": ""
+              }
+            ],
+            "total": 53
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "c0",
+                "siteName": "合成课程 0（重复）",
+                "teacherName": "重复老师"
+              },
+              {
+                "siteId": "c1",
+                "siteName": "合成课程 1（重复）"
+              },
+              {
+                "siteId": "c50",
+                "siteName": "合成课程 50"
+              }
+            ],
+            "total": 53
+          }
+        }
+      }
+    }
+  ]
+}

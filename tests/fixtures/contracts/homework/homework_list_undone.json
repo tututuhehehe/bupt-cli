@@ -1,0 +1,49 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/student/undone",
+        "query": {
+          "userId": "synthetic-user"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "siteNum": 1,
+            "undoneNum": 2,
+            "undoneList": [
+              {
+                "activityId": "u-2",
+                "activityName": "未交二",
+                "siteId": "site-1",
+                "siteName": "课程一",
+                "endTime": "2026-11-22 23:59",
+                "beginTime": "2026-11-10 08:00"
+              },
+              {
+                "activityId": "u-1",
+                "activityName": "未交一",
+                "siteId": "site-1",
+                "siteName": "课程一",
+                "endTime": "2026-11-19 23:59",
+                "beginTime": "2026-11-11 08:00"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

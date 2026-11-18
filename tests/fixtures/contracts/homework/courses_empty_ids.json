@@ -1,0 +1,41 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteName": "无编号甲"
+              },
+              {
+                "siteName": "无编号乙"
+              },
+              {
+                "siteName": "无编号丙"
+              }
+            ],
+            "total": 3
+          }
+        }
+      }
+    }
+  ]
+}

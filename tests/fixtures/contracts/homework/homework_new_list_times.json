@@ -1,0 +1,80 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "site-1",
+                "siteName": "数据结构",
+                "teacherName": "合成老师"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/ykt-site/work/student/list",
+        "json": {
+          "siteId": "site-1",
+          "userId": "synthetic-user",
+          "current": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "activityId": "hw-old",
+                "assignmentTitle": "旧作业",
+                "assignmentStatus": 99,
+                "assignmentBeginTime": "2026-10-01 08:00",
+                "assignmentEndTime": "2026-12-01 23:59"
+              },
+              {
+                "activityId": "hw-newer",
+                "assignmentTitle": "较新作业",
+                "assignmentStatus": 99,
+                "assignmentBeginTime": "2026-11-17 08:00",
+                "assignmentEndTime": "2026-11-25 23:59"
+              },
+              {
+                "activityId": "hw-newest",
+                "assignmentTitle": "最新作业",
+                "assignmentStatus": 99,
+                "assignmentBeginTime": "2026-11-18 09:00",
+                "assignmentEndTime": "2026-11-20 23:59"
+              }
+            ],
+            "total": 3
+          }
+        }
+      }
+    }
+  ]
+}

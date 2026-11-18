@@ -1,0 +1,81 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "site-1",
+                "siteName": "数据结构",
+                "teacherName": "合成老师"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/ykt-site/work/student/list",
+        "json": {
+          "siteId": "site-1",
+          "userId": "synthetic-user",
+          "current": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "activityId": "hw-auth",
+                "assignmentTitle": "鉴权作业",
+                "assignmentStatus": 99,
+                "assignmentEndTime": "2026-11-30 23:59"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/work/detail",
+        "query": {
+          "assignmentId": "hw-auth"
+        }
+      },
+      "response": {
+        "status": 401,
+        "json": {
+          "code": 401,
+          "msg": "synthetic token expired"
+        }
+      }
+    }
+  ]
+}

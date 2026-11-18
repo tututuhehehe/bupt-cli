@@ -1,0 +1,91 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "site-1",
+                "siteName": "数据结构",
+                "teacherName": "合成老师"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/ykt-site/work/student/list",
+        "json": {
+          "siteId": "site-1",
+          "userId": "synthetic-user",
+          "current": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "activityId": "hw-submitted",
+                "assignmentTitle": "已交作业",
+                "siteId": "site-1",
+                "assignmentStatus": 0,
+                "assignmentEndTime": "2026-11-20 23:59",
+                "assignmentBeginTime": "2026-11-01 08:00",
+                "submitTime": "2026-11-15 10:00",
+                "score": 88
+              },
+              {
+                "activityId": "hw-past",
+                "assignmentTitle": "已过期作业",
+                "siteId": "site-1",
+                "assignmentStatus": 99,
+                "assignmentEndTime": "2026-11-01 23:59",
+                "assignmentBeginTime": "2026-10-01 08:00"
+              },
+              {
+                "activityId": "hw-no-deadline",
+                "assignmentTitle": "无截止时间",
+                "siteId": "site-1",
+                "assignmentStatus": 99
+              },
+              {
+                "activityId": "hw-late",
+                "assignmentTitle": "待完成作业",
+                "siteId": "site-1",
+                "assignmentStatus": 99,
+                "assignmentEndTime": "2026-11-30 23:59",
+                "assignmentBeginTime": "2026-11-10 08:00"
+              }
+            ],
+            "total": 4
+          }
+        }
+      }
+    }
+  ]
+}
