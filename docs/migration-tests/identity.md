@@ -43,7 +43,39 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - `locally_valid` 要求至少一个可用的 CAS Cookie：非空 domain、非空 name、字符串 value，且未明确过期。过期或格式不完整的 Cookie 只增加 `cookie_count`，不能单独让状态变成可用；缺失/不可解析的过期时间仍按未知处理。
 - `diagnose --only cas` 在没有可用 CAS Cookie 时返回本地 skipped 报告；其他需要联网的组返回 pending，不写会话。
 - `logout` 分别 unlink 自己拥有的 `credentials.json` 和 `session.json`，不重写打开的文件；`config.json` 和 `timetable.json` 保持原样。符号链接和非普通文件会被拒绝并报 auth 错误。
-- 本 lane 的 27 个进程测试全部通过；待实现场景没有以永远通过或伪造断言的形式保留。
+- 本 lane 的 27 个进程测试全部通过；另有 3 个 `identity` lib 单测覆盖共享 profile API；待实现场景没有以永远通过或伪造断言的形式保留。
+
+## 共享本地 profile API（本轮）
+
+`src/identity.rs` 新增 crate-internal、只读的 `load_profile(config_dir)`，返回 `Option<LocalProfile>`：
+
+- `LocalProfile::username() -> &str`：沿用现有 `load_account` 的规范化/trim 与 `BUPT_USERNAME` 优先级。
+- `LocalProfile::role() -> Option<Role>`：沿用现有 `Role::parse`，只返回类型化的 `Graduate`/`Undergraduate`；缺失和非法角色都是 `None`。
+- `LocalProfile::has_password() -> bool`：只报告是否检测到非空密码，不保存或返回密码内容。
+
+`LocalProfile` 不包含 password/cookie/token 字段，`Debug` 也只显示 username/role/has_password。API 只读 `credentials.json` 与环境变量，不读取会话、不联网、不写文件。`status` 和 `diagnose` 已改用同一入口，因此现有公开语义不变；其他 lane 的读取器本轮未迁移。
+
+本轮新增 3 个 lib 单测：profile 规范化/类型化角色/密码存在性及 Debug 脱敏、无密码和缺失/非法角色、缺失 profile 文件。
+
+## 现有本地凭据读取器审计（待整合）
+
+以下只是审计记录，没有修改其他 lane，也没有统一公开优先级：
+
+| 读取器 | username / 环境优先级 | role | 密码存在性 | 错误边界 |
+| --- | --- | --- | --- | --- |
+| `identity::load_profile`（本轮） | `BUPT_USERNAME` 先经 trim 过滤，再回退配置字符串；最终 trim | env/config 解析为 `Option<Role>`；缺失和非法都为 `None` | env 或配置的密码字符串任一非空 | 配置不存在且无有效 env -> `None`；读取/解析失败 -> auth；有 username 但无密码仍返回 profile |
+| `academics::load_account` | env 和配置都 trim；逐项回退 | 规范化别名；未知角色保留为小写字符串，缺失为 `""`；`validate_role` 区分缺失/非法 | `require_password` 为真时要求密码；env 优先于配置 | 读取/解析失败 -> auth；无 username 或必需密码缺失 -> auth |
+| `homework::require_credentials` | env 只过滤空串、不 trim；配置可用字符串或数字；username 再按 trim 非空过滤 | 不读取 role | env 或配置的 username/password 都必须存在 | 读取/解析失败 -> auth；没有 profile -> auth |
+| `campus::has_local_profile` | env username trim；配置 username trim；env 与配置按字段组合 | 不读取 role | env 或配置的有效 username/password 同时存在 | 读取/解析失败按“无 profile”返回 `false` |
+
+已知冲突，交由整合者决定，不在本轮改动：
+
+1. **缺失 vs 非法角色**：identity API 两者都返回 `None`；academics 分别保留 `""` 与未知字符串，并给出不同 usage 文案。
+2. **环境变量 vs 保存配置**：identity/academics 都按字段 env 优先，但密码“存在性”的处理不同；homework 的 env 不做 trim，空白 env 会阻止配置回退，且配置还接受数字；campus 的 password env 仅按非空判断（空白也算存在），只有 username trim；campus 还只返回 bool，并把读取失败当成没有 profile。
+3. **无密码 profile**：identity 仍可命名账号但禁止激活缓存；homework/campus 视为未配置；academics 是否报错取决于 `require_password`。
+4. **配置异常**：identity/homework 报 auth，campus 静默返回 `false`；academics 读取失败报 auth。
+
+接入 caller 时必须先由 supervisor 确认统一语义；本轮不改变 `status`/`diagnose` 的现有优先级。
 
 ## 用例映射
 
