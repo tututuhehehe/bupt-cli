@@ -276,3 +276,73 @@ def test_save_credentials_preserves_unknown_keys(tmp_path, monkeypatch):
     assert data["password"] == "new"
     assert data["role"] == "graduate"
     assert data["custom_note"] == "keep me"
+
+
+def _stale_mobile_session(now=None):
+    """Session cache carrying a failed *undergraduate* JWGL attempt."""
+    data = _fake_session_data(now)
+    data["mobile_jwgl"] = {
+        "last_error": "Mobile JWGL login failed: 该帐号不存在或密码错误！",
+        "last_attempt_at": "2026-01-01T00:00:00Z",
+        "blocked_until": 0.0,
+    }
+    return data
+
+
+def test_graduate_status_drops_stale_mobile_jwgl_error(monkeypatch, tmp_path):
+    """A graduate id cannot exist in the undergraduate registrar system.
+
+    Regression: a leftover failure from an old `bupt login --jwgl` attempt kept
+    showing up in `status`, which reads like a broken password and invites
+    retries that lock the CAS account.
+    """
+    monkeypatch.setenv("BUPT_CLI_CACHE_DIR", str(tmp_path))
+    save_session_file(_stale_mobile_session())
+
+    session = BuptSession(Credentials("u1", "pw", "graduate"))
+    status = session.status()
+    assert status["exists"] is True  # the cache really loaded
+    mobile = status["mobile_jwgl"]
+
+    assert mobile["present"] is False
+    assert mobile["last_error"] is None
+
+
+def test_undergraduate_status_keeps_mobile_jwgl_error(monkeypatch, tmp_path):
+    """The cleanup must only apply to graduate accounts."""
+    monkeypatch.setenv("BUPT_CLI_CACHE_DIR", str(tmp_path))
+    save_session_file(_stale_mobile_session())
+
+    session = BuptSession(Credentials("u1", "pw", "undergraduate"))
+    status = session.status()
+    assert status["exists"] is True  # the cache really loaded
+
+    assert status["mobile_jwgl"]["last_error"] is not None
+
+
+def test_graduate_mobile_login_is_never_attempted(monkeypatch, tmp_path):
+    """Refuse before the network: any attempt can only fail and can lock up."""
+    monkeypatch.setenv("BUPT_CLI_CACHE_DIR", str(tmp_path))
+    save_session_file(_stale_mobile_session())
+
+    session = BuptSession(Credentials("u1", "pw", "graduate"))
+    result = session.try_mobile_login(force=True)
+
+    assert result["attempted"] is False
+    assert result["ok"] is False
+    assert result["skipped"] == "graduate account"
+    assert "本科教务" in result["reason"]
+    # Nothing recorded, nothing persisted to retry-fail against.
+    assert "mobile_jwgl" not in session.data
+
+
+def test_graduate_mobile_manager_refuses_before_any_request(monkeypatch, tmp_path):
+    """The lowest-level guard: ensure_login must raise without a request."""
+    monkeypatch.setenv("BUPT_CLI_CACHE_DIR", str(tmp_path))
+    session = BuptSession(Credentials("u-grad", "pw", "graduate"))
+
+    from bupt_cli.errors import CampusAuthError
+
+    with pytest.raises(CampusAuthError) as excinfo:
+        session.mobile_manager().ensure_login(force=True)
+    assert "本科教务" in str(excinfo.value)

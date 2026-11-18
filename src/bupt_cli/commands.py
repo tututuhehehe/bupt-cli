@@ -1928,7 +1928,8 @@ def cmd_uninstall(args) -> dict[str, Any]:
         if entry:
             add(_os.path.join(entry, "bupt"))
 
-    # Around the running program (project launcher, ./dist/bupt, ...).
+    # Around the running program (project launcher, the installed ./bupt, an
+    # older ./dist/bupt, ...).
     add(str(Path.cwd() / "bupt"))
     add(str(Path.cwd() / "dist" / "bupt"))
     add(str(project_root / "bupt"))
@@ -1949,12 +1950,21 @@ def cmd_uninstall(args) -> dict[str, Any]:
     if getattr(_sys, "frozen", False):
         running_paths.add(_os.path.realpath(_sys.executable))
     else:
-        # `python -m bupt_cli` via the launcher: the launcher is $0 of the shell
+        # `./bupt-dev` via the launcher: the launcher is $0 of the shell
         # script, which Python does not see. Detect it as the project launcher
-        # whose parent holds src/bupt_cli.
-        launcher = project_root / "bupt"
-        if launcher.exists():
-            running_paths.add(_os.path.realpath(launcher))
+        # whose parent holds src/bupt_cli. (`./bupt` is the built binary, not a
+        # launcher, so it must stay deletable when running from source.)
+        for launcher_name in ("bupt-dev", "bupt"):
+            launcher = project_root / launcher_name
+            if not launcher.exists():
+                continue
+            try:
+                with open(launcher, "rb") as handle:
+                    is_script = handle.read(2) == b"#!"
+            except OSError:
+                is_script = False
+            if is_script:
+                running_paths.add(_os.path.realpath(launcher))
 
     def looks_like_bupt(path: str) -> bool:
         """Strictly verify an executable before deleting it.

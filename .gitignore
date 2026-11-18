@@ -7,6 +7,10 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+# 构建产物：./build.sh 直接把二进制装到项目根目录，不进 git
+/bupt
+/bupt.new
+/bupt.old
 .uv/
 credentials.json
 credentials *.json

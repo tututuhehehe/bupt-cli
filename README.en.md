@@ -83,14 +83,16 @@ the portal's "研究生系统" entry.
 
 ## Install / run
 
-There is exactly **one entry point**: the `bupt` launcher script in the project
-root. It sets `PYTHONPATH` to `src/` and `.deps/` and runs a plain CPython — no
-virtualenv, no editable install, no `.pth` indirection, so there is no
-"package disappeared" failure mode.
+There is exactly **one entry point**: `bupt` in the project root, which is the
+standalone binary produced by `./build.sh` (the directory is on `PATH`, so the
+command goes straight to it). `./bupt-dev` is the source launcher kept for
+development — it sets `PYTHONPATH` to `src/` and `.deps/` and runs a plain
+CPython (no virtualenv, no editable install, no `.pth` indirection).
 
 ```bash
 cd /path/to/bupt-cli
-./bupt --help          # works from any cwd too (the dir is on PATH)
+./bupt-dev --help      # run straight from source
+./build.sh             # -> ./bupt, the self-contained binary
 ```
 
 How it resolves things:
@@ -111,23 +113,26 @@ uv pip install --python ~/.local/share/uv/python/cpython-3.14-macos-aarch64-none
 ### Standalone binary (macOS arm64)
 
 ```bash
-./build.sh             # -> dist/bupt  (16 MB, self-contained)
-./dist/bupt --version
+./build.sh             # -> ./bupt  (16 MB, self-contained)
+bupt --version
 ```
 
 The binary links only against the system `libSystem`/`libz`, so it runs on any
 macOS arm64 machine without Python installed. All state still lives in
 `~/.bupt-cli/`, so the binary itself carries nothing.
 
-`dist/` is a build artifact and is safe to delete (`./build.sh --clean`).
+`./bupt` is a gitignored build artifact: rebuild with `./build.sh`, and
+`./build.sh --clean` removes only intermediate files (the installed binary is
+kept). The build stages into a temporary directory and smoke-tests first, so a
+failed build never breaks the binary you already have.
 
-**This repo does not install itself globally.** If you want `bupt` on your
-`PATH`, copy the binary yourself, e.g.:
+**This repo does not install itself globally.** If you want `bupt` elsewhere on
+your `PATH`, copy the binary yourself, e.g.:
 
 ```bash
-cp dist/bupt ~/.local/bin/bupt && chmod 755 ~/.local/bin/bupt
+cp bupt ~/.local/bin/bupt && chmod 755 ~/.local/bin/bupt
 # or, if you prefer a system-wide copy:
-sudo cp dist/bupt /usr/local/bin/bupt
+sudo cp bupt /usr/local/bin/bupt
 ```
 
 To undo any of this:

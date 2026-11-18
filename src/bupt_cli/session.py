@@ -312,6 +312,7 @@ class BuptSession:
         self._new_cas_logins = 0
         self._mobile_login_attempted = False
         self._mobile_login_error = ""
+        self._drop_stale_mobile_state()
 
     # -- state ---------------------------------------------------------
 
@@ -323,6 +324,32 @@ class BuptSession:
         self._new_cas_logins += 1
         self.data["cas_logins_total"] = int(self.data.get("cas_logins_total") or 0) + 1
         self.data["last_cas_login_at"] = _utc_iso(time.time())
+
+    def _drop_stale_mobile_state(self) -> None:
+        """Forget mobile-JWGL leftovers for accounts that cannot use it.
+
+        `jwglweixin.bupt.edu.cn` (mobile JWGL) is the *undergraduate* registrar
+        system: a graduate id does not exist there at all. A cached
+        ``last_error`` from an old attempt is therefore not a real account
+        problem — it only makes `status` look permanently broken and invites
+        password retries that can lock the CAS account. Drop it in memory; the
+        next persist writes the cleaned state back.
+        """
+        if self.credentials.role != "graduate":
+            return
+        mobile = self.data.get("mobile_jwgl")
+        if not isinstance(mobile, dict):
+            return
+        for key in (
+            "last_error",
+            "last_attempt_at",
+            "blocked_until",
+            "token",
+            "expires_at",
+        ):
+            mobile.pop(key, None)
+        if not mobile:
+            self.data.pop("mobile_jwgl", None)
 
     def _record_mobile_login(self) -> None:
         self._mobile_login_attempted = True
@@ -419,6 +446,21 @@ class BuptSession:
         client._mobile_jwgl_session_mgr = mobile_manager
         return client
 
+    def _mobile_disabled_reason(self) -> str:
+        """Why mobile JWGL must not submit a password, if it must not.
+
+        Checked by ``CliMobileSessionManager.ensure_login`` before any request,
+        so this is the lowest-level guard against a pointless (and lockout
+        risk) login.
+        """
+        if self.credentials.role == "graduate":
+            return (
+                "研究生账号不属于本科教务系统（mobile JWGL / jwglweixin）；"
+                "该学号在那套系统里不存在，请改用 `bupt schedule` / "
+                "`bupt schedule exams`"
+            )
+        return self._mobile_blocked_reason()
+
     def mobile_manager(self) -> CliMobileSessionManager:
         if self._mobile_mgr is not None:
             return self._mobile_mgr
@@ -426,7 +468,7 @@ class BuptSession:
             username=self.credentials.username,
             password=self.credentials.password,
             timeout=self.timeout,
-            disabled_reason=self._mobile_blocked_reason(),
+            disabled_reason=self._mobile_disabled_reason(),
             on_login=self._record_mobile_login,
         )
         client = manager.client
@@ -458,6 +500,12 @@ class BuptSession:
         mobile = self.data.get("mobile_jwgl") or {}
         token = str(mobile.get("token") or "")
         if not token and not allow_login:
+            if self.credentials.role == "graduate":
+                raise CampusAuthError(
+                    "研究生账号没有本科教务（mobile JWGL）会话；该学号在那套"
+                    "系统里不存在，重试登录只会失败",
+                    hint="改用 `bupt schedule` / `bupt schedule exams`",
+                )
             raise CampusAuthError(
                 "no cached mobile JWGL session; run `bupt login --jwgl` "
                 "(mobile JWGL is the undergraduate system; graduate ids are not present)"
@@ -517,6 +565,25 @@ class BuptSession:
         mobile = self.data.setdefault("mobile_jwgl", {})
         if not self.credentials.username or not self.credentials.password:
             return {"attempted": False, "ok": False, "reason": "no credentials"}
+        # Refuse before touching the network: mobile JWGL is the undergraduate
+        # registrar system, so a graduate login can only fail — and a failed
+        # attempt is exactly what locks accounts.
+        if self.credentials.role == "graduate":
+            mobile.pop("last_error", None)
+            mobile.pop("blocked_until", None)
+            mobile.pop("last_attempt_at", None)
+            if not mobile:
+                self.data.pop("mobile_jwgl", None)
+            return {
+                "attempted": False,
+                "ok": False,
+                "skipped": "graduate account",
+                "reason": (
+                    "研究生账号不属于本科教务系统（mobile JWGL），未尝试登录；"
+                    "该学号在那套系统里不存在，输任何密码都会被拒"
+                ),
+                "hint": "研究生课表/考试用 `bupt schedule` / `bupt schedule exams`",
+            }
         blocked = self._mobile_blocked_reason()
         if blocked and not force:
             return {"attempted": False, "ok": False, "reason": blocked}

@@ -42,11 +42,11 @@
 
 ### 方式一：源码运行（开发用）
 
-项目根目录的 `bupt` 就是唯一入口。它把 `PYTHONPATH` 指向 `src/` 和 `.deps/`，直接跑 CPython——**没有虚拟环境、没有 editable 安装、没有 `.pth` 指针**，所以不会出现"包莫名消失"。
+`./bupt-dev` 是源码直跑入口（**不是** `bupt`，避免盖住二进制）。它把 `PYTHONPATH` 指向 `src/` 和 `.deps/`，直接跑 CPython——**没有虚拟环境、没有 editable 安装、没有 `.pth` 指针**，所以不会出现"包莫名消失"。改完源码立刻验证用它：
 
 ```bash
 cd /path/to/bupt-cli
-./bupt --help
+./bupt-dev --help
 ```
 
 | 内容 | 位置 |
@@ -71,22 +71,22 @@ unzip bupt-macos-arm64.zip && chmod +x bupt
 ./bupt login
 ```
 
-或者自己构建：
+或者自己构建（构建完直接装到项目根目录的 `./bupt`）：
 
 ```bash
-./build.sh             # -> dist/bupt（约 16 MB，自包含）
-./dist/bupt --version
+./build.sh             # -> ./bupt（约 16 MB，自包含）
+bupt --version         # 项目目录在 PATH 上，直接就是二进制
 ```
 
 二进制只链接系统 `libSystem` / `libz`，**不需要装 Python**。所有状态仍在 `~/.bupt-cli/`，二进制本身不携带任何数据。
 
-`dist/` 是构建产物，可随时删（`./build.sh --clean`）。
+`./bupt` 是构建产物（已在 `.gitignore` 里），重跑 `./build.sh` 覆盖即可；`./build.sh --clean` 只清中间产物，不动已装好的 `./bupt`。构建先打到临时目录并冒烟测试，失败不会弄坏现有二进制。
 
-**本仓库不会把自己装进系统。** 想放到 PATH 上就自己拷：
+**本仓库不会把自己装进系统。** 想放到别处就自己拷：
 
 ```bash
-cp dist/bupt ~/.local/bin/bupt && chmod 755 ~/.local/bin/bupt
-sudo cp dist/bupt /usr/local/bin/bupt     # 或系统级
+cp bupt ~/.local/bin/bupt && chmod 755 ~/.local/bin/bupt
+sudo cp bupt /usr/local/bin/bupt          # 或系统级
 ```
 
 卸载：
