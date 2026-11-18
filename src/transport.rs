@@ -314,16 +314,12 @@ fn validate_request(request: &Request) -> CliResult<()> {
     Ok(())
 }
 
-fn curl_arguments(request: &Request, timeout: Duration) -> CliResult<Vec<OsString>> {
-    validate_request(request)?;
-    if timeout.is_zero() {
-        return Err(request_rejected());
-    }
+fn base_curl_arguments(timeout: Duration) -> Vec<OsString> {
     let timeout = timeout
         .min(Duration::from_secs(MAX_TIMEOUT_SECONDS))
         .max(Duration::from_millis(1));
     let connect_timeout = timeout.min(Duration::from_secs(CONNECT_TIMEOUT_SECONDS));
-    let mut args: Vec<OsString> = vec![
+    vec![
         "--disable".into(),
         "--silent".into(),
         "--show-error".into(),
@@ -340,11 +336,21 @@ fn curl_arguments(request: &Request, timeout: Duration) -> CliResult<Vec<OsStrin
         MAX_RESPONSE_BYTES.to_string().into(),
         "--max-redirs".into(),
         "0".into(),
+    ]
+}
+
+fn curl_arguments(request: &Request, timeout: Duration) -> CliResult<Vec<OsString>> {
+    validate_request(request)?;
+    if timeout.is_zero() {
+        return Err(request_rejected());
+    }
+    let mut args = base_curl_arguments(timeout);
+    args.extend([
         "--request".into(),
         request.method.into(),
         "--url".into(),
         request.url.clone().into(),
-    ];
+    ]);
     for (name, value) in &request.headers {
         args.push("--header".into());
         args.push(format!("{name}: {value}").into());

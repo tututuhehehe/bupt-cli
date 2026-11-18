@@ -1,9 +1,10 @@
 //! The CAS/UCloud slice for a one-exchange system curl executor. All request
 //! strings are written as curl options to stdin, never to argv or a file.
 
-use super::{Request, Response};
+use super::{CurlExec, Request, Response, base_curl_arguments};
 use crate::cli::{CliError, CliResult};
 use std::fmt::Write;
+use std::time::Duration;
 use url::Url;
 
 const MAX_REQUEST: usize = 64 * 1024;
@@ -18,7 +19,34 @@ enum Route {
     UcloudRead,
 }
 
-pub(super) fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
+pub(super) fn exchange(
+    exec: &mut dyn CurlExec,
+    timeout: Duration,
+    request: &Request,
+) -> CliResult<Response> {
+    if timeout.is_zero() {
+        return Err(rejected());
+    }
+    let input = curl_config(request)?;
+    let mut args = base_curl_arguments(timeout);
+    args.extend(["--config".into(), "-".into()]);
+    let output = exec.exec(&args, &input).map_err(|_| network_failure())?;
+    if !output.success {
+        return Err(network_failure());
+    }
+    parse_response(&output.stdout)
+}
+
+fn network_failure() -> CliError {
+    CliError::new(
+        4,
+        "network",
+        "campus HTTPS request failed",
+        "Check campus network connectivity. The request was not retried.",
+    )
+}
+
+fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
     let route = route(request).ok_or_else(rejected)?;
     let body = std::str::from_utf8(&request.body).map_err(|_| rejected())?;
     if body.len() > MAX_REQUEST
@@ -124,7 +152,7 @@ fn option(config: &mut String, name: &'static str, value: &str) {
     config.push_str("\"\n");
 }
 
-pub(super) fn parse_response(mut stdout: &[u8]) -> CliResult<Response> {
+fn parse_response(mut stdout: &[u8]) -> CliResult<Response> {
     for _ in 0..=3 {
         let end = stdout[..stdout.len().min(MAX_HEADERS)]
             .windows(4)
@@ -212,6 +240,46 @@ fn malformed_response() -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curl_receives_no_request_secrets_in_arguments() {
+        struct FakeCurl;
+        impl CurlExec for FakeCurl {
+            fn exec(
+                &mut self,
+                args: &[std::ffi::OsString],
+                stdin: &[u8],
+            ) -> CliResult<super::super::CurlOutput> {
+                assert_eq!(args.first().unwrap(), "--disable");
+                assert!(args.ends_with(&["--config".into(), "-".into()]));
+                assert!(
+                    args.iter()
+                        .all(|arg| !arg.to_string_lossy().contains("TEST-ONLY"))
+                );
+                assert!(
+                    std::str::from_utf8(stdin)
+                        .unwrap()
+                        .contains("password=TEST-ONLY")
+                );
+                Ok(super::super::CurlOutput {
+                    stdout: b"HTTP/2 429\r\n\r\n".to_vec(),
+                    success: true,
+                })
+            }
+        }
+        let response = exchange(
+            &mut FakeCurl,
+            Duration::from_secs(1),
+            &Request {
+                method: "POST",
+                url: "https://auth.bupt.edu.cn/authserver/login".into(),
+                headers: vec![],
+                body: b"password=TEST-ONLY".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(response.status, 429);
+    }
 
     #[test]
     fn request_scope_and_curl_option_boundaries() {
