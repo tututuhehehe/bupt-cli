@@ -16,8 +16,8 @@ const COURSE_PAGE_SIZE: usize = 50;
 const COURSE_PAGE_LIMIT: u32 = 10;
 
 pub(super) struct Session {
-    access_token: String,
-    user_id: String,
+    pub(super) access_token: String,
+    pub(super) user_id: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,9 +77,7 @@ pub(super) fn fetch_courses(
     let mut seen = HashSet::new();
 
     for page in 1..=COURSE_PAGE_LIMIT {
-        let url = format!("{UCLOUD_API}{COURSES_PATH}?size={COURSE_PAGE_SIZE}&current={page}");
-        let data = get_data(transport, session, "UCloud course list", url)?;
-        let (batch, record_count) = parse_course_page(&data)?;
+        let (batch, record_count) = fetch_course_page(transport, session, page)?;
         let mut fresh = 0usize;
         for course in batch {
             if !course.site_id.is_empty() && !seen.insert(course.site_id.clone()) {
@@ -96,6 +94,18 @@ pub(super) fn fetch_courses(
     }
 
     Ok(courses)
+}
+
+/// Fetch one course page. List/submission-time lookups use only the first
+/// page, matching Python ``get_enrolled_courses()``.
+pub(super) fn fetch_course_page(
+    transport: &mut dyn Transport,
+    session: &Session,
+    page: u32,
+) -> CliResult<(Vec<Course>, usize)> {
+    let url = format!("{UCLOUD_API}{COURSES_PATH}?size={COURSE_PAGE_SIZE}&current={page}");
+    let data = get_data(transport, session, "UCloud course list", url)?;
+    parse_course_page(&data)
 }
 
 /// Fetch the pending-assignment overview. This maps only fields present in the
@@ -118,17 +128,63 @@ pub(super) fn fetch_undone(
     parse_undone(&data)
 }
 
-fn get_data(
+pub(super) fn get_data(
     transport: &mut dyn Transport,
     session: &Session,
     operation: &str,
     url: String,
 ) -> CliResult<Value> {
+    let object = send_payload(transport, session, operation, "GET", url, None)?;
+    object
+        .get("data")
+        .cloned()
+        .ok_or_else(|| CliError::new(5, "parse", format!("{operation} response missing data"), ""))
+}
+
+pub(super) fn post_data(
+    transport: &mut dyn Transport,
+    session: &Session,
+    operation: &str,
+    url: String,
+    body: &Value,
+) -> CliResult<Value> {
+    let object = send_payload(transport, session, operation, "POST", url, Some(body))?;
+    object
+        .get("data")
+        .cloned()
+        .ok_or_else(|| CliError::new(5, "parse", format!("{operation} response missing data"), ""))
+}
+
+/// Send one authenticated JSON request and return the top-level object after
+/// HTTP/envelope checks. Transport failures keep their original network layer.
+pub(super) fn send_payload(
+    transport: &mut dyn Transport,
+    session: &Session,
+    operation: &str,
+    method: &'static str,
+    url: String,
+    body: Option<&Value>,
+) -> CliResult<Map<String, Value>> {
+    let mut headers = auth_headers(&session.access_token);
+    let body = match body {
+        Some(body) => {
+            headers.push(("Content-Type".into(), "application/json".into()));
+            serde_json::to_vec(body).map_err(|_| {
+                CliError::new(
+                    5,
+                    "parse",
+                    format!("{operation} request could not be serialized"),
+                    "",
+                )
+            })?
+        }
+        None => Vec::new(),
+    };
     let response = transport.send(Request {
-        method: "GET",
+        method,
         url,
-        headers: auth_headers(&session.access_token),
-        body: Vec::new(),
+        headers,
+        body,
     })?;
 
     let status = response.status;
@@ -184,10 +240,7 @@ fn get_data(
             "The command did not retry.",
         ));
     }
-    object
-        .get("data")
-        .cloned()
-        .ok_or_else(|| CliError::new(5, "parse", format!("{operation} response missing data"), ""))
+    Ok(object.clone())
 }
 
 fn parse_course_page(data: &Value) -> CliResult<(Vec<Course>, usize)> {
@@ -283,7 +336,10 @@ fn parse_undone(data: &Value) -> CliResult<UndoneOverview> {
     })
 }
 
-fn pagination_total(object: &Map<String, Value>, operation: &str) -> CliResult<Option<u64>> {
+pub(super) fn pagination_total(
+    object: &Map<String, Value>,
+    operation: &str,
+) -> CliResult<Option<u64>> {
     for key in ["total", "totalCount", "totalElements"] {
         let Some(value) = object.get(key) else {
             continue;
@@ -310,7 +366,10 @@ fn pagination_total(object: &Map<String, Value>, operation: &str) -> CliResult<O
     Ok(None)
 }
 
-fn first_present<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+pub(super) fn first_present<'a>(
+    object: &'a Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Value> {
     for key in keys {
         if let Some(value) = object.get(*key)
             && !value.is_null()
@@ -368,7 +427,7 @@ fn count_value(value: Option<&Value>, default: u64) -> u64 {
     }
 }
 
-fn is_truthy(value: &Value) -> bool {
+pub(super) fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
         Value::Bool(value) => *value,
@@ -379,7 +438,7 @@ fn is_truthy(value: &Value) -> bool {
     }
 }
 
-fn value_as_string(value: &Value) -> Option<String> {
+pub(super) fn value_as_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
@@ -407,7 +466,7 @@ fn looks_like_auth_error(message: &str) -> bool {
         || message.contains("登录")
 }
 
-fn auth_headers(access_token: &str) -> Vec<(String, String)> {
+pub(super) fn auth_headers(access_token: &str) -> Vec<(String, String)> {
     vec![
         ("Blade-Auth".into(), access_token.to_owned()),
         ("Tenant-Id".into(), "000000".into()),
@@ -418,7 +477,7 @@ fn auth_headers(access_token: &str) -> Vec<(String, String)> {
     ]
 }
 
-fn query_url(path: &str, params: &[(&str, &str)]) -> String {
+pub(super) fn query_url(path: &str, params: &[(&str, &str)]) -> String {
     let mut url = format!("{UCLOUD_API}{path}");
     for (index, (key, value)) in params.iter().enumerate() {
         url.push(if index == 0 { '?' } else { '&' });

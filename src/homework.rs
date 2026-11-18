@@ -1,6 +1,10 @@
+mod detail;
 #[allow(dead_code)] // Exercised by in-process tests; CLI wiring follows the session adapter.
 mod read;
+mod show;
 mod submit;
+mod text;
+mod verify;
 
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::identity;
@@ -116,19 +120,13 @@ pub(crate) fn run(
 
 fn run_homework(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     match matches.subcommand() {
-        Some(("show", _)) => {
-            require_credentials(context)?;
-            Err(unsupported("homework show"))
-        }
+        Some(("show", show_matches)) => show::run(show_matches, context),
         Some(("download", _)) => {
             require_credentials(context)?;
             Err(unsupported("homework download"))
         }
         Some(("submit", submit_matches)) => submit::run(submit_matches, context),
-        Some(("verify", _)) => {
-            require_credentials(context)?;
-            Err(unsupported("homework verify"))
-        }
+        Some(("verify", verify_matches)) => verify::run(verify_matches, context),
         _ => {
             require_credentials(context)?;
             Err(unsupported("homework listing"))
@@ -147,4 +145,12 @@ pub(super) fn unsupported(operation: &str) -> CliError {
 
 pub(super) fn require_credentials(context: &Context<'_>) -> CliResult<()> {
     identity::require_authenticated_profile(&context.config_dir).map(|_| ())
+}
+
+/// Single session-acquisition seam for every homework command. The identity
+/// lane will replace this body with the real adapter; until then a configured
+/// account stops before any campus request.
+pub(in crate::homework) fn load_session(context: &Context<'_>) -> CliResult<read::Session> {
+    require_credentials(context)?;
+    Err(unsupported("homework session wiring"))
 }
