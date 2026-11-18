@@ -34,17 +34,18 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 
 ## 第一批本地实现状态
 
-`src/identity.rs` 已实现本地 `login` 参数校验、只读 `status`、会话归属判定和 `logout`。CAS/UCloud 协议切片已在 `src/identity/cas.rs` 用注入传输验证，但尚未接到生产命令、网络传输或在线 `diagnose`。
+`src/identity.rs` 已实现本地 `login`、只读 `status`、会话归属判定和 `logout`；本轮新增 `src/identity/session.rs`，把 `src/identity/cas.rs` 的 CAS/UCloud 协议接到生产 `login` 和 `require_ucloud_session`，但仍只使用注入的 `Transport`。CLI 的传输工厂仍是 `Offline`，等待整合者接线。
 
-- 有效的 `login --user … --password … --role …` 在校验后返回明确的 pending 错误（退出码 `5`，`type: upstream`），不读取或写入账号状态。
-- `src/identity.rs` 的 `registration` 测试模块已把结构化登录参数与私有 `VerifiedLogin` 能力分开；它复用 `Scripted` CAS 成功/拒绝序列，证明只有验证成功后才登记 `credentials.json`。该模块只在 `#[cfg(test)]` 编译，生产 `login` 仍未接线，CAS 原型仍不接生产 transport。
-- 当前 `login` 是非交互解析里程碑：缺少 `--user`/`--password` 会 usage 退出；最终登录仍必须恢复交互式提示。
+- 有效的 `login --user … --password … --role …` 先预检本地目录和文件，再走 CAS；成功后写 `credentials.json` 和原生 `session.json`。生产入口不再返回 pending；交互式账号/密码提示仍待实现。
+- 登录只提交一次密码表单，并且只以普通 CAS service-ticket 校验返回的显式重定向和 UCloud ticket 作为成功证据。登录本身不请求 UCloud token；ticket、最终 URL 和 Cookie 原文都不进入输出。
+- 原生 session 用维护中的 `cookie_store` 序列化 Cookie，保留 host-only、默认 path、过期和非持久 Cookie；导入时拒绝 CAS 白名单之外的域名/path。`status` 同时兼容旧的平铺 Cookie 形状，公开输出字段不变。
+- 当前 `login` 仍是非交互解析里程碑：缺少 `--user`/`--password` 会 usage 退出；最终登录仍必须恢复交互式提示。
 - `status` 的 `user` 只输出 `user_id`、`user_name`、`real_name`；未知键忽略。`user_id` 只接受字符串或整数，两个名称字段只接受字符串；对象/数组等嵌套值直接省略。缓存中的 `mobile_jwgl.last_error` 不原样输出，统一映射为不含细节的安全诊断。
 - 没有密码的已保存 profile 可以在 `status` 中显示学号，但不会激活任何缓存会话；没有 profile 时同样不激活。
 - `locally_valid` 要求至少一个可用的 CAS Cookie：非空 domain、非空 name、字符串 value，且未明确过期。过期或格式不完整的 Cookie 只增加 `cookie_count`，不能单独让状态变成可用；缺失/不可解析的过期时间仍按未知处理。
-- `diagnose --only cas` 在没有可用 CAS Cookie 时返回本地 skipped 报告；其他需要联网的组返回 pending，不写会话。
+- `diagnose --only cas` 在没有可用 CAS Cookie 时返回本地 skipped 报告；其他需要联网的组仍返回 pending，不写会话。
 - `logout` 分别 unlink 自己拥有的 `credentials.json` 和 `session.json`，不重写打开的文件；`config.json` 和 `timetable.json` 保持原样。符号链接和非普通文件会被拒绝并报 auth 错误。
-- 本 lane 的 28 个进程测试全部通过；`identity` 模块另有 27 个 lib 单测（12 个本地/登记 + 15 个 CAS/UCloud）；待实现场景没有以永远通过或伪造断言的形式保留。
+- 本 lane 的 28 个进程测试全部通过；`identity` 模块另有 38 个 lib 单测（4 个 profile/参数 + 17 个原生会话 + 17 个 CAS/UCloud），全库 lib 共 112 个；待实现场景没有以永远通过或伪造断言的形式保留。
 
 ## 共享本地 profile API（本轮）
 
@@ -55,7 +56,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - `LocalProfile::has_password() -> bool`：只报告 `credentials.json` 中是否有非空密码字符串，不保存或返回密码内容。
 - `require_authenticated_profile(config_dir)`：在 `load_profile` 之上要求 username 和非空密码；缺失、不可读或不可解析统一返回 auth 退出码 `3`，不检查 role。
 
-`LocalProfile` 不包含 password/cookie/token 字段，`Debug` 也只显示 username/role/has_password。这个 API 只读 `credentials.json`，不读取账号环境变量、会话或网络，也不写文件。
+`LocalProfile` 不包含 password/cookie/token 字段；`Debug` 只显示 username/role/has_password，新增的私有 `session_revision` 不显示也不通过公开访问器返回。这个 API 只读 `credentials.json`，不读取账号环境变量、会话或网络，也不写文件。
 
 本轮同时迁移了调用方：`status`/`diagnose` 继续使用 `load_profile`；`academics`、`homework`、`campus` 的受保护命令改用共享鉴权入口。`academics` 只在需要选择本科/研究生数据源的操作里继续要求合法 role，`homework`/`campus` 不要求 role；匿名 `library` 路径仍不读取凭据。
 
@@ -77,32 +78,32 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 3. role 缺失或非法只在确实需要 role 的 `academics` 操作中报 usage；其他使用方不因 role 阻止仅需登录的命令。
 4. `status` 的只读语义和 session 归属规则不变；无密码 profile 仍然只显示学号，不激活缓存。
 
-## CAS/UCloud 协议切片（本轮）
+## CAS/UCloud 协议与原生会话（本轮）
 
-`src/identity/cas.rs` 是从 Python `auth.py` 抽出的单个平铺子模块，只服务测试和后续接线，当前没有接到任何生产命令、传输工厂或会话持久化：
+`src/identity/cas.rs` 仍是单个平铺子模块，使用注入的 `Transport`；`src/identity/session.rs` 负责生产登录、磁盘加载和惰性 token 交换。`Cargo.toml` 只为 `cookie_store` 启用 `serde_json` feature，没有新增网络依赖。
 
 - `cas_login` 先 GET CAS 登录页并提取 `execution`，然后只提交一次账号密码表单。所有重定向都校验 URL、host 和 path；POST 不跟随 307/308，返回明确的 auth 错误，避免重放密码。其余重定向只以 GET 跟随，目标必须是 HTTPS 的 `auth.bupt.edu.cn/authserver/*` 或 `ucloud.bupt.edu.cn/uclass*`；端口、userinfo、非 TLS、外部 host、路径穿越和超长重定向链都拒绝。TLS 证书校验由最终传输实现负责；本切片只保证请求 URL 和重定向目标不会离开 HTTPS 白名单。
 - CAS 表单最终页必须是 2xx，且不能仍是 `/authserver/login` 登录页。随后必须再走普通 CAS service-ticket 校验请求：只有 301/302/303/307/308 这类明确重定向状态，且 `Location` 指向允许的 UCloud path 并携带 ticket，才算登录成功。2xx 即使带 `Location` 也不算；空页、无关页、登录页、300/304、缺失 ticket 或无 `Location` 的 3xx 都 fail closed。
-- `CasLogin` 的字段私有，只有拿到 service ticket 才能构造；最终 URL 不再暴露，ticket 不进入 `Debug`。协议切片本身不写文件；`identity::registration` 的测试路径只在验证成功后写 `credentials.json`，生产 `login` 尚未接线，失败路径不得写状态。
-- `ucloud_token` 是惰性的：CAS 登录本身不请求 OAuth token。登录拿到的 service ticket 在第一次真正需要 token 时使用；之后 ticket 已消费或 token 过期时，再通过同一 CAS service-ticket 校验请求取新 ticket。token 只缓存在内存，并按既有 `UCLOUD_EXPIRY_BUFFER_SECONDS`/JWT `exp` 判断是否过期；ticket 交换不跟随进入 UCloud。后续读取使用 `Blade-Auth`、`Tenant-Id: 000000` 和既有 UCloud 客户端 Basic 授权头，不把 CAS Cookie 或密码带到 UCloud API。
-- 错误按全局合同分层：401/403 是 auth `3`；其他 HTTP 4xx/5xx（包括限流 429）是 upstream `5`，其中 429 只提示等待，其他提示服务响应异常，均不提示重试密码；连接/传输失败是 network `4`。缺少 execution、畸形页面/JSON、缺失 `Location` 是 upstream `5`；没有 ticket、ticket 重定向不合法或缺少 `access_token` 是 auth `3`。错误消息不回显密码、Cookie、ticket 或 token。
-- 15 个 CAS/UCloud lib 单测使用 `Scripted` 和 `TEST-ONLY-` 合成值：单次密码 POST、service ticket 正向证据、显式重定向状态（301/302/303/307/308）、允许 302 后空/无关 200 无 ticket 的失败关闭、200 带 `Location` 不得当 ticket、307/308 拒绝、非 TLS/外部 host 拒绝、HTTP 4xx/5xx 与连接失败分层（含 429）、缺失 execution、惰性 token 与缓存复用、过期 token 不重用、UCloud 读取路径校验、ticket 重定向校验、token 响应成功条件。当前全库 lib 共 83 个测试；`contract_identity` 仍是 28 个进程测试。
-- 未实现：真实传输接线、生产账号/会话写入（离线测试路径只写 `credentials.json`）、自动续期/登录次数上限、在线 `diagnose`、Windows ACL、真实校园网验收。以上仍保留在下面的待实现场景中。
+- `CasLogin` 的字段私有，只有拿到 service ticket 才能构造；最终 URL 不保留，ticket 不进入 `Debug`。`session::login` 只在 `cas_login` 成功后读取旧 `credentials.json`、生成新 revision，并写入原生 session；验证失败不会触碰旧文件。
+- Cookie 容器改为维护中的 `cookie_store`：接收时只接受 CAS 及其校园父域，导入时再次检查每个序列化 Cookie 的 domain/path，拒绝外部范围；序列化保留 host-only、默认 path、过期时间和非持久 Cookie。CAS Cookie 只发给 CAS，UCloud token/API 请求不带 Cookie。
+- `ucloud_token` 是惰性的：CAS 登录本身不请求 OAuth token。协议层 `CasLogin` 在成功时保留一个一次性 ticket，供同一进程的首次 token 请求使用；生产 `session::login` 在写盘前丢弃它，所以独立进程首次读取会用持久化 Cookie 再走一次普通的 service-ticket 校验。之后 ticket 已消费或 token 过期时，同样重新校验并取新 ticket。token 缓存在 session 中，并按既有 `UCLOUD_EXPIRY_BUFFER_SECONDS`/JWT `exp` 判断是否过期；ticket 交换不跟随进入 UCloud。后续读取使用 `Blade-Auth`、`Tenant-Id: 000000` 和既有 UCloud 客户端 Basic 授权头，不把 CAS Cookie 或密码带到 UCloud API。
+- `require_ucloud_session(context)` 返回 `(access_token, user_id)`；没有可验证的本地会话、Cookie 范围不合法、文件权限不安全或 revision 不匹配时，在联网前返回 auth `3`。有新鲜缓存 token 时直接复用且不写盘；缺失/过期时才做一次 service-ticket/token 交换，并把新 Cookie 和 token 写回 session。该路径从不提交账号密码。
+- 错误按全局合同分层：401/403 是 auth `3`；其他 HTTP 4xx/5xx（包括限流 429）是 upstream `5`，其中 429 只提示等待，其他提示服务响应异常，均不提示重试密码；连接/传输失败是 network `4`。缺少 execution、畸形页面/JSON、缺失 `Location` 是 upstream `5`；没有 ticket、ticket 重定向不合法或缺少 `access_token` 是 auth `3`。错误消息不回显密码、Cookie、ticket、token 或最终 URL。
+- 17 个 CAS/UCloud lib 单测使用 `Scripted` 和 `TEST-ONLY-` 合成值：单次密码 POST、service ticket 正向证据、显式重定向状态（301/302/303/307/308）、允许 302 后空/无关 200 无 ticket 的失败关闭、200 带 `Location` 不得当 ticket、307/308 拒绝、非 TLS/外部 host 拒绝、HTTP 4xx/5xx 与连接失败分层（含 429）、缺失 execution、惰性 token 与缓存复用、过期 token 不重用、UCloud 读取路径校验、ticket 重定向校验、token 响应成功条件。
 
-**真实接线门槛**：URL 与 Cookie 已改用 `url` 和 `cookie_store`。保留明确 HTTPS 主机和路径限制，拒绝显式端口和编码路径穿越；CAS Cookie 只从 CAS 接收、只发往 CAS。新增两个合成用例覆盖 Cookie 默认路径、过期、域隔离及 URL 规范化。该协议仍仅编译进测试；还需接入受限传输、会话持久化与业务命令后，再用独立状态实际运行 `login`、`courses`、`homework --undone`。匿名 CAS 登录页可达不算认证通过。
+**集成门槛（live transport）**：CLI 仍使用 `Offline`，没有真实校园流量。接线前仍需由整合者确认受限传输的 TLS/重定向行为、进程级 login/read 路径、`homework` 等业务命令的实际调用点，以及真实校园网验收。当前安全边界是固定 HTTPS host/path、单一密码 POST、Cookie 域/path 白名单、私有文件写入和非 Unix fail closed；不把合成测试当作真实登录证明。
 
-## 离线验证到登记（测试路径，本轮）
+## 生产身份/会话接线（本轮）
 
-`src/identity.rs` 中的 `registration` 模块只在 `#[cfg(test)]` 编译；生产 `login` 仍返回 pending，CAS 原型仍不接生产传输。该路径把“验证”和“登记”分成两层：
+`session::login` 把“验证”和“登记”分开：
 
 - `LoginRequest` 保存结构化的 `username`/`password`/`role`；`Debug` 只显示 username/role，password 固定为 `<redacted>`。
-- `VerifiedLogin` 是 `registration` 私有的零大小能力，只有 `verify_login` 在 `cas::cas_login` 成功后构造。它不携带 ticket、cookie、token 或最终 URL；`verify_login` 立即丢弃 `CasLogin`，避免登记层持久化协议材料。
-- `verify_and_register` 先验证，后读取旧 `credentials.json` 合并未知键，再原子替换。CAS auth/network/限流失败发生在读取/写入之前，旧 credentials 和 session 字节保持不变。
-- 改密验证始终使用请求中的新密码；不读取旧凭据或旧 session 作为验证依据。测试在旧 session 同学号、同角色的情况下仍断言完整 CAS 流程发生，且旧密码和旧 session secret 不出现在请求/输出中。
-- 写入使用同目录临时文件：创建时 `0600`，写字节前再次 `chmod 0600`，`sync_all` 后 `rename` 替换；任何失败都删除临时文件。旧文件是合法 JSON 对象时保留未知键；损坏/非对象/不可读的普通旧文件在验证成功后替换（与 Python `save_credentials` 一致）。目标 symlink、非普通文件、config 目录 symlink 都拒绝；新建 config 目录为 `0700`。
-- 成功登记只写 `credentials.json`，不写、不改 `session.json`。同账号旧会话是否失效本轮未实现，也不声称旧会话已被新密码重新验证；后续接线必须显式决定失效/复用策略，不能用本路径规避该决定。
-- 非 Unix 平台写入 fail closed（upstream `5`），不声明 Windows ACL 支持。
-- 9 个新增 lib 单测覆盖：`LoginRequest` 密码 Debug 脱敏；成功登记写 `0600`、未知键保留、无 ticket/URL/cookie/token 持久化；改密使用新密码且不读旧 session；401/登录页拒绝/429/网络失败时 credentials+session 字节和权限不变；credentials symlink 不触碰目标；config 目录 symlink 拒绝；非普通 credentials 拒绝；缺失 config 目录创建为 `0700`；损坏旧文件在验证成功后修复。错误和 Debug 都不含合成密码、ticket 或本地路径。
+- 登录前预检：config/cache 目录不存在时创建为 `0700`，拒绝 symlink、非目录、组/其他用户可写；已有 `credentials.json`/`session.json` 拒绝 symlink、非普通文件或 owner 与父目录不一致；在目录中创建并删除私有 probe，确认能写入后才提交密码 POST。生成 32 字节随机 `session_revision`（hex），只用于本地归属绑定，不进入输出。
+- CAS 成功后先合并旧 credentials 的未知键，再写 `username`/`password`/`role`/`session_revision`；session 重置协议相关状态，写入版本、账号、角色、revision、时间、维护中的 Cookie 数组、`cas_logins_total`，不写 ticket、最终 URL、密码或 token（登录阶段没有 token，协议层的一次性 ticket 也在写盘前丢弃）。
+- 两个文件都在同目录以 `create_new` + `0600` 临时文件 staging；写字节前再次 `chmod 0600`，`sync_all` 后 `rename`，失败删除临时文件。代码不声称跨两个路径的原子事务：先提交 credentials，再提交 session；若 session 提交失败，credentials 的新 revision 会使旧 session 无法通过绑定检查。CAS/auth/network/限流失败或验证不完整时，旧 credentials/session 字节和权限保持不变。
+- `require_ucloud_session` 读取时要求 credentials 和 session 都是普通、owner-only（组/其他用户无权限，通常为 `0600`）文件，父目录不是 symlink 且不可被其他用户写，config/cache 属主一致；校验 `version`、username、role、revision 后才接受 Cookie/token。旧 v1 会话仍由公开 `status` 只读兼容，但不会激活原生读取路径。
+- 非 Unix 平台在写入前 fail closed（upstream `5`），不声明 Windows ACL 支持。
+- 17 个新增 lib 单测覆盖：单次 CAS 验证且登录不请求 token、credentials 未知键保留和新 revision、second login 生成新 revision、分离进程从磁盘加载并复用新鲜 token（含 CAS Cookie 已过期）、无密码/错误 revision/外部 Cookie 范围/不安全权限在联网前拒绝、过期 token 惰性刷新并写回、token 刷新 401 时 session 不变、401 和缺少 ticket 时旧字节不变且不重试密码、损坏的普通 credentials/session 在验证成功后修复、symlink/可写目录在密码 POST 前拒绝、非 Unix fail closed。测试只用临时目录、`Scripted` 和合成秘密。
 
 ## 用例映射
 
@@ -143,29 +144,30 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - Python `status --check` 会联网；合同删除了该参数，联网诊断归到 `diagnose`。本修订直接验证它被 usage 拒绝，没有猜测兼容行为。
 - Python `login --jwgl` 会尝试移动教务登录；合同删除了该参数。本修订直接验证它被 usage 拒绝。
 - Python `probe._save_probe_state()` 会在探测过程中写 `session.json`；Rust `diagnose` 明确不写本地会话，测试用前后快照约束。
-- Python `login` 在验证前保存新凭据；合同要求失败时保留上一次有效登记和会话。当前实现还在 pending 前，后续接线必须保持这个顺序。
+- Python `login` 在验证前保存新凭据；Rust 先验证 CAS，再在同一事务顺序中提交新 credentials 和 session。失败时保留上一次有效登记和会话；若 session 提交单独失败，新 revision 会让旧 session 失效，而不是假装两者已原子提交。
 - Python `logout` 只删 `session.json`，不清密码；合同要求同时忘掉本地凭据和会话，但保留课表和设置。Rust 直接 unlink 两个自有文件，不重写或截断；符号链接/非普通文件拒绝。
 - Python `status.user` 原样返回缓存对象；Rust 只允许 `user_id`、`user_name`、`real_name`，且只接受字符串/整数 ID 和字符串名称，嵌套值不输出。Python `mobile_jwgl.last_error` 原样返回；Rust 映射为安全诊断，不输出缓存自由文本。
 - Python 的凭据读取允许环境变量覆盖 `credentials.json`；Rust 合同改为只读 JSON，账号环境变量不再补充或覆盖任何字段。相关进程用例验证 env-only 被忽略、冲突 env 不改变本地账号和 role。
-- Python 只要缓存有 Cookie 且学号相同就可能复用；Rust 要求 profile 含密码、v2 归属元组 `(username, role)`，并要求至少一个未明确过期且 name/value 完整的 CAS Cookie。v1 只复用身份无关的 CAS/UCloud 状态，不复用无法确认角色的移动教务状态。
+- Python 只要缓存有 Cookie 且学号相同就可能复用；Rust 要求 profile 含密码、v2 归属元组 `(username, role)` 和 revision；公开 `status` 仍要求至少一个未明确过期且 name/value 完整的 CAS Cookie，原生读取在已有新鲜 token 时可直接复用 token，只有需要刷新 token 时才要求可用 CAS Cookie。v1 只复用身份无关的 CAS/UCloud 状态，不复用无法确认角色的移动教务状态。
+- Python 的 `session.json` 使用平铺 Cookie 对象；Rust 原生登录使用 `cookie_store` 序列化，同时让公开 `status` 继续读取旧平铺形状。Python 的旧会话没有 per-login revision；Rust 原生会话要求 revision，防止同账号改密后旧 session 继续被读取。
 - 当前 Rust `login` 只实现非交互参数解析；Python 在缺参数时提示输入。最终登录仍必须恢复交互式提示；本轮只把它记录为里程碑，不把非交互行为当作最终合同。
 - 成功/错误输出统一带 `schema: "bupt.v1"`；这是迁移合同的新增外壳。
 
 ## 待实现场景与所需测试缝
 
-以下场景仍不能在当前进程级共享 harness 下完整验证。部分已由 `identity::registration` 的离线测试路径覆盖，但生产接线、进程级验证或平台 ACL 仍待补；它们需要整合者先确认最小测试缝，不能用永远通过的空断言或猜测内部 API 代替。
+以下场景仍不能在当前进程级共享 harness 下完整验证。生产登录/读取已通过 `Scripted` 接上注入传输，但 CLI 仍是 `Offline`，进程级验证、真实传输和平台 ACL 仍待补；它们需要整合者先确认最小测试缝，不能用永远通过的空断言或猜测内部 API 代替。
 
 1. **延迟 CAS 拒绝时保留旧状态**（与非法参数用例分开）。
-   `identity::registration` 的 `Scripted` 测试已覆盖参数合法后 CAS 401、登录页拒绝、429 和连接失败时旧 `credentials.json`、旧 `session.json` 字节不变。生产 `login` 尚未接线，所以进程级延迟拒绝仍要在接线后复跑；当前 `invalid_login_arguments_...` 只覆盖联网前拒绝，不能代替进程级场景。
+   `session` 的 `Scripted` 测试已覆盖参数合法后 CAS 401、缺少 service ticket 时旧 `credentials.json`、旧 `session.json` 字节和权限不变，且只有一个密码 POST。CLI 仍用 `Offline`，所以进程级延迟拒绝仍要在真实传输接线后复跑；当前 `invalid_login_arguments_...` 只覆盖联网前拒绝，不能代替进程级场景。
 
-2. **同一学号改密码后不能用旧会话证明新密码**。
-   离线测试路径已证明：同账号旧 session 存在时，提交新密码仍完整走 CAS，且请求中不出现旧密码或旧 session secret。旧会话是否失效仍未实现；当前决定是登记只写 `credentials.json`、不动 `session.json`，也不声称旧会话已被新密码重新验证。
+2. **同一学号改密码后旧会话失效**。
+   原生 session 现在绑定 username、role 和每次登录新生成的 `session_revision`；成功登录会同时写新 revision 的 credentials/session，单独更新 credentials 的异常路径也会让旧 session 被拒绝。离线测试已证明新密码走完整 CAS、旧密码/旧 token 不出现在请求中；仍缺真实密码修改的进程级场景和旧 session 文件的显式清理策略。
 
-3. **成功登录的凭据存储与续期写回**。
-   离线测试路径已覆盖 `credentials.json` 的创建/原子替换、`0600`、未知键合并保留、损坏旧文件修复、密码/ticket/URL 不进入输出，以及成功登记不改 `session.json`。仍需生产接线；macOS `0600` 之外尤其 Windows 用户 ACL 未实现，非 Unix 写入 fail closed。当前进程用例仍只验证已存在文件的读取/删除边界，不验证生产创建。
+3. **成功登录的凭据/会话存储与续期写回**。
+   已覆盖两个文件的私有创建/替换、`0600`、未知键合并保留、revision、无 ticket/URL 持久化、非私有目录/文件和 symlink 拒绝，以及成功登录不请求 token。仍需真实传输接线；macOS `0600` 之外尤其 Windows 用户 ACL 未实现，非 Unix 写入 fail closed。当前进程用例仍只验证已存在文件的读取/删除边界，不验证生产创建。
 
 4. **续期有界且只由明确过期触发**。
-   需要脚本化传输序列和请求/登录计数观测：缓存票据失效时最多一次自动续期；达到 `BUPT_MAX_CAS_LOGINS` 预算后不再登录；暂时断网、密码拒绝、HTTP 401/403、限流（429）不得被当作过期信号触发续期。当前只能验证 `status` 不续期、不改变登录计数、缺失过期时间不触发重登。
+   需要脚本化传输序列和请求/登录计数观测：缓存票据失效时最多一次自动续期；达到 `BUPT_MAX_CAS_LOGINS` 预算后不再登录；暂时断网、密码拒绝、HTTP 401/403、限流（429）不得被当作过期信号触发续期。当前只实现按需 service-ticket/token 刷新，没有自动 CAS 密码重登或登录预算；仍只能验证 `status` 不续期、不改变登录计数、缺失过期时间不触发重登。
 
 5. **`diagnose` 的公共可达性检查和移动教务无 token 在线路径**。
    Python 的 `mobile_jwgl` 组包含一个未认证的 GET（移动教务登录端点可达性），因此不能把所有移动教务行都断言为 skipped，也不能在离线共享 harness 里真的发出该请求，否则会意外联网。

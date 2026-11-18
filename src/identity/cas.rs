@@ -1,20 +1,21 @@
 //! Transport-injected CAS and UCloud protocol slice.
 //!
-//! URL normalization and cookie rules use maintained implementations. The
-//! module remains test-only until the scoped HTTP transport, credential store,
-//! and service session wiring are reviewed together.
+//! URL validation and cookie storage use maintained `url` and `cookie_store`
+//! implementations. The production session layer drives this module through an
+//! injected transport; the CLI still keeps `Offline` until the parent wires the
+//! bounded transport.
 //!
-//! It proves the request shape, redirect policy and response classification
-//! with synthetic `Scripted` transports. A successful `cas_login` is the only
-//! way to obtain a `CasLogin`, and it must include a service ticket issued by
-//! the ordinary CAS verification request. Future account persistence must take
-//! that value so a failed login cannot write local state.
+//! A successful `cas_login` is the only way to obtain a `CasLogin`, and it must
+//! include a service ticket issued by the ordinary CAS verification request.
+//! The session layer persists only the cookie store and an optional lazy token;
+//! a failed or incomplete verification never reaches the local writer.
 
 use crate::cli::{CliError, CliResult};
 use crate::transport::{Request, Response, Transport};
 use cookie_store::{Cookie, CookieDomain, CookieStore};
 use serde_json::{Map, Value, json};
 use std::fmt;
+use std::io::Cursor;
 use url::Url;
 
 const CAS_LOGIN_URL: &str = "https://auth.bupt.edu.cn/authserver/login";
@@ -68,6 +69,33 @@ impl fmt::Debug for UCloudToken {
 }
 
 impl CasLogin {
+    /// Rebuild a session from persisted cookies and an optional cached token.
+    /// Imported cookies are rejected unless every cookie stays inside the
+    /// approved CAS scope.
+    pub(super) fn from_persisted(cookies: &Value, ucloud: Option<&Value>) -> CliResult<Self> {
+        let cookies = CookieJar::from_json(cookies)?;
+        let ucloud = ucloud.and_then(UCloudToken::from_session_json);
+        Ok(Self {
+            cookies,
+            ticket: None,
+            ucloud,
+        })
+    }
+
+    /// Serialize the maintained cookie store, preserving host-only scope,
+    /// default path, expiry, and non-persistent session cookies.
+    pub(super) fn cookies_json(&self) -> CliResult<Value> {
+        self.cookies.to_json()
+    }
+
+    pub(super) fn has_usable_cookies(&self) -> bool {
+        self.cookies.has_usable()
+    }
+
+    pub(super) fn has_usable_ucloud_token(&self) -> bool {
+        self.ucloud.as_ref().is_some_and(UCloudToken::is_usable)
+    }
+
     /// Fetch a UCloud token only when a caller needs one. The service ticket
     /// obtained during login is consumed first; later needs request a new CAS
     /// service ticket. No OAuth token request happens before this call.
@@ -75,10 +103,7 @@ impl CasLogin {
         &mut self,
         transport: &mut dyn Transport,
     ) -> CliResult<&UCloudToken> {
-        let cached = self
-            .ucloud
-            .as_ref()
-            .is_some_and(|token| !token.is_expired());
+        let cached = self.ucloud.as_ref().is_some_and(UCloudToken::is_usable);
         if !cached {
             let ticket = match self.ticket.take() {
                 Some(ticket) => ticket,
@@ -121,8 +146,13 @@ impl UCloudToken {
         &self.access_token
     }
 
-    /// Existing session-cache metadata for a future persistence step.
-    #[allow(dead_code)]
+    /// The pair a read adapter needs, in `(access_token, user_id)` order.
+    pub(super) fn identity_pair(&self) -> Option<(String, String)> {
+        let user_id = self.user_id_string()?;
+        Some((self.access_token.clone(), user_id))
+    }
+
+    /// Existing session-cache metadata for persistence.
     pub(super) fn as_session_json(&self) -> Value {
         json!({
             "access_token": self.access_token,
@@ -133,6 +163,74 @@ impl UCloudToken {
             "jwt_payload": Value::Object(self.jwt_payload.clone()),
             "expires_at": self.expires_at.map(Value::from).unwrap_or(Value::Null),
         })
+    }
+
+    fn from_session_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let access_token = object
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && !value
+                        .chars()
+                        .any(|ch| ch.is_control() || ch.is_whitespace())
+            })?
+            .to_owned();
+        let jwt_payload = object
+            .get("jwt_payload")
+            .and_then(Value::as_object)
+            .cloned()
+            .or_else(|| super::jwt_payload(&access_token))
+            .unwrap_or_default();
+        let user_id = object
+            .get("user_id")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .or_else(|| {
+                jwt_payload
+                    .get("user_id")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+            });
+        let user_name = script_or_none(object.get("user_name"))
+            .or_else(|| script_or_none(jwt_payload.get("user_name")));
+        let real_name = script_or_none(object.get("real_name"))
+            .or_else(|| script_or_none(jwt_payload.get("real_name")));
+        let expires_at = object
+            .get("expires_at")
+            .and_then(super::number_value)
+            .filter(|value| value.is_finite())
+            .or_else(|| jwt_payload.get("exp").and_then(super::number_value));
+        let refresh_token = object
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        Some(Self {
+            access_token,
+            refresh_token,
+            user_id,
+            user_name,
+            real_name,
+            expires_at,
+            jwt_payload,
+        })
+    }
+
+    fn user_id_string(&self) -> Option<String> {
+        match self.user_id.as_ref()? {
+            Value::String(value) => {
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_owned())
+            }
+            Value::Number(value) => value.is_i64().then(|| value.to_string()),
+            _ => None,
+        }
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.is_expired() && self.user_id_string().is_some()
     }
 
     fn is_expired(&self) -> bool {
@@ -746,15 +844,52 @@ impl CookieJar {
             let Ok(cookie) = Cookie::parse(value.clone(), &url) else {
                 continue;
             };
-            // No public-suffix database is needed: accept only CAS and its campus parent.
-            if matches!(&cookie.domain,
-                CookieDomain::HostOnly(host) if host == CAS_HOST)
-                || matches!(&cookie.domain,
-                    CookieDomain::Suffix(domain) if matches!(domain.as_str(), CAS_HOST | "bupt.edu.cn"))
-            {
+            if approved_cookie_domain(&cookie.domain) && approved_cookie_path(&cookie.path) {
                 let _ = self.0.insert(cookie, &url);
             }
         }
+    }
+
+    fn to_json(&self) -> CliResult<Value> {
+        let mut bytes = Vec::new();
+        cookie_store::serde::json::save_incl_expired_and_nonpersistent(&self.0, &mut bytes)
+            .map_err(|_| {
+                CliError::new(
+                    5,
+                    "upstream",
+                    "cannot serialize the saved CAS cookies",
+                    "Run `bupt login` again to rebuild the local session.",
+                )
+            })?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            CliError::new(
+                5,
+                "upstream",
+                "cannot encode the saved CAS cookies",
+                "Run `bupt login` again to rebuild the local session.",
+            )
+        })
+    }
+
+    fn from_json(value: &Value) -> CliResult<Self> {
+        let bytes = serde_json::to_vec(value).map_err(|_| cookie_session_error())?;
+        let store = cookie_store::serde::json::load_all(Cursor::new(bytes))
+            .map_err(|_| cookie_session_error())?;
+        if store.iter_any().any(|cookie| {
+            !approved_cookie_domain(&cookie.domain) || !approved_cookie_path(&cookie.path)
+        }) {
+            return Err(CliError::new(
+                3,
+                "auth",
+                "saved CAS cookies contain a scope that is not approved",
+                "Run `bupt login` again to rebuild the local session.",
+            ));
+        }
+        Ok(Self(store))
+    }
+
+    fn has_usable(&self) -> bool {
+        self.header_for(super::CAS_SERVICE_URL).is_some()
     }
 
     fn header_for(&self, raw: &str) -> Option<String> {
@@ -762,10 +897,44 @@ impl CookieJar {
         let values: Vec<_> = self
             .0
             .get_request_values(&url)
+            .filter(|(name, value)| !name.is_empty() && !value.is_empty())
             .map(|(name, value)| format!("{name}={value}"))
             .collect();
         (!values.is_empty()).then(|| values.join("; "))
     }
+}
+
+fn approved_cookie_domain(domain: &CookieDomain) -> bool {
+    // No public-suffix database is needed: accept only CAS and its campus parent.
+    matches!(domain, CookieDomain::HostOnly(host) if host.eq_ignore_ascii_case(CAS_HOST))
+        || matches!(domain, CookieDomain::Suffix(value) if value.eq_ignore_ascii_case(CAS_HOST) || value.eq_ignore_ascii_case("bupt.edu.cn"))
+}
+
+fn approved_cookie_path(path: &cookie_store::CookiePath) -> bool {
+    let path: &str = path.as_ref();
+    (path == "/" || path == "/authserver" || path.starts_with("/authserver/"))
+        && !path.contains("//")
+        && !path.contains('\\')
+        && !path.contains(['?', '#'])
+        && !path.to_ascii_lowercase().contains("%2f")
+        && !path.to_ascii_lowercase().contains("%5c")
+        && !path.split('/').any(|segment| {
+            let segment = segment.to_ascii_lowercase();
+            matches!(
+                segment.as_str(),
+                "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+            )
+        })
+        && !path.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+}
+
+fn cookie_session_error() -> CliError {
+    CliError::new(
+        3,
+        "auth",
+        "saved CAS cookies are invalid",
+        "Run `bupt login` again to rebuild the local session.",
+    )
 }
 
 fn parse_https_url(raw: &str) -> Option<Url> {
@@ -998,8 +1167,13 @@ mod tests {
                     "Set-Cookie".into(),
                     "expired=TEST-ONLY; Expires=Wed, 01 Jan 2003 00:00:00 GMT".into(),
                 ),
+                (
+                    "Set-Cookie".into(),
+                    "wrong_path=TEST-ONLY; Path=/other; Secure".into(),
+                ),
             ],
         );
+        assert!(!jar.to_json().unwrap().to_string().contains("wrong_path"));
         let login = jar.header_for(CAS_LOGIN_URL).unwrap();
         assert!(login.contains("local=TEST-ONLY") && login.contains("campus=TEST-ONLY"));
         assert!(!login.contains("public=") && !login.contains("expired="));
