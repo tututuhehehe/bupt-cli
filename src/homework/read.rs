@@ -20,6 +20,15 @@ pub(super) struct Session {
     user_id: String,
 }
 
+impl Session {
+    pub(super) fn new(access_token: String, user_id: String) -> Self {
+        Self {
+            access_token,
+            user_id,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Course {
     pub(super) site_id: String,
@@ -55,6 +64,7 @@ pub(super) struct UndoneItem {
     pub(super) site_id: Option<String>,
     pub(super) site_name: String,
     pub(super) begin_time: Option<String>,
+    pub(super) published_at: Option<time::PrimitiveDateTime>,
     pub(super) end_time: Option<String>,
     pub(super) is_submitted: bool,
 }
@@ -64,6 +74,89 @@ pub(super) struct UndoneOverview {
     pub(super) total_sites: u64,
     pub(super) undone_count: u64,
     pub(super) items: Vec<UndoneItem>,
+}
+
+pub(super) fn undone_json(
+    overview: UndoneOverview,
+    limit: u64,
+    now: time::PrimitiveDateTime,
+) -> Value {
+    let mut seen = HashSet::new();
+    let mut entries: Vec<_> = overview
+        .items
+        .into_iter()
+        .filter(|item| {
+            !item.is_submitted
+                && (item.activity_id.is_empty() || seen.insert(item.activity_id.clone()))
+        })
+        .map(|item| (item.end_time.as_deref().and_then(local_timestamp), item))
+        .collect();
+    entries.sort_by(|(due_a, item_a), (due_b, item_b)| {
+        due_a
+            .is_none()
+            .cmp(&due_b.is_none())
+            .then(due_a.cmp(due_b))
+            .then(item_a.activity_name.cmp(&item_b.activity_name))
+    });
+    if limit != 0 {
+        entries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    }
+    let assignments: Vec<_> = entries
+        .into_iter()
+        .map(|(due, item)| {
+            let overdue = due.is_some_and(|due| due < now);
+            let hours =
+                due.map(|due| (((due - now).as_seconds_f64() / 36.0).round_ties_even()) / 100.0);
+            serde_json::json!({
+                "id": item.activity_id, "title": item.activity_name,
+                "course": (!item.site_name.is_empty()).then_some(item.site_name),
+                "course_id": item.site_id,
+                "published_at": item.published_at.map(iso_local_timestamp),
+                "deadline": item.end_time, "begin_time": item.begin_time,
+                "status": if overdue { "overdue" } else { "pending" },
+                "submitted": false, "submitted_at": null, "score": null,
+                "hours_remaining": hours, "overdue": overdue,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "count": assignments.len(), "method": "undone",
+        "filters": { "undone": true, "course": null, "new_days": null },
+        "assignments": assignments,
+    })
+}
+
+fn local_timestamp(text: &str) -> Option<time::PrimitiveDateTime> {
+    use time::macros::format_description;
+    let text = text.split('.').next()?.trim();
+    let text = text.replace('T', " ");
+    time::PrimitiveDateTime::parse(
+        &text,
+        format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+    )
+    .ok()
+    .or_else(|| {
+        time::PrimitiveDateTime::parse(
+            &text,
+            format_description!("[year]-[month]-[day] [hour]:[minute]"),
+        )
+        .ok()
+    })
+    .or_else(|| {
+        time::Date::parse(&text, format_description!("[year]-[month]-[day]"))
+            .ok()
+            .map(time::Date::midnight)
+    })
+}
+
+fn iso_local_timestamp(value: time::PrimitiveDateTime) -> String {
+    format!(
+        "{} {:02}:{:02}:{:02}",
+        value.date(),
+        value.hour(),
+        value.minute(),
+        value.second()
+    )
 }
 
 /// Fetch every enrolled course page, preserving page order and dropping only
@@ -271,6 +364,20 @@ fn parse_undone(data: &Value) -> CliResult<UndoneOverview> {
                 .and_then(value_as_string),
             site_name: first_truthy_string(record, &["siteName"]),
             begin_time: record.get("beginTime").and_then(value_as_string),
+            published_at: [
+                "assignmentBeginTime",
+                "beginTime",
+                "publishTime",
+                "releaseTime",
+                "createTime",
+                "createdTime",
+                "gmtCreate",
+                "createDate",
+                "startTime",
+            ]
+            .into_iter()
+            .filter_map(|key| record.get(key).and_then(Value::as_str))
+            .find_map(local_timestamp),
             end_time: record.get("endTime").and_then(value_as_string),
             is_submitted: false,
         });
@@ -877,6 +984,28 @@ mod tests {
             overview.items[1].end_time, None,
             "course enrichment must not invent a deadline"
         );
+    }
+
+    #[test]
+    fn undone_cli_output_sorts_deduplicates_and_preserves_null_values() {
+        let overview = parse_undone(&json!({"undoneList": [
+            {"activityId": "2", "activityName": "Unknown"},
+            {"activityId": "1", "activityName": "Due", "beginTime": "2026-11-16 09:00", "endTime": "2026-11-18 10:30:00.000"},
+            {"activityId": "1", "activityName": "Duplicate"}
+        ]})).unwrap();
+        let now = local_timestamp("2026-11-18 11:00:00").unwrap();
+        let result = undone_json(overview, 0, now);
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["method"], "undone");
+        assert_eq!(result["assignments"][0]["title"], "Due");
+        assert_eq!(
+            result["assignments"][0]["published_at"],
+            "2026-11-16 09:00:00"
+        );
+        assert_eq!(result["assignments"][0]["hours_remaining"], -0.5);
+        assert_eq!(result["assignments"][0]["status"], "overdue");
+        assert!(result["assignments"][1]["hours_remaining"].is_null());
+        assert_eq!(result["assignments"][1]["status"], "pending");
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn malformed_saved_credentials_are_an_auth_error() {
 }
 
 #[test]
-fn saved_credentials_do_not_require_a_role() {
+fn legacy_roleless_credentials_cannot_prove_a_verified_login() {
     let sandbox = Sandbox::new();
     fs::write(
         sandbox.root().join("config/credentials.json"),
@@ -95,7 +95,13 @@ fn saved_credentials_do_not_require_a_role() {
     .expect("write synthetic roleless credentials");
 
     let invocation = sandbox.run(&["courses"]);
-    assert_error(&invocation, 5, "upstream");
+    let error = assert_error(&invocation, 3, "auth");
+    assert!(
+        error["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("bupt login")
+    );
     assert!(!sandbox.root().join("cache/session.json").exists());
 }
 
