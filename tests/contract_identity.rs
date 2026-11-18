@@ -550,6 +550,94 @@ fn status_without_credentials_succeeds_without_creating_state() {
 }
 
 #[test]
+fn missing_profile_does_not_activate_cached_session() {
+    let sandbox = Sandbox::new();
+    let session_path = seed_session(&sandbox, SESSION);
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["status"], &[]);
+    let status = success(&inv);
+
+    assert_eq!(status["username"], Value::Null);
+    assert_eq!(status["exists"], json!(false));
+    assert_eq!(status["cookie_count"], json!(0));
+    assert_eq!(status["locally_valid"], json!(false));
+    assert_no_fixture_secrets(&inv);
+
+    assert_tree_empty(&config_dir(&sandbox));
+    assert_eq!(read_text(&session_path), SESSION);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn passwordless_profile_is_named_but_does_not_activate_cached_session() {
+    let sandbox = Sandbox::new();
+    let mut profile = session_value(CREDENTIALS);
+    profile
+        .as_object_mut()
+        .expect("credentials fixture is an object")
+        .remove("password");
+    let profile_text = serde_json::to_string_pretty(&profile).expect("serialize profile");
+    seed_file(&config_dir(&sandbox), "credentials.json", &profile_text);
+    let session_path = seed_session(&sandbox, SESSION);
+    let config_before = snapshot_tree(&config_dir(&sandbox));
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["status"], &[]);
+    let status = success(&inv);
+
+    assert_eq!(status["username"], json!(USER));
+    assert_eq!(status["exists"], json!(false));
+    assert_eq!(status["cookie_count"], json!(0));
+    assert_eq!(status["locally_valid"], json!(false));
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(read_text(&session_path), SESSION);
+    assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn status_allowlists_user_fields_and_suppresses_cached_diagnostics() {
+    let sandbox = Sandbox::new();
+    seed_credentials(&sandbox, CREDENTIALS_UNDERGRADUATE);
+
+    let mut leaky = session_value(SESSION_UNDERGRADUATE_STALE_MOBILE);
+    leaky["user"] = json!({
+        "user_id": "42",
+        "user_name": USER,
+        "real_name": "Synthetic Tester",
+        "saved_password": PRIMARY_PASSWORD,
+        "unknown_cookie": COOKIE_SECRET,
+        "nested": {"access_token": ACCESS_SECRET}
+    });
+    leaky["mobile_jwgl"]["last_error"] = json!(format!(
+        "mobile login failed: {PRIMARY_PASSWORD} {COOKIE_SECRET} {ACCESS_SECRET}"
+    ));
+    seed_json(&cache_dir(&sandbox), "session.json", &leaky);
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["status"], &[]);
+    let status = success(&inv);
+
+    assert_eq!(
+        status["user"],
+        json!({
+            "user_id": "42",
+            "user_name": USER,
+            "real_name": "Synthetic Tester"
+        })
+    );
+    assert_eq!(
+        status["mobile_jwgl"]["last_error"],
+        json!("cached mobile JWGL login failed; details suppressed")
+    );
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
 fn status_reads_cached_state_without_mutation_or_secret_leak() {
     let sandbox = Sandbox::new();
     let credentials_path = seed_credentials(&sandbox, CREDENTIALS);
@@ -681,9 +769,73 @@ fn status_tolerates_non_numeric_cookie_expiry() {
         status["cookies_expire_at"].is_string(),
         "numeric expiry must survive a malformed neighbour"
     );
+    assert_eq!(
+        status["locally_valid"],
+        json!(true),
+        "an invalid expiry is unknown, not expired"
+    );
     assert_no_fixture_secrets(&inv);
 
     assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn locally_valid_requires_a_usable_cookie_and_keeps_unknown_expiry() {
+    let mut expired = session_value(SESSION);
+    expired["cookies"][0]["expires"] = json!(1);
+
+    let mut malformed = session_value(SESSION);
+    let malformed_cookie = malformed["cookies"][0]
+        .as_object_mut()
+        .expect("cookie fixture is an object");
+    malformed_cookie.remove("name");
+    malformed_cookie.remove("value");
+
+    let mut unknown_expiry = session_value(SESSION);
+    unknown_expiry["cookies"][0]
+        .as_object_mut()
+        .expect("cookie fixture is an object")
+        .remove("expires");
+
+    for (case, session, expected_locally_valid) in [
+        ("expired cookie", expired, false),
+        ("malformed cookie", malformed, false),
+        ("unknown cookie expiry", unknown_expiry, true),
+    ] {
+        let sandbox = Sandbox::new();
+        seed_credentials(&sandbox, CREDENTIALS);
+        seed_json(&cache_dir(&sandbox), "session.json", &session);
+        let config_before = snapshot_tree(&config_dir(&sandbox));
+        let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+        let inv = run_with_env(&sandbox, &["status"], &[]);
+        let status = success(&inv);
+        assert_eq!(status["cookie_count"], json!(1), "{case}");
+        assert_eq!(status["ucloud"]["present"], json!(true), "{case}");
+        assert_eq!(
+            status["locally_valid"],
+            json!(expected_locally_valid),
+            "{case}"
+        );
+        assert_no_fixture_secrets(&inv);
+        assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+        assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+
+        if !expected_locally_valid {
+            let diagnose = run_with_env(&sandbox, &["diagnose", "--only", "cas"], &[]);
+            let report = success(&diagnose);
+            let rows = report["endpoints"]
+                .as_array()
+                .expect("diagnose report has endpoints");
+            assert!(
+                rows.iter().all(|row| row["status"] == json!("skipped")),
+                "{case}: no usable CAS cookie must skip the check"
+            );
+            assert_no_fixture_secrets(&diagnose);
+            assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+            assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+        }
+    }
 }
 
 #[test]
@@ -757,26 +909,13 @@ fn logout_clears_password_and_session_but_keeps_timetable_and_config() {
 
     assert_eq!(result["removed"], json!(true));
     assert!(!session_path.exists());
+    assert!(
+        !credentials_path.exists(),
+        "logout must unlink the owned credentials file"
+    );
     assert_eq!(read_text(&config_path), CONFIG);
     assert_eq!(read_text(&timetable_path), TIMETABLE);
     assert_no_fixture_secrets(&inv);
-
-    if credentials_path.exists() {
-        let contents = read_text(&credentials_path);
-        assert!(
-            !contents.contains(PRIMARY_PASSWORD),
-            "logout must remove the stored password"
-        );
-        let credentials: Value =
-            serde_json::from_str(&contents).expect("remaining credentials must be valid JSON");
-        if let Some(password) = credentials.get("password") {
-            assert!(
-                password.is_null() || password.as_str() == Some(""),
-                "logout left a usable password behind"
-            );
-        }
-        assert_private_file(&credentials_path);
-    }
 
     let second_inv = run_with_env(&sandbox, &["logout"], &[]);
     let second = success(&second_inv);
@@ -784,6 +923,37 @@ fn logout_clears_password_and_session_but_keeps_timetable_and_config() {
     assert_eq!(read_text(&config_path), CONFIG);
     assert_eq!(read_text(&timetable_path), TIMETABLE);
     assert!(!session_path.exists());
+    assert!(!credentials_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn logout_refuses_to_follow_credentials_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let target = seed_file(sandbox.root(), "credential-target.json", CREDENTIALS);
+    let credentials_path = config_dir(&sandbox).join("credentials.json");
+    symlink(&target, &credentials_path).expect("create credentials symlink");
+    let session_path = seed_session(&sandbox, SESSION);
+    let config_before = snapshot_tree(&config_dir(&sandbox));
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["logout"], &[]);
+    auth_error(&inv);
+    assert_no_fixture_secrets(&inv);
+
+    assert!(
+        fs::symlink_metadata(&credentials_path)
+            .expect("credentials symlink still exists")
+            .file_type()
+            .is_symlink(),
+        "logout must refuse rather than follow or replace the symlink"
+    );
+    assert_eq!(read_text(&target), CREDENTIALS);
+    assert_eq!(read_text(&session_path), SESSION);
+    assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
 }
 
 #[test]

@@ -10,6 +10,8 @@ const SESSION_FILENAME: &str = "session.json";
 const CREDENTIALS_FILENAME: &str = "credentials.json";
 const CACHE_VERSION: u64 = 2;
 const UCLOUD_EXPIRY_BUFFER_SECONDS: f64 = 60.0;
+const SAFE_MOBILE_DIAGNOSTIC: &str = "cached mobile JWGL login failed; details suppressed";
+const PUBLIC_USER_FIELDS: &[&str] = &["user_id", "user_name", "real_name"];
 const CAS_SERVICE_URL: &str =
     "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fucloud.bupt.edu.cn%2Fuclass";
 
@@ -120,6 +122,7 @@ impl Role {
 struct Account {
     username: String,
     role: Option<Role>,
+    has_password: bool,
 }
 
 fn run_login(matches: &ArgMatches) -> CliResult<Outcome> {
@@ -212,9 +215,17 @@ fn load_account(config_dir: &Path) -> CliResult<Option<Account>> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or(config_role);
+    let config_has_password = config
+        .get("password")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty());
+    let env_has_password = env::var("BUPT_PASSWORD")
+        .ok()
+        .is_some_and(|value| !value.is_empty());
     Ok(Some(Account {
         username,
         role: role_text.as_deref().and_then(Role::parse),
+        has_password: config_has_password || env_has_password,
     }))
 }
 
@@ -257,6 +268,11 @@ fn load_session(cache_dir: &Path, account: Option<&Account>) -> SessionSnapshot 
     let Some(account) = account else {
         return SessionSnapshot::empty("no configured account; session cache not adopted");
     };
+    if !account.has_password {
+        return SessionSnapshot::empty(
+            "the saved profile has no password; session cache not adopted",
+        );
+    }
     let Some(session_username) = data
         .get("username")
         .and_then(Value::as_str)
@@ -328,12 +344,8 @@ fn status_document(
             .or(Some(Value::Null))
     }
     .unwrap_or(Value::Null);
-    let user = data
-        .get("user")
-        .filter(|value| value.is_object())
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let (cookie_count, cookie_expiry) = cookie_status(data.get("cookies"));
+    let user = public_user(data.get("user"));
+    let cookies = cookie_status(data.get("cookies"), now);
     let ucloud = ucloud_status(data.get("ucloud"), now);
     let mobile_data =
         if session.accepted && account.and_then(|account| account.role) != Some(Role::Graduate) {
@@ -361,29 +373,75 @@ fn status_document(
         "updated_at": string_or_null(data.get("updated_at")),
         "cache_error": session.error,
         "cache_username_mismatch": session.mismatch,
-        "cookie_count": cookie_count,
-        "cookies_expire_at": cookie_expiry.and_then(iso_epoch).map(Value::String).unwrap_or(Value::Null),
+        "cookie_count": cookies.total,
+        "cookies_expire_at": cookies.earliest_expiry.and_then(iso_epoch).map(Value::String).unwrap_or(Value::Null),
         "ucloud": ucloud,
         "mobile_jwgl": mobile,
         "cas_logins_total": cas_logins_total,
         "locally_valid": session.accepted
-            && cookie_count > 0
+            && cookies.usable > 0
             && ucloud_present
             && !ucloud_expired,
         "note": "locally_valid is based on cached expiries; use `bupt diagnose` for live checks",
     })
 }
 
-fn cookie_status(cookies: Option<&Value>) -> (u64, Option<f64>) {
+#[derive(Debug, Default)]
+struct CookieStatus {
+    total: u64,
+    usable: u64,
+    earliest_expiry: Option<f64>,
+}
+
+fn cookie_status(cookies: Option<&Value>, now: f64) -> CookieStatus {
     let Some(cookies) = cookies.and_then(Value::as_array) else {
-        return (0, None);
+        return CookieStatus::default();
     };
-    let count = cookies.len() as u64;
-    let expiry = cookies
-        .iter()
-        .filter_map(|cookie| cookie.as_object()?.get("expires").and_then(number_value))
-        .reduce(f64::min);
-    (count, expiry)
+    let mut status = CookieStatus {
+        total: cookies.len() as u64,
+        ..CookieStatus::default()
+    };
+    for cookie in cookies {
+        let Some(cookie) = cookie.as_object() else {
+            continue;
+        };
+        let expiry = cookie
+            .get("expires")
+            .and_then(number_value)
+            .filter(|value| value.is_finite());
+        if let Some(expiry) = expiry {
+            status.earliest_expiry = Some(
+                status
+                    .earliest_expiry
+                    .map_or(expiry, |current| current.min(expiry)),
+            );
+        }
+        let named = cookie
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let valued = cookie
+            .get("value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        let expired = expiry.is_some_and(|value| value <= now);
+        if named && valued && !expired {
+            status.usable += 1;
+        }
+    }
+    status
+}
+
+fn public_user(user: Option<&Value>) -> Value {
+    let mut public = Map::new();
+    if let Some(user) = user.and_then(Value::as_object) {
+        for field in PUBLIC_USER_FIELDS {
+            if let Some(value) = user.get(*field) {
+                public.insert((*field).to_owned(), value.clone());
+            }
+        }
+    }
+    Value::Object(public)
 }
 
 fn ucloud_status(ucloud: Option<&Value>, now: f64) -> Value {
@@ -428,11 +486,17 @@ fn mobile_status(mobile: Option<&Value>, now: f64) -> Value {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
     let expiry = mobile.get("expires_at").and_then(number_value);
+    let last_error = mobile
+        .get("last_error")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|_| json!(SAFE_MOBILE_DIAGNOSTIC))
+        .unwrap_or(Value::Null);
     json!({
         "present": token.is_some(),
         "expired": token.map(|_| expiry.is_some_and(|value| value <= now)),
         "expires_at": expiry.and_then(iso_epoch).map(Value::String).unwrap_or(Value::Null),
-        "last_error": string_or_null(mobile.get("last_error")),
+        "last_error": last_error,
         "blocked_until": mobile
             .get("blocked_until")
             .and_then(number_value)
@@ -467,19 +531,12 @@ fn number_value(value: &Value) -> Option<f64> {
 
 fn run_logout(context: &mut Context<'_>) -> CliResult<Outcome> {
     let session_path = context.cache_dir.join(SESSION_FILENAME);
-    let removed = match fs::remove_file(&session_path) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => {
-            return Err(CliError::new(
-                3,
-                "auth",
-                "cannot delete the local session cache",
-                "Check the session file permissions.",
-            ));
-        }
-    };
-    clear_saved_password(&context.config_dir.join(CREDENTIALS_FILENAME))?;
+    let credentials_path = context.config_dir.join(CREDENTIALS_FILENAME);
+    ensure_removable(&session_path, "session cache")?;
+    ensure_removable(&credentials_path, "credentials file")?;
+
+    let removed = remove_owned_file(&session_path, "session cache")?;
+    remove_owned_file(&credentials_path, "credentials file")?;
     Ok(Outcome {
         data: json!({"removed": removed, "path": path_string(&session_path)}),
         code: 0,
@@ -487,95 +544,49 @@ fn run_logout(context: &mut Context<'_>) -> CliResult<Outcome> {
     })
 }
 
-fn clear_saved_password(path: &Path) -> CliResult<()> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+fn ensure_removable(path: &Path, label: &str) -> CliResult<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => {
             return Err(CliError::new(
                 3,
                 "auth",
-                "cannot read the local credentials file",
-                "Check the credentials file permissions.",
+                format!("cannot inspect the local {label}"),
+                "Check the file permissions.",
             ));
         }
     };
-    let mut value: Value = match serde_json::from_slice(&bytes) {
-        Ok(value @ Value::Object(_)) => value,
-        _ => {
-            fs::remove_file(path).map_err(|_| {
-                CliError::new(
-                    3,
-                    "auth",
-                    "cannot remove the unreadable credentials file",
-                    "Check the credentials file permissions.",
-                )
-            })?;
-            return Ok(());
-        }
-    };
-    if let Some(object) = value.as_object_mut() {
-        object.remove("password");
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::new(
+            3,
+            "auth",
+            format!("refusing to remove a symlink at the local {label} path"),
+            "Remove the symlink manually, then run `bupt logout` again.",
+        ));
     }
-    let text = serde_json::to_string_pretty(&value).map_err(|_| {
-        CliError::new(
-            5,
-            "upstream",
-            "cannot serialize the local credentials file",
-            "",
-        )
-    })?;
-    write_private(path, text.as_bytes())
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> CliResult<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|_| {
-                CliError::new(
-                    3,
-                    "auth",
-                    "cannot update the local credentials file",
-                    "Check the credentials file permissions.",
-                )
-            })?;
-        file.write_all(bytes).map_err(|_| {
-            CliError::new(
-                3,
-                "auth",
-                "cannot update the local credentials file",
-                "Check the credentials file permissions.",
-            )
-        })?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| {
-            CliError::new(
-                3,
-                "auth",
-                "cannot secure the local credentials file",
-                "Check the credentials file permissions.",
-            )
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, bytes).map_err(|_| {
-            CliError::new(
-                3,
-                "auth",
-                "cannot update the local credentials file",
-                "Check the credentials file permissions.",
-            )
-        })?;
+    if !metadata.file_type().is_file() {
+        return Err(CliError::new(
+            3,
+            "auth",
+            format!("refusing to remove a non-regular local {label}"),
+            "Remove it manually, then run `bupt logout` again.",
+        ));
     }
     Ok(())
+}
+
+fn remove_owned_file(path: &Path, label: &str) -> CliResult<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(CliError::new(
+            3,
+            "auth",
+            format!("cannot delete the local {label}"),
+            "Check the file permissions.",
+        )),
+    }
 }
 
 fn run_diagnose(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
@@ -583,8 +594,8 @@ fn run_diagnose(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Ou
     let groups = requested_groups(matches)?;
     let account = load_account(&context.config_dir)?;
     let session = load_session(&context.cache_dir, account.as_ref());
-    let (cookie_count, _) = cookie_status(session.data.get("cookies"));
-    let has_cookies = session.accepted && cookie_count > 0;
+    let has_cookies =
+        session.accepted && cookie_status(session.data.get("cookies"), unix_now()).usable > 0;
 
     if !has_cookies && groups.iter().all(|group| group == "cas") {
         return Ok(Outcome {
