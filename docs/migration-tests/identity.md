@@ -22,7 +22,7 @@ Python 对照版本：`d7c35ef`。本清单记录测试迁移和第一批本地�
 cargo test --offline --test contract_identity
 ```
 
-当时的 21 个用例全部失败，失败原因一致：`src/main.rs` 仍以退出码 `78` 输出 `Rust CLI not implemented; test migration scaffold only`，没有实现任何公开入口。没有编译错误、网络访问、`#[ignore]` 或 `#[should_panic]`。当前实现新增了 6 个审查用例，总数变为 27。
+当时的 21 个用例全部失败，失败原因一致：`src/main.rs` 仍以退出码 `78` 输出 `Rust CLI not implemented; test migration scaffold only`，没有实现任何公开入口。没有编译错误、网络访问、`#[ignore]` 或 `#[should_panic]`。当前实现新增了 6 个审查用例，后续凭据合同修订又新增 1 个，总数变为 28。
 
 格式检查：
 
@@ -34,7 +34,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 
 ## 第一批本地实现状态
 
-`src/identity.rs` 已实现本地 `login` 参数校验、只读 `status`、会话归属判定和 `logout`。未接 CAS 验证、网络传输或在线 `diagnose`。
+`src/identity.rs` 已实现本地 `login` 参数校验、只读 `status`、会话归属判定和 `logout`。CAS/UCloud 协议切片已在 `src/identity/cas.rs` 用注入传输验证，但尚未接到生产命令、网络传输或在线 `diagnose`。
 
 - 有效的 `login --user … --password … --role …` 在校验后返回明确的 pending 错误（退出码 `5`，`type: upstream`），不读取或写入账号状态。
 - 当前 `login` 是非交互解析里程碑：缺少 `--user`/`--password` 会 usage 退出；最终登录仍必须恢复交互式提示。
@@ -75,6 +75,18 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 2. 匿名命令不读取凭据；参数校验仍先于凭据读取。
 3. role 缺失或非法只在确实需要 role 的 `academics` 操作中报 usage；其他使用方不因 role 阻止仅需登录的命令。
 4. `status` 的只读语义和 session 归属规则不变；无密码 profile 仍然只显示学号，不激活缓存。
+
+## CAS/UCloud 协议切片（本轮）
+
+`src/identity/cas.rs` 是从 Python `auth.py` 抽出的单个平铺子模块，只服务测试和后续接线，当前没有接到任何生产命令、传输工厂或会话持久化：
+
+- `cas_login` 先 GET CAS 登录页并提取 `execution`，然后只提交一次账号密码表单。所有重定向都校验 URL、host 和 path；POST 不跟随 307/308，返回明确的 auth 错误，避免重放密码。其余重定向只以 GET 跟随，目标必须是 HTTPS 的 `auth.bupt.edu.cn/authserver/*` 或 `ucloud.bupt.edu.cn/uclass*`；端口、userinfo、非 TLS、外部 host、路径穿越和超长重定向链都拒绝。TLS 证书校验由最终传输实现负责；本切片只保证请求 URL 和重定向目标不会离开 HTTPS 白名单。
+- CAS 成功必须是 2xx，且最终 URL 不是 `/authserver/login`、响应里也不再出现登录 `execution` 表单。单独的 HTTP 200 登录页不算成功。
+- `CasLogin` 的字段私有，只有成功完成上述交换才能构造。当前切片不写任何文件；后续 `login` 接线必须从该值取得已确认身份后再写 `credentials.json`/`session.json`，失败路径不得写状态。
+- `ucloud_token` 是惰性的：CAS 登录本身不预取 UCloud token。第一次需要时 GET 带 service 的 CAS 地址，只从 `Location` 提取 ticket，立刻 POST `ykt-basics/oauth/token`（`grant_type=third`，Basic `sword:sword_secret`）；token 只缓存在内存，并按既有 `UCLOUD_EXPIRY_BUFFER_SECONDS`/JWT `exp` 判断是否过期。ticket 交换不跟随进入 UCloud，后续读取用 `Blade-Auth`、`Tenant-Id: 000000` 和同一 Basic 头，不把 CAS Cookie 或密码带到 UCloud API。
+- 错误按现有分层输出：401/403 是 auth `3`，其他 HTTP/传输失败是 network `4`；缺少 execution、畸形页面或 JSON 是 upstream `5`；没有 ticket、ticket 重定向不合法或缺少 `access_token` 是 auth `3`。错误消息不回显密码、Cookie 或 token。
+- 12 个 lib 单测使用 `Scripted` 和 `TEST-ONLY-` 合成值：单次密码 POST 与 GET 重定向、200 登录页拒绝、307/308 拒绝、非 TLS/外部 host 拒绝、HTTP 失败分类、缺失 execution、惰性 token 与缓存复用、过期 token 不重用、UCloud 读取路径校验、ticket 重定向/缺失/拒绝校验、token 响应成功条件。当前 lib 共 53 个测试；`contract_identity` 仍是 28 个进程测试。
+- 未实现：真实传输接线、账号/会话写入、自动续期/登录次数上限、在线 `diagnose`、Windows ACL、真实校园网验收。以上仍保留在下面的待实现场景中。
 
 ## 用例映射
 
@@ -128,7 +140,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 以下场景不能在当前共享 harness 下可靠验证。当前没有对应的失败测试；它们需要整合者先确认最小测试缝，不能用永远通过的空断言或猜测内部 API 代替。
 
 1. **延迟 CAS 拒绝时保留旧状态**（与非法参数用例分开）。
-   需要可注入的传输层或脚本化 CAS 响应，让 `login` 在参数合法后得到确定的 auth/network 失败；断言旧 `credentials.json`、旧 `session.json` 和课表/配置均不变。当前 `invalid_login_arguments_...` 只覆盖联网前拒绝，不能代替本场景。
+   当前 `src/identity/cas.rs` 已能用 `Scripted` 证明 CAS 失败/拒绝的请求形状，但 `login` 尚未接入该切片。接线后仍需让 `login` 在参数合法后得到确定的 auth/network 失败，并断言旧 `credentials.json`、旧 `session.json` 和课表/配置均不变。当前 `invalid_login_arguments_...` 只覆盖联网前拒绝，不能代替本场景。
 
 2. **同一学号改密码后不能用旧会话证明新密码**。
    需要凭据版本/指纹缝，或传输层注入：旧会话存在、同一学号提交新密码时，必须发生一次真实凭据验证，不能直接返回旧会话成功。仅靠本地文件无法知道旧会话是用哪一代密码建立的。
