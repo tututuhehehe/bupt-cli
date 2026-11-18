@@ -399,9 +399,38 @@ fn transport_failure() -> CliError {
     )
 }
 
-// Login enables this transport only after private session persistence is wired.
-#[cfg(test)]
 mod cas_wire;
+
+/// Separate from public-library transport: CAS cookies and UCloud credentials
+/// are supplied to the trusted executable only through stdin.
+pub(crate) struct CampusCurl {
+    timeout: Duration,
+}
+
+impl CampusCurl {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Transport for CampusCurl {
+    fn send(&mut self, request: Request) -> CliResult<Response> {
+        // Do not hand a private request to the PATH fallback. A trusted
+        // Windows system-curl path and its execution remain to be verified.
+        if !cfg!(target_os = "macos") {
+            return Err(CliError::new(
+                5,
+                "upstream",
+                "authenticated HTTPS is not yet enabled on this platform",
+                "",
+            ));
+        }
+        let mut exec = SystemCurl {
+            program: PathBuf::from("/usr/bin/curl"),
+        };
+        cas_wire::exchange(&mut exec, self.timeout, &request)
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod testing {

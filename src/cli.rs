@@ -94,10 +94,14 @@ type Run = fn(&str, &ArgMatches, &mut Context<'_>) -> CliResult<Outcome>;
 
 type Lane = (fn() -> Vec<Command>, Run);
 
-/// The library lane is anonymous; every other lane must stay on `Offline` until
-/// its authenticated session adapter is reviewed.
 fn uses_public_library(name: &str) -> bool {
     name == "library"
+}
+
+/// Allow the CAS protocol and only the first two read-only UCloud flows.
+fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
+    matches!(name, "login" | "courses")
+        || (name == "homework" && arguments.subcommand().is_none() && arguments.get_flag("undone"))
 }
 
 const LANES: &[Lane] = &[
@@ -229,16 +233,16 @@ fn run(
                 .get_one::<f64>("timeout")
                 .expect("timeout has a validated default"),
         );
-        let mut curl: Option<crate::transport::Curl> = None;
-        // Production passes `None`: build the bounded curl adapter only after
-        // `--timeout` is parsed. Tests inject a recording transport instead.
-        let transport: &mut dyn Transport = if uses_public_library(name) {
-            match public {
-                Some(transport) => transport,
-                None => curl.get_or_insert_with(|| crate::transport::Curl::new(timeout)),
-            }
-        } else {
-            offline
+        let mut library_curl = crate::transport::Curl::new(timeout);
+        let mut campus_curl = crate::transport::CampusCurl::new(timeout);
+        // An injected public transport marks the entire dispatch as a test;
+        // the first injected transport then handles all non-library commands.
+        let transport: &mut dyn Transport = match public {
+            Some(transport) if uses_public_library(name) => transport,
+            Some(_) => offline,
+            None if uses_public_library(name) => &mut library_curl,
+            None if uses_campus_transport(name, arguments) => &mut campus_curl,
+            None => offline,
         };
         let mut context = Context::from_environment(timeout, transport)?;
         let (_, handler) = routes
@@ -361,6 +365,24 @@ mod tests {
         assert_eq!(document["schema"], "bupt.v1");
         assert_eq!(document["ok"], true);
         assert_eq!(document["count"], 0);
+    }
+
+    #[test]
+    fn private_transport_is_only_routed_to_the_first_cas_and_read_flows() {
+        for (args, allowed) in [
+            (&["bupt", "login"][..], true),
+            (&["bupt", "courses"][..], true),
+            (&["bupt", "homework", "--undone"][..], true),
+            (&["bupt", "homework"][..], false),
+            (&["bupt", "status"][..], false),
+            (&["bupt", "diagnose"][..], false),
+            (&["bupt", "library", "search", "example"][..], false),
+        ] {
+            let (command, _) = command_tree();
+            let matches = command.try_get_matches_from(args).unwrap();
+            let (name, arguments) = matches.subcommand().unwrap();
+            assert_eq!(uses_campus_transport(name, arguments), allowed);
+        }
     }
 
     #[test]
