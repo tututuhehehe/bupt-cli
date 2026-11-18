@@ -1,0 +1,1 @@
+synthetic file that uninstall must not remove
