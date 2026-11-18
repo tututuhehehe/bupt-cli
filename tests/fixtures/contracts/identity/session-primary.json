@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "username": "2026000001",
+  "role": "graduate",
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-02T03:04:05Z",
+  "cookies": [
+    {
+      "name": "SID",
+      "value": "TEST-ONLY-COOKIE-SECRET-a1b2",
+      "domain": "auth.bupt.edu.cn",
+      "path": "/",
+      "secure": true,
+      "expires": 4102444800,
+      "domain_specified": true,
+      "domain_initial_dot": false,
+      "rest": {}
+    }
+  ],
+  "ucloud": {
+    "access_token": "TEST-ONLY-ACCESS-TOKEN-SECRET-c3d4",
+    "refresh_token": "TEST-ONLY-REFRESH-TOKEN-SECRET-e5f6",
+    "user_id": "42",
+    "user_name": "2026000001",
+    "real_name": "Synthetic Tester",
+    "jwt_payload": {
+      "exp": 4102444800,
+      "user_id": "42"
+    },
+    "expires_at": 4102444800
+  },
+  "cas_logins_total": 2
+}
