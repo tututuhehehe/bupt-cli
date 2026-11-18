@@ -1,0 +1,16 @@
+{
+  "e": 0,
+  "m": "",
+  "d": {
+    "data": [
+      {
+        "dromName": "101",
+        "dromNum": "fixture-meter-101"
+      },
+      {
+        "dromName": "102",
+        "dromNum": "fixture-meter-102"
+      }
+    ]
+  }
+}

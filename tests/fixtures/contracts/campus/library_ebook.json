@@ -1,0 +1,13 @@
+{
+  "result": {"code": 0, "msg": ""},
+  "data": [
+    {
+      "locate": "https://example.invalid/ebook/1\u001e",
+      "recNote": "Electronic version"
+    },
+    {
+      "locate": "https://example.invalid/ebook/2",
+      "recNote": "电子书"
+    }
+  ]
+}
