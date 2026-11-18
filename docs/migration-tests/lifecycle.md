@@ -35,6 +35,8 @@
 | 未知文件与自己的文件混在一起时整目录跳过，双方文件都按字节保留并报告 skipped | `test_uninstall_refuses_home_and_root` 的保守保护；合同“不扩大删除范围” | `uninstall_skips_mixed_data_directories_wholesale` |
 | 只有自己可识别的 `timetable.json` 时也能完整清理 | 旧 `data_markers` 不含 `timetable.json`，这是要修的缺口 | `uninstall_removes_an_owned_timetable_only_directory` |
 | 不因 basename 是 `timetable.json` 就删除用户目录里的同名文件 | 旧 `looks_like_bupt` 的“先验证再删除”原则 | `uninstall_does_not_remove_a_timetable_lookalike` |
+| `timetable.json` 归属识别要求 v1 的 term/role/shape，v2 另需 username | 旧 `data_markers` 缺口；合同“只清理自己的课表” | `timetable_ownership_requires_known_shape`、`owned_data_requires_recognized_payloads` |
+| 卸载 note 区分完整完成、keep-data 保留、跳过或部分失败 | `cmd_uninstall` 的 `note`；合同“不对跳过项报告为已删除” | `uninstall_note_distinguishes_completion_from_skips_and_keep_data`；`uninstall_skips_mixed_data_directories_wholesale`、`uninstall_keep_data_preserves_credentials_and_timetable` 的 note 断言 |
 | 危险数据根在真实删除模式下也不动文件 | `test_uninstall_refuses_home_and_root` | `uninstall_refuses_dangerous_data_roots_in_destructive_mode` |
 | 数据目录是符号链接时不跟随目标，只处理链接本身或跳过 | `cmd_uninstall` 的 symlink 分支 | `uninstall_does_not_follow_a_symlinked_data_directory` |
 | 不盲删显式 PATH/CWD 上恰好叫 `bupt` 的无关可执行文件 | `test_looks_like_bupt_rejects_random_binary`、`test_uninstall_never_targets_source_files` | `uninstall_does_not_delete_an_unrelated_executable_on_path` |
@@ -55,22 +57,24 @@
 
 ### `uninstall`
 
-- 可执行文件候选只有当前正在运行的 `bupt` / `bupt.exe`：必须是普通文件、非空、文件名匹配且（Unix）有执行位。不扫描 PATH，不删除其他同名条目，不把源码文件当作二进制。
-- 数据目录逐目录规划：符号链接、危险根（根目录、HOME 或其上级、当前目录或其上级）、`--keep-data`、未知/混合/不可验证内容，全部记为 skipped，不做部分删除。
-- 只有目录内所有文件都可识别为自己的 JSON（`credentials.json`、`session.json`、`config.json`、`timetable.json`，且内容形态匹配）时才整体删除。`timetable.json` 使用 `version` 1/2、`courses` 数组和 `calendar` 对象识别；同名但内容不符的 lookalike 会跳过。
+- 可执行文件候选只有当前正在运行的 `bupt` / `bupt.exe`：必须是普通文件、非空、文件名匹配且（Unix）有执行位；验证失败时只记为 skipped。不扫描 PATH，不删除其他同名条目，不把源码文件当作二进制。
+- 数据目录先完整规划并携带已验证的普通文件集合：遇到未知 basename 先短路，不读取其内容；符号链接、危险根（根目录、HOME 或其上级、当前目录或其上级）、`--keep-data`、未知/混合/不可验证内容，全部记为 skipped，不触碰任何条目。
+- 只有目录内所有文件都可识别为自己的 JSON（`credentials.json`、`session.json`、`config.json`、`timetable.json`，且内容形态匹配）时才执行删除。`timetable.json` 要求 `version` 1/2、`term`、已知 `role`、`courses` 数组和 `calendar` 对象；v2 还要求 `username`。v1 的已验证夹具继续接受，同名但内容不符的 lookalike 会跳过。
+- 删除按计划中的叶子文件逐个进行，最后只调用非递归 `remove_dir`。开始删除前会再次核对目录身份、条目集合和文件元数据；若发现新条目、替换的路径或变化的文件元数据，整个目录跳过。删除开始后若再发现新条目或变化，会停止并保留剩余内容，报告已删除的文件和未完成的目录，不声称原子回滚。
 - `--dry-run` 只生成计划，不删除可执行文件或数据；`--keep-data` 保留数据目录但移除当前可执行文件（Unix）。Windows 运行中 `.exe` 的移除/替换仍待实现，明确报告为 skipped，不报告为 removed。
+- `note` 仍是单个字符串，不新增字段：`卸载完成` 只在没有 skipped、没有 keep-data 保留时出现；保留、跳过、删除失败或待处理会分别得到明确的部分完成/未移除说明。
 
 ### 本轮测试结果
 
 ```sh
 cargo test --locked --offline --lib
-# 10 passed
+# 17 passed
 
 cargo test --locked --offline --test contract_lifecycle
 # 20 passed; 3 failed
 ```
 
-新增/相关的单元用例：`repo_must_be_owner_slash_repo`、`release_assets_are_selected_per_supported_platform`、`only_a_regular_bupt_executable_is_a_target`、`removal_plans_only_the_given_executable`、`dry_run_plans_without_removing_the_executable`、`owned_data_requires_recognized_payloads`、`logged_out_credentials_remain_recognizable`、`dangerous_roots_are_refused_without_following_aliases`。
+新增/相关的单元用例：`repo_must_be_owner_slash_repo`、`release_assets_are_selected_per_supported_platform`、`only_a_regular_bupt_executable_is_a_target`、`removal_plans_only_the_given_executable`、`dry_run_plans_without_removing_the_executable`、`owned_data_requires_recognized_payloads`、`timetable_ownership_requires_known_shape`、`logged_out_credentials_remain_recognizable`、`dry_run_keeps_the_vetted_directory`、`mixed_directory_is_rejected_before_removal`、`late_unknown_file_survives_execution`、`changed_owned_file_survives_execution`、`replaced_directory_survives_execution`、`uninstall_note_distinguishes_completion_from_skips_and_keep_data`、`dangerous_roots_are_refused_without_following_aliases`。
 
 仍失败的 lane 用例都属于其他功能线尚未接入，不是本 lane 的断言变化：
 
@@ -112,7 +116,7 @@ cargo test --locked --offline --test contract_lifecycle
    - 若后续改为扫描 PATH/CWD，必须把被拒绝的候选放进 `skipped`，并重新审视“只作用于获准目标”的合同。
 
 6. **在线更新与 Windows swap（暂缓、待实测）**
-   - 真实 GitHub release 检查、asset 下载、在线更新和 Windows 原位替换/运行中文件锁行为均未在本轮运行；不得用 live network/publish 假装通过。
+   - 真实 GitHub release 检查、asset 下载、在线更新和 Windows 原位替换/运行中文件锁行为均未在本轮运行；不得用 live network/publish 假装通过。Windows 上的运行中 `.exe` 移除/替换仍只报告 skipped；下载和远端替换仍未实现、未声称完成。
    - macOS Apple Silicon 与 Windows x64 的真实 release 可执行文件、权限位、替换行为和 `--version` 冒烟测试需要两个平台的实际运行。
 
 ## 历史红测记录

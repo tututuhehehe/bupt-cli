@@ -662,6 +662,17 @@ fn uninstall_keep_data_preserves_credentials_and_timetable() {
         array_mentions(&payload["skipped"], &config) || array_mentions(&payload["skipped"], &cache),
         "keep-data must report the data directories as skipped: {payload}"
     );
+    let note = payload["note"]
+        .as_str()
+        .expect("uninstall note is a string");
+    assert!(
+        note.contains("--keep-data"),
+        "keep-data note must name the intentional preservation: {payload}"
+    );
+    assert_ne!(
+        note, "卸载完成",
+        "keep-data must not claim a complete removal: {payload}"
+    );
     assert_eq!(
         tree(sandbox.root()),
         before,
@@ -713,6 +724,17 @@ fn uninstall_skips_mixed_data_directories_wholesale() {
     assert!(
         array_mentions(&payload["skipped"], &config) && array_mentions(&payload["skipped"], &cache),
         "mixed directories must be reported as skipped: {payload}"
+    );
+    let note = payload["note"]
+        .as_str()
+        .expect("uninstall note is a string");
+    assert_ne!(
+        note, "卸载完成",
+        "uninstall must not claim a complete removal when data dirs were skipped: {payload}"
+    );
+    assert!(
+        note.contains("部分") || note.contains("跳过") || note.contains("待处理"),
+        "uninstall note must disclose skipped or partial work: {payload}"
     );
 }
 
