@@ -1,0 +1,170 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/work/detail",
+        "query": {
+          "assignmentId": "1000000000000000005"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "id": "1000000000000000005",
+            "assignmentTitle": "确认提交",
+            "className": "课程一",
+            "assignmentStatus": 99,
+            "assignmentEndTime": "2026-12-01 23:59",
+            "assignmentContent": "<p>题目</p>"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/work/submit-view",
+        "query": {
+          "assignmentId": "1000000000000000005"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "assignmentId": -1,
+            "attachmentIds": [],
+            "assignmentContent": "",
+            "assignmentStatus": 99
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/blade-source/resource/upload/biz"
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "success": true,
+          "data": "uploaded-rid",
+          "msg": "synthetic ok"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/ykt-site/work/submit",
+        "json": {
+          "assignmentId": "1000000000000000005",
+          "assignmentType": 0,
+          "assignmentContent": "合成答案",
+          "attachmentIds": [
+            "uploaded-rid"
+          ],
+          "userId": "synthetic-user",
+          "groupId": "",
+          "commitId": ""
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "success": true,
+          "code": 200,
+          "msg": "synthetic ok"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/work/submit-view",
+        "query": {
+          "assignmentId": "1000000000000000005"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "assignmentId": "1000000000000000005",
+            "attachmentIds": [
+              "uploaded-rid"
+            ],
+            "assignmentContent": "<p>合成答案</p>",
+            "assignmentStatus": 0
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "site-1",
+                "siteName": "课程一"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/ykt-site/work/student/list",
+        "json": {
+          "siteId": "site-1",
+          "userId": "synthetic-user",
+          "current": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "activityId": "1000000000000000005",
+                "assignmentTitle": "确认提交",
+                "assignmentStatus": 0,
+                "submitTime": "2026-11-18 11:00"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    }
+  ]
+}
