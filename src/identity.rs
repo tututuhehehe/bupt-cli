@@ -14,6 +14,10 @@ const PUBLIC_USER_FIELDS: &[&str] = &["user_id", "user_name", "real_name"];
 const CAS_SERVICE_URL: &str =
     "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fucloud.bupt.edu.cn%2Fuclass";
 
+// The synthetic protocol is not compiled into production until the live-wiring gate is met.
+#[cfg(test)]
+mod cas;
+
 const DIAGNOSE_GROUPS: &[&str] = &[
     "public",
     "cas",
@@ -759,11 +763,15 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn jwt_expiry(token: &str) -> Option<f64> {
+fn jwt_payload(token: &str) -> Option<Map<String, Value>> {
     let payload = token.split('.').nth(1)?;
     let bytes = base64url_decode(payload)?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("exp").and_then(number_value)
+    value.as_object().cloned()
+}
+
+fn jwt_expiry(token: &str) -> Option<f64> {
+    jwt_payload(token)?.get("exp").and_then(number_value)
 }
 
 fn base64url_decode(text: &str) -> Option<Vec<u8>> {
