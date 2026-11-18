@@ -326,7 +326,7 @@ struct Snapshot {
 }
 
 fn owned_snapshot(ctx: &Context<'_>) -> CliResult<Snapshot> {
-    let account = load_account(ctx, false)?;
+    let account = load_account(ctx, true)?;
     validate_role(&account)?;
     let path = ctx.cache_dir.join("timetable.json");
     let raw = fs::read(&path)
@@ -423,7 +423,7 @@ fn calendar_payload(snapshot: &Snapshot) -> Value {
 
 fn export_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
     let snapshot = owned_snapshot(ctx)?;
-    let content = build_ics(&snapshot)?;
+    let (content, events) = build_ics(&snapshot)?;
     let out = matches
         .get_one::<String>("out")
         .map(|path| expand_home(path, &ctx.home_dir))
@@ -444,7 +444,7 @@ fn export_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome
         "from_cache": true,
         "courses": snapshot.courses.len(),
         "weeks": snapshot.calendar.len(),
-        "events": content.matches("BEGIN:VEVENT").count(),
+        "events": events,
         "path": out.display().to_string(),
         "hint": "在日历 App 里双击导入；重复导入会生成重复事件",
     })))
@@ -494,7 +494,7 @@ fn reveal(path: &Path) {
     let _ = command.status();
 }
 
-fn build_ics(snapshot: &Snapshot) -> CliResult<String> {
+fn build_ics(snapshot: &Snapshot) -> CliResult<(String, usize)> {
     let (start, end) =
         week_bounds(snapshot).ok_or_else(|| refresh_required("课表快照里没有可用的日期信息"))?;
     let sessions = occurrences(snapshot, start, end);
@@ -524,7 +524,7 @@ fn build_ics(snapshot: &Snapshot) -> CliResult<String> {
 
     let mut emitted = 0;
     for session in sessions {
-        if session.time_start.is_empty() || session.time_end.is_empty() {
+        if !valid_clock(&session.time_start) || !valid_clock(&session.time_end) {
             continue;
         }
         let day = session.date.iso().replace('-', "");
@@ -567,7 +567,23 @@ fn build_ics(snapshot: &Snapshot) -> CliResult<String> {
         emitted += 1;
     }
     lines.push("END:VCALENDAR".to_string());
-    Ok(format!("{}\r\n", lines.join("\r\n")))
+    Ok((format!("{}\r\n", lines.join("\r\n")), emitted))
+}
+
+fn valid_clock(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 5
+        || !bytes[0].is_ascii_digit()
+        || !bytes[1].is_ascii_digit()
+        || bytes[2] != b':'
+        || !bytes[3].is_ascii_digit()
+        || !bytes[4].is_ascii_digit()
+    {
+        return false;
+    }
+    let hour = u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0');
+    let minute = u32::from(bytes[3] - b'0') * 10 + u32::from(bytes[4] - b'0');
+    hour <= 23 && minute <= 59
 }
 
 fn location_text(data: &Value) -> String {
@@ -593,6 +609,8 @@ fn ics_escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace(';', "\\;")
         .replace(',', "\\,")
+        .replace("\r\n", "\\n")
+        .replace('\r', "\\n")
         .replace('\n', "\\n")
 }
 
@@ -774,13 +792,25 @@ struct Date {
 impl Date {
     fn parse(text: &str) -> Option<Self> {
         let bytes = text.as_bytes();
-        if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        if bytes.len() != 10
+            || bytes[4] != b'-'
+            || bytes[7] != b'-'
+            || !bytes
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+        {
             return None;
         }
         let year = text[0..4].parse::<i32>().ok()?;
         let month = text[5..7].parse::<u32>().ok()?;
         let day = text[8..10].parse::<u32>().ok()?;
-        if month == 0 || month > 12 || day == 0 || day > days_in_month(year, month) {
+        if !(1..=9999).contains(&year)
+            || month == 0
+            || month > 12
+            || day == 0
+            || day > days_in_month(year, month)
+        {
             return None;
         }
         Some(Self { year, month, day })
@@ -837,6 +867,9 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
+// std::time has no local-offset API in this build. today/tomorrow/week use
+// this UTC day for now; DTSTAMP below is intentionally UTC. See the clock item
+// in docs/migration-tests/academics.md for the requested shared date API.
 fn utc_today() -> Date {
     Date::from_days((unix_seconds() / 86_400) as i64)
 }

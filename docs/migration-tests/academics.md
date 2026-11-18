@@ -28,6 +28,12 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `cached_export_writes_an_anonymized_ics_with_real_dates` | `test_timetable.py::test_build_ics_emits_one_event_per_session`、`test_build_ics_is_crlf_and_folded` | `schedule export` 每个 occurrence 一个 VEVENT；真实日期、开始/结束时间、SUMMARY/LOCATION、CRLF、折叠宽度、末周课程也导出 |
 | `ics_folds_long_utf8_lines` | `test_timetable.py::test_build_ics_is_crlf_and_folded`、`test_grad.py::test_build_ics_is_crlf_and_folded` | 长中文 SUMMARY 按 UTF-8 八位字节折行，每行不超过 76 字节；按 RFC 5545 去折行后必须逐字节还原完整 SUMMARY，拒绝截断或省略 |
 | `export_succeeds_even_when_opening_the_folder_fails` | 合同“导出文件成功不因打开系统文件管理器失败变成导出失败” | Unix 下伪造 `open` 写 sentinel 后退出 9：证明 opener 确实被调用，同时 `schedule export` 仍成功且文件存在；真实 Windows reveal 仍未实测 |
+| `passwordless_profile_cannot_read_a_matching_snapshot` | 合同“`logout` 清掉本地密码和会话，保留课表”；身份/快照归属 | 密码被清掉但 username/role 仍匹配时，query/calendar/export 全部 auth 拒绝；快照字节不变，不生成 ICS |
+| `explicit_environment_credentials_still_satisfy_the_local_profile` | 旧凭据优先级 | 配置缺密码时，显式合成 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 仍能读取匹配快照 |
+| `date_arguments_require_ascii_yyyy_mm_dd_and_valid_year` | 合同“非法参数在读写业务状态前拒绝” | 带符号年份/分量、0000 年、非 ASCII 数字、非补零月日、非法闰日全部 usage；不触碰缓存 |
+| `valid_leap_day_is_accepted_by_the_local_query` | `--date` 合法日期边界 | 2024-02-29 被接受并返回空结果；快照不变 |
+| `export_omits_events_with_invalid_clock_times` | 合同“不伪造考试/课表事实”；安全 ICS | 25:00、09:60 等非法时钟在插值前被拒绝，不生成对应事件，事件计数只算真实输出 |
+| `export_counts_real_events_and_escapes_injected_line_breaks` | 安全 ICS 导出 | 课程名/房间中的 CRLF、裸 LF、`BEGIN:VEVENT` / `END:VEVENT` 被转义成文本；物理事件边界仍各只有一条，`events` 不按子串计数 |
 | `corrupt_and_wrong_version_caches_require_an_explicit_update` | `test_timetable.py::test_load_rejects_corrupt_or_wrong_version` | 损坏 JSON、未来版本、缺 `courses` 的快照不导致 panic/假成功；提示 `schedule update`；不重写缓存 |
 | `unattributed_v1_cache_is_refused_instead_of_guessed` | 合同“不能确认旧快照归属时提示刷新” | v1 有 `role` 但无账号：query/calendar/export 全部拒绝，提示刷新，不生成导出文件 |
 | `cache_owned_by_another_account_is_refused` | 合同“只读当前学号及身份的可用课表快照” | v2 快照属于另一学号：三种读取命令全部拒绝，不泄漏/导出旧账号课表 |
@@ -40,9 +46,10 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 
 ## 实施状态（本地第一批）
 
-- `src/academics.rs` 已实现本地部分：v2 快照归属校验、`schedule` 单日/周/原始查询、`schedule calendar`、`schedule export`（含 ICS 折行和 opener 失败隔离），以及 `scores` / `classrooms` / `exams` 的本地身份与数据源路由校验。
-- 本清单 18 个进程用例全部通过；没有用跳过或假断言绕过尚未接通的远端路径。
+- `src/academics.rs` 已实现本地部分：v2 快照归属校验、可用当前 profile 校验（密码被 logout 清掉的配置不能单独读取课表/导出）、`schedule` 单日/周/原始查询、`schedule calendar`、`schedule export`（含严格日期/HH:MM 校验、ICS 折行、CRLF/换行转义和 opener 失败隔离），以及 `scores` / `classrooms` / `exams` 的本地身份与数据源路由校验。
+- 本清单 24 个进程用例全部通过；没有用跳过或假断言绕过尚未接通的远端路径。
 - `schedule update`、本科生 `scores` / `classrooms` / `exams` 和研究生 `exams` 在通过本地校验后返回 upstream pending（退出 5），不访问 transport、校园网或浏览器。对应的成功输出场景仍在下面的暂缓清单中，尚未编译成用例，因此当前也不会以红测出现。
+- 当前本地 credentials 读取是 academics 的临时实现；identity 的共享 loader 接线后应替换，避免两套密码/身份规则漂移。显式 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 仍可补足密码已清掉的配置文件。
 - 当前过期策略：归属明确且版本兼容的 v2 快照即使已离开教学周，仍会按本地快照返回；不会自动刷新。合同没有明确“过期是提示刷新还是继续读快照”，这里先选择严格离线、显式刷新，需整合者确认后再补跨学期用例。
 
 ## 暂不能黑盒验证的场景与最小测试缝
@@ -68,8 +75,9 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
    - 需要成功的 `schedule update` 注入缝，或实现侧的存储单元测试。当前只验证读取/拒绝时不会改写缓存。
 7. **过期但归属明确的快照**
    - 合同没有明确“过期快照是直接返回、还是提示刷新”。本轮用围绕当天生成的教学周避开歧义；若实现选择提示刷新，应补一条明确的跨学期用例，而不是让测试依赖运行日期。
-8. **本周/今天/明天的时钟边界**
-   - 需要可注入时钟或固定 `--date` 已覆盖单日；跨周（周日/周一）、学期外 fallback 仍待确定语义后补。
+8. **本周/今天/明天的本地日与时钟边界**
+   - 旧 Python 用 `date.today()`（用户本地日）；当前 Rust 只用 `std::time`，没有本地时区 API，因此 today/tomorrow/week 暂用 UTC 日，DTSTAMP 按合同保持 UTC。这是明确的未决差异，不冒充已修复。
+   - 具体依赖请求：由整合者批准并加入共享依赖 `time`（启用 `local-offset`）或 `jiff`，或提供可注入的共享 clock；在此之前不修改本线 Cargo。跨周（周日/周一）、学期外 fallback 仍需该 seam 后补。
 9. **Windows 下打开导出目录失败**
    - 当前 Unix 用 sentinel 证明伪造 `open` 被调用且退出 9 后导出仍成功；Windows 的 explorer 路径与启动失败仍未实测，需在 Windows 验收或实现侧的启动器抽象中覆盖。
 10. **课表/考试页面真实上游结构**
