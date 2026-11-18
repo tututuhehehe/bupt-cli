@@ -2,11 +2,11 @@
 
 范围：`library search|hold|ebook`、`electricity`、`electricity buildings`、`notices`、`notices show`、`card`。
 Python 基准：`d7c35ef` 的 `tests/test_library.py`、`tests/test_electricity.py`、`src/bupt_cli/{library,commands,config}.py`，以及 `src/bupt_cli/_vendor/campus_api/bupt/portal.py`。
-Rust 合同：`docs/rust-migration.md`。本文件只记录测试阶段，不含实现决定。
+Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与未决项；合同冲突时以 `docs/rust-migration.md` 为准。
 
 ## 已执行的离线用例
 
-`tests/contract_campus.rs` 全部通过公开 CLI 进程边界验证，使用共享 `Sandbox`，只用合成输入，不读取真实凭据、不依赖校园网响应。所有错误用例都断言：stdout 为空、stderr 是单个 JSON、带 `schema: "bupt.v1"`、`ok: false`、正确的 `error.type` 和退出码。没有离线传输缝时，这些断言只能区分本地参数、配置和凭据层，不能证明实现没有发起请求。
+`tests/contract_campus.rs` 全部通过公开 CLI 进程边界验证，使用共享 `Sandbox`，只用合成输入，不读取真实凭据、不依赖校园网响应。所有错误用例都断言：stdout 为空、stderr 是单个 JSON、带 `schema: "bupt.v1"`、`ok: false`、正确的 `error.type` 和退出码。进程级用例没有成功响应注入，只能区分本地参数、配置和凭据层，不能证明实现没有发起请求；库解析和请求形状由 `src/campus/library.rs` 内的 `Scripted` 测试覆盖。
 
 | Rust 用例 | 覆盖语义 | Python 来源 |
 |---|---|---|
@@ -36,6 +36,7 @@ Rust 合同：`docs/rust-migration.md`。本文件只记录测试阶段，不含
 | `notices_accepts_case_insensitive_types_before_auth` | 类型大小写不敏感，合法类型继续到凭据层 | `_notice_types`、`NoticeType` |
 | `notices_rejects_invalid_count_as_usage_error` | `--count` 负数/非整数/小数在凭据前 usage | `test_invalid_numeric_arguments_are_usage_errors` |
 | `notices_show_requires_a_url_and_non_negative_max_chars` | 缺 URL、负 `--max-chars` 为 usage | `cli.py` notices show 参数 |
+| `notices_show_rejects_blank_url_before_auth` | 空白 URL 在无凭据时仍为 usage 2，证明校验先于 profile/auth；提示指向 `bupt notices` | 本轮评审决定，覆盖旧版空 URL 落 upstream 5 的行为 |
 | `notices_show_requires_credentials_without_creating_session` | 有效 URL 但无凭据时 auth 3 并提示登录；使用 `.invalid` 合成 URL；不创建会话文件（不等于证明无请求） | `commands.py:cmd_notices_show` |
 | `notices_and_card_are_not_blocked_by_malformed_dorm_config` | 损坏 dorm config + 缺失凭据时 auth 并提示登录，config usage 没有抢先 | `commands.py` portal 分派 |
 | `card_rejects_unexpected_arguments` | card 不收 `--area`/位置参数 | `cli.py` card 参数 |
@@ -46,11 +47,11 @@ Rust 合同：`docs/rust-migration.md`。本文件只记录测试阶段，不含
 - library 的空白输入用例故意放一个损坏的 `credentials.json`；library 仍报 usage，证明匿名校验不会解析账号配置并转成 auth。
 - `electricity buildings` 用例故意放损坏的 `config.json` 并保持无凭据；返回 auth 且提示登录，说明 config usage 没有抢先。错误文案不作断言，也不能证明没有请求。
 - 缺 room、顶层 `--area` 用例故意放损坏配置；报具体 flag/参数错误，证明这些参数校验先于业务配置读取。未知楼名在 Python 中位于配置读取之后，未用损坏配置做顺序断言。
-- 所有断言只使用合成输入：楼名是公开常量或占位符，URL 使用 `example.invalid`，没有真实学号、密码、Cookie 或 token；测试不依赖校园网响应。脚手架红跑在 exit 78 前不会发起上游请求，实现后的请求次数需由离线缝验证。
+- 所有断言只使用合成输入：楼名是公开常量或占位符，URL 使用 `example.invalid`，没有真实学号、密码、Cookie 或 token；测试不依赖校园网响应。进程级用例仍不能证明实现没有发请求；内部 `Scripted` 测试只回放合成响应。
 
 ## 合成夹具
 
-`tests/fixtures/contracts/campus/` 是脱敏的上游响应形状；`src/campus.rs` 的内部 `Scripted` 传输测试已直接消费图书馆响应。电费/门户夹具继续留给会话适配器接通后的测试。
+`tests/fixtures/contracts/campus/` 是脱敏的上游响应形状；`src/campus/library.rs` 的内部 `Scripted` 传输测试已直接消费图书馆响应。电费/门户夹具继续留给会话适配器接通后的测试。
 
 | 夹具 | 预期用途 |
 |---|---|
@@ -66,16 +67,16 @@ Rust 合同：`docs/rust-migration.md`。本文件只记录测试阶段，不含
 
 ## 第一批实现（本地路径）
 
-`src/campus.rs` 已实现：
+`src/campus.rs` 保留命令注册、路由、参数校验和占位 portal 桥；`src/campus/library.rs` 负责匿名 OPAC；`src/campus/dorm.rs` 负责宿舍配置与楼名。已实现：
 
 - `library search|hold|ebook` 的参数规格：`--page`、`--page-size`、`--location`、`--with-ebook`、位置参数与空白校验。
 - 匿名 OPAC 请求和响应解析：书目字段、HTML 高亮/实体清理、馆藏状态列与偏移回退、电子资源扁平列表和 `\x1e` 清理；`--with-ebook` 的旁路查询失败只记 `null`。
 - `electricity` / `electricity buildings` 的参数规格、楼名与校区别名、`config.json` 的 `dorm` 解析，以及 flag > env > config > built-in placeholder 的优先级。
-- `notices` / `notices show` / `card` 的本地参数校验与类型筛选；无本地 profile 时这些需要授权的命令返回 auth 3，有 profile 时停在 session adapter pending，不伪造成功。
+- `notices` / `notices show` / `card` 的本地参数校验与类型筛选；`notices show` 的空白 URL 在读取 profile 前以 usage 2 拒绝。无本地 profile 时授权命令返回 auth 3，有 profile 时停在 session adapter pending，不伪造成功。
 
 ### 本轮新增的内部 fixture 测试
 
-这些测试在 `src/campus.rs` 的 `#[cfg(test)]` 中通过共享 `Scripted` 传输回放合成夹具，不联网：
+这些测试在 `src/campus/library.rs` / `src/campus/dorm.rs` 的 `#[cfg(test)]` 中；图书馆测试通过共享 `Scripted` 传输回放合成夹具，不联网：
 
 | Rust 测试 | 覆盖 |
 |---|---|
@@ -85,6 +86,8 @@ Rust 合同：`docs/rust-migration.md`。本文件只记录测试阶段，不含
 | `library_hold_parses_status_columns_and_campus_rows` | 状态列、列偏移回退、非馆藏行过滤、可借计数、GET 请求头 |
 | `library_ebook_parses_flat_resources_and_empty_state` | 两条资源、`\x1e` 去除、空列表、详情 Referer |
 | `library_search_with_ebook_marks_failures_as_null` | 一次搜索 + 两次旁路，失败项为 `null` |
+| `library_ids_are_escaped_as_single_path_segment` | hold URL 与 ebook Referer 把非 ASCII/保留字符 ID 编码为单一路径段；JSON `id` 与表单 `sid` 保持原值；简单字母数字不变 |
+| `library_transport_errors_do_not_echo_internal_diagnostics` | 传输错误仍按 Python 分类映射为 usage 2；消息不含内部诊断，hint 保留 `diagnose` |
 | `dorm_config_defaults_and_config_values_are_resolved_locally` | 内置占位符、config 值、`source=config` |
 | `dorm_flags_win_over_environment_and_config` | flag > env > config、楼名/room/floor |
 
@@ -103,15 +106,29 @@ Rust 合同：`docs/rust-migration.md`。本文件只记录测试阶段，不含
 
 进程测试当前只能验证参数、无 profile 的 auth 层和文件副作用；不能证明实现没有发请求。成功响应测试需要整合者提供的进程内传输注入或等价 seam，生产二进制不增加模拟环境变量。
 
+## 待门户适配器落实的安全约束
+
+- `notices show` 目前只拒绝空白 URL；接 portal adapter 时必须校验目标在允许的校园门户域名/路径内，重定向后也要复核。
+- 不得把校园凭据、Cookie 或 token 发送到任意 `--url` 指向的地址。
+- 本轮只做本地空白 URL 校验，未连接 portal adapter、未发起真实请求，也未实现域名白名单。
+
+## 解析与编码边界
+
+这些测试证明的是合成夹具上的字段映射和请求形状，不是与线上站点逐字一致：
+
+- HTML 只做简单的标签/实体扫描，不覆盖畸形或深度嵌套 HTML、复杂表格合并单元格等；线上结构变化可能改变 `page_title`、馆藏行或正文提取。
+- 路径段编码按 UTF-8 字节百分号编码，空格在路径用 `%20`、表单用 `+`；未验证上游是否接受所有保留字符 ID，也未做 URL 规范化。
+- 搜索 `data` 非数组时当前按空列表处理；浮点计数截断；这些形状变化没有线上回归证据。
+- notices 列表/详情、card、电费查询仍未接入响应解析；夹具只描述预期形状。
+
 ## 旧版歧义（未在本轮决定）
 
-1. **library 上游错误退出码**：Python `cmd_library_search` / `cmd_library_hold` / `cmd_library_ebook` 把 `LibraryError` 统一转成 `UsageError`（退出 2），包括传输错误、上游返回 `result.code != 0` 和 hold 页面 404/500。第一批实现为保持旧行为暂时沿用 usage 2；Rust 合同的分层错误可能更适合 network/upstream，仍待整合者决定，没有合同断言。
-2. **`notices show ""`**：Python 在建立会话前抛 `ValueError`，最终落成通用 upstream 5，而不是 usage 2。合同要求非法参数在联网前拒绝；空 URL 是否应成为 usage 尚未决定，本轮未写断言。
-3. **`notices --count 0`**：Python 仍先建立会话（无凭据时 auth 3），然后客户端短路返回空列表。是否应允许无会话的空查询未定，本轮未测。
-4. **损坏 config 与完整 flag 的关系**：Python `resolve_dorm` 无条件读取 `config.json`，因此即使 flag 已给全，损坏配置仍会让查询失败。本轮验证了「参数本身非法时先报参数错误」「buildings 不因 dorm config 失败而抢先」，以及「无 flag/env 时 config 中的无效楼名会触发 usage（证明配置被读取）」；没有决定完整 flag 是否应绕过损坏配置，也没有验证最终电表请求的来源。
-5. **`electricity buildings` 是否需要登录**：Python 走 `_session(required=True)`，所以无凭据是 auth 3。若上游元数据实际可匿名读取，这是合同未写明的新行为；本轮按旧版断言 auth。
-6. **card 数字容错**：Python 把无法解析的 `qkje/oddfare/mail` 静默变成 null。是否保留静默容错还是报 parse 错误，本轮未决定。
-7. **notices 详情输出字段**：CLI 只输出 `title/url/author/time/content_text/content_truncated/attachments/images`，不输出 `content_html` 与 `blocks`。本轮按「保留能沿用的字段」记录，不扩字段。
+1. **library 上游错误退出码**：Python `cmd_library_search` / `cmd_library_hold` / `cmd_library_ebook` 把 `LibraryError` 统一转成 `UsageError`（退出 2），包括传输错误、上游返回 `result.code != 0` 和 hold 页面 404/500。第一批实现为保持旧行为暂时沿用 usage 2；内部测试只固定该分类和通用消息，进程合同未覆盖错误分层。Rust 合同的分层错误可能更适合 network/upstream，仍待整合者决定。
+2. **`notices --count 0`**：Python 仍先建立会话（无凭据时 auth 3），然后客户端短路返回空列表。是否应允许无会话的空查询未定，本轮未测。
+3. **损坏 config 与完整 flag 的关系**：Python `resolve_dorm` 无条件读取 `config.json`，因此即使 flag 已给全，损坏配置仍会让查询失败。本轮验证了「参数本身非法时先报参数错误」「buildings 不因 dorm config 失败而抢先」，以及「无 flag/env 时 config 中的无效楼名会触发 usage（证明配置被读取）」；没有决定完整 flag 是否应绕过损坏配置，也没有验证最终电表请求的来源。
+4. **`electricity buildings` 是否需要登录**：Python 走 `_session(required=True)`，所以无凭据是 auth 3。若上游元数据实际可匿名读取，这是合同未写明的新行为；本轮按旧版断言 auth。
+5. **card 数字容错**：Python 把无法解析的 `qkje/oddfare/mail` 静默变成 null。是否保留静默容错还是报 parse 错误，本轮未决定。
+6. **notices 详情输出字段**：CLI 只输出 `title/url/author/time/content_text/content_truncated/attachments/images`，不输出 `content_html` 与 `blocks`。本轮按「保留能沿用的字段」记录，不扩字段。
 
 ## 验证记录
 
@@ -124,6 +141,6 @@ cargo test --locked --offline --test contract_campus
 ```
 
 - `cargo fmt --check`：通过。
-- `cargo test --locked --offline --lib`：10 passed（8 个 campus fixture/配置测试 + 2 个共享 CLI 测试）。
-- `cargo test --locked --offline --test contract_campus`：29 passed。
+- `cargo test --locked --offline --lib`：12 passed（10 个 campus fixture/配置/编码测试 + 2 个共享 CLI 测试）。
+- `cargo test --locked --offline --test contract_campus`：30 passed。
 - 上述未接通场景没有对应的红测，也没有用 `#[ignore]`/`#[should_panic]` 隐藏；本轮没有真实校园网请求。
