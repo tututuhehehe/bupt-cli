@@ -10,10 +10,10 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 
 ## 关键约定
 
-1. **课表快照归属**：用例假设 Rust 快照格式为 v2，顶层带 `username` 和既有 `role`。只有 `username` 等于当前凭据、`role` 等于当前身份时才可服务 `schedule` / `schedule calendar` / `schedule export`。v1 没有 `username`，属于“无法确认归属”，必须提示 `schedule update`，不能按 `role` 猜测后继续。
+1. **课表快照归属与当前学期**：Rust 快照格式为 v2，顶层带 `username` 和 `role`。只有 `username` 等于当前凭据、`role` 等于当前身份、且运行当天落在快照教学周日期的闭区间内，才可直接服务 `schedule` / `schedule calendar` / `schedule export`。v1 没有 `username`，属于“无法确认归属”，不能按 `role` 猜测后继续。归属不符、缺失、损坏或当天不在学期内的快照都走唯一一次自动刷新；刷新失败/不完整/不覆盖当天时保留旧文件但不把它当作当前学期，也不生成日历或导出。
 2. **缓存位置**：沿用旧行为，fixture 写到 `BUPT_CLI_CACHE_DIR/timetable.json`；凭据写到 `BUPT_CLI_CONFIG_DIR/credentials.json`。
 3. **网络隔离边界**：共享 `Sandbox` 只隔离 HOME/config/cache。把 `HTTP(S)_PROXY`/`ALL_PROXY` 指向关闭的本地端口是 best-effort，只对遵守这些环境变量的 HTTP 客户端生效；它不覆盖浏览器/非 HTTP 流量，也不能证明“没有发起网络请求”。真正的 no-calls 断言必须放在后续注入 transport/browser 的场景里（见下）。
-4. **动态日期**：快照的教学周围绕 UTC 当天生成（前后各数周），避免测试在学期结束后因“过期”而误判；断言的具体日期由同一套日期算法算出。
+4. **动态日期与时钟**：进程用例的教学周围绕 UTC 当天生成（前后各数周），避免测试在学期结束后因“过期”而误判；实现侧用例使用固定日期 `2026-09-23`，并显式把 `today` 传给 `select_snapshot`。生产路径仍只能用 `std::time` 的 UTC 日，尚无跨平台本地时区 API；这是已记录的运行时限制，不用假数据冒充本地日。
 5. **凭据来源**：只用临时目录里的 `credentials.json`；账号环境变量不读取、不覆盖 JSON。role 只用于需要身份路由的教务操作。
 
 ## 用例映射
@@ -33,26 +33,48 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `environment_credentials_do_not_fill_a_passwordless_profile` | 旧凭据优先级的有意变更 | 配置缺密码时，即使合成 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 全部存在，也不能补足本地 profile；查询停在 auth，快照不变 |
 | `environment_credentials_do_not_override_saved_account_or_role` | 旧凭据优先级的有意变更 | 有效 JSON 的学号和 role 优先于冲突的账号环境变量；匹配的 graduate 快照仍可读取，role 输出保持 `graduate` |
 | `date_arguments_require_ascii_yyyy_mm_dd_and_valid_year` | 合同“非法参数在读写业务状态前拒绝” | 带符号年份/分量、0000 年、非 ASCII 数字、非补零月日、非法闰日全部 usage；不触碰缓存 |
-| `valid_leap_day_is_accepted_by_the_local_query` | `--date` 合法日期边界 | 2024-02-29 被接受并返回空结果；快照不变 |
-| `export_omits_events_with_invalid_clock_times` | 合同“不伪造考试/课表事实”；安全 ICS | 25:00、09:60 等非法时钟在插值前被拒绝，不生成对应事件，事件计数只算真实输出 |
+| `date_outside_the_current_term_reports_the_range_without_switching_terms` | 合同“`--date` 只筛选当前学期，范围外报告区间，不切换学期或当作没课” | 合法但不在当前学期的 2024-02-29 退出 2；错误同时报告请求日期和当前学期起止；不刷新、不改写快照 |
+| `export_rejects_invalid_start_or_end_clocks_and_preserves_an_existing_file` | 合同“不伪造考试/课表事实”；完整 ICS 校验 | 25:00 开始时间、09:60 结束时间不再是“跳过事件”，而是整次导出失败；错误点名课程和对应的开始/结束时间，已有 `.ics` 字节不变，无临时文件残留 |
+| `export_normalizes_recognizable_times_and_allows_missing_teacher_or_room` | 合同“导出先规范化上游可识别的日期/时间；教师/教室缺失允许” | `8：00` 与 `0935` 规范化为 08:00/09:35；课程缺 teachers/rooms 仍生成事件，且不写空 LOCATION |
+| `export_rejects_missing_calendar_dates_and_names_the_course` | 合同“任一上课场次无法生成有效事件时点名课程，不生成半份日历” | 课程引用不存在的第 99 周日期：退出 5，错误含课程名和缺失日期，已有 `.ics` 不变 |
 | `export_counts_real_events_and_escapes_injected_line_breaks` | 安全 ICS 导出 | 课程名/房间中的 CRLF、裸 LF、`BEGIN:VEVENT` / `END:VEVENT` 被转义成文本；物理事件边界仍各只有一条，`events` 不按子串计数 |
-| `corrupt_and_wrong_version_caches_require_an_explicit_update` | `test_timetable.py::test_load_rejects_corrupt_or_wrong_version` | 损坏 JSON、未来版本、缺 `courses` 的快照不导致 panic/假成功；提示 `schedule update`；不重写缓存 |
+| `corrupt_and_wrong_version_caches_require_an_explicit_update` | `test_timetable.py::test_load_rejects_corrupt_or_wrong_version` | 损坏 JSON、未来版本、缺 `courses` 的快照不导致 panic/假成功；自动刷新不可用时显式报告，不重写缓存 |
 | `unattributed_v1_cache_is_refused_instead_of_guessed` | 合同“不能确认旧快照归属时提示刷新” | v1 有 `role` 但无账号：query/calendar/export 全部拒绝，提示刷新，不生成导出文件 |
 | `cache_owned_by_another_account_is_refused` | 合同“只读当前学号及身份的可用课表快照” | v2 快照属于另一学号：三种读取命令全部拒绝，不泄漏/导出旧账号课表 |
-| `cache_for_another_role_is_refused` | 合同同上；`test_cli_errors.py` 角色守卫 | v2 快照 role 与当前身份不符：三种读取命令全部拒绝 |
+| `cache_for_another_role_is_refused` | 合同同上；`test_cli_errors.py` 角色守卫 | v2 快照 role 与当前身份不符：三种读取命令全部拒绝，不泄漏旧身份课表 |
+| `missing_snapshot_reports_unavailable_refresh_without_fabricating_cache` | 合同“上游不可用时显式失败，不伪造数据” | 没有快照时自动刷新只尝试临时来源一次；退出 5，错误说明“没有接通/不会伪造”，不创建缓存 |
+| `manual_update_without_a_source_preserves_the_existing_snapshot` | 合同“刷新失败保留旧快照” | `schedule update` 强制刷新，但未接来源：退出 5，旧快照字节不变，无临时文件 |
 | `out_of_range_week_points_at_explicit_update_and_keeps_the_snapshot` | `commands.cmd_schedule` 中 `--week` 不存在的分支 | 合法整数但不在快照范围：退出 2，hint 指向 `schedule update`，缓存不变 |
 | `invalid_weekday_entries_are_ignored_not_wrapped_or_fabricated` | `test_timetable.py::test_occurrences_ignores_out_of_range_weekdays` | 手改缓存中的 `-1`/`7`/`99` 不崩溃、不绕到周日、不伪造课程；返回 count 0 |
 | `graduate_accounts_are_refused_by_undergraduate_jwgl_commands` | `test_cli_errors.py::test_undergraduate_jwgl_commands_refuse_graduate_accounts` | `scores`/`classrooms` 对研究生身份在联网前退出 2，说明走本科教务；不生成 session/cache |
 | `role_guards_only_refuse_graduate_accounts_not_unknown_passwords` | `test_cli_errors.py::test_undergraduate_role_is_not_blocked` | 缺密码时 `exams`（研究生）/`scores`（本科生）都停在 auth，而不是被本科教务守卫误拒；不写 session/cache |
 | `unsupported_role_is_rejected_before_backend_selection` | 合同“登记显式选择的本科/研究生身份” | 未知 role 不被猜测为本科/研究生，命令在选后端前退出 2；不触碰缓存/session |
 
-## 实施状态（本地第一批）
+## 实现侧刷新边界用例
 
-- `src/academics.rs` 已实现本地部分：v2 快照归属校验、可用当前 profile 校验（密码被 logout 清掉的配置不能单独读取课表/导出）、`schedule` 单日/周/原始查询、`schedule calendar`、`schedule export`（含严格日期/HH:MM 校验、ICS 折行、CRLF/换行转义和 opener 失败隔离），以及 `scores` / `classrooms` / `exams` 的本地身份与数据源路由校验。
-- 本清单 25 个进程用例全部通过；没有用跳过或假断言绕过尚未接通的远端路径。
-- `schedule update`、本科生 `scores` / `classrooms` / `exams` 和研究生 `exams` 在通过本地校验后返回 upstream pending（退出 5），不访问 transport、校园网或浏览器。对应的成功输出场景仍在下面的暂缓清单中，尚未编译成用例，因此当前也不会以红测出现。
+这些用例在 `src/academics.rs` 的私有 `#[cfg(test)]` 模块里，通过 `select_snapshot(..., today, ..., &mut FakeSource)` 直接注入日期和假的课表来源；不启动进程、不联网、不依赖真实时钟。
+
+| Rust 用例 | 覆盖点 |
+|---|---|
+| `fresh_owned_snapshot_is_served_without_fetching` | 当天在归属正确的学期闭区间内：来源调用 0 次，`from_cache=true`，快照不被重写 |
+| `freshness_includes_both_term_endpoints_and_ignores_fetch_age` | 学期首日与末日都算新鲜；`fetched_at` 即使很旧也不触发刷新（不是 TTL），且不重写快照 |
+| `missing_snapshot_fetches_exactly_once_and_writes_the_new_term` | 缺快照：来源恰好 1 次，写入带当前学号/身份的新学期快照 |
+| `stale_snapshot_fetches_exactly_once_and_replaces_the_cache` | 学期已不覆盖当天：来源恰好 1 次；选中并缓存新课程，而不是旧学期 |
+| `foreign_snapshot_is_never_used_even_when_refresh_fails` | 归属不符且刷新失败：返回错误，不把外来快照当兜底，旧文件不变 |
+| `foreign_snapshot_is_replaced_only_after_a_clean_refresh` | 归属不符但刷新成功：恰好 1 次取数，只有刷新成功后才替换缓存 |
+| `date_outside_the_selected_term_never_fetches_again` | 先用新鲜快照完成选择（0 次），再由 `ensure_date_in_term` 拒绝范围外 `--date`，来源仍为 0 次 |
+| `failed_incomplete_or_out_of_term_refresh_preserves_the_old_snapshot` | 刷新报错、缺时钟、或返回不覆盖当天的学期：都只取 1 次，旧快照字节不变，无临时文件 |
+| `forced_update_fetches_even_for_a_fresh_snapshot_and_preserves_on_failure` | `update` 语义强制取数（即使快照新鲜）；成功后替换，失败后保留旧快照 |
+
+## 实施状态（本地当前学期与完整导出）
+
+- `src/academics.rs` 已实现一个共享的本地优先选择/刷新边界：`schedule`、`schedule calendar`、`schedule export` 在读取前先验证 v2 归属与运行当天是否在学期闭区间内；缺失、过期、归属不符或损坏时最多自动取数一次。`schedule update` 复用同一边界并强制刷新。生产来源 `UnavailableSource` 明确返回“当前构建没有接通教务课表刷新；不会伪造课表数据”（退出 5），不触碰网络或浏览器。
+- 取数成功后才原子替换 `timetable.json`；刷新失败、数据不完整或不覆盖当天时保留旧文件，但拒绝把旧文件当作当前学期。进程用例与实现侧假来源用例共同覆盖 0 次命中、1 次刷新、归属不符、范围外 `--date` 和失败保留。
+- `schedule export` 先对全部场次做完整校验：日期必须来自教学周日期表，时间支持 `8:00`、`08:00`、`0800`、全角冒号等可识别形式并规范化；任一课程缺日期/时间或时钟非法时点名课程并整次失败。教师/教室缺失允许。校验通过后才写临时文件并替换目标，失败不会覆盖已有 `.ics`。
+- `scores` / `classrooms` / `exams` 仍只完成本地身份与数据源路由校验，之后返回 upstream pending（退出 5）；没有成功输出、网络、浏览器或真实校园数据。
+- 本清单的进程用例 29 个、实现侧刷新边界用例 9 个全部通过；没有用跳过或假断言绕过尚未接通的远端路径。`cargo fmt --check`、`cargo test --locked --offline --lib`、`cargo test --locked --offline --test contract_academics` 是交付检查项。
 - 本地凭据统一由 `identity::require_authenticated_profile` 读取 `credentials.json`：username 和非空密码是登录前提；`role` 只在需要选择/校验数据源的 `schedule`、`exams`、`scores`、`classrooms` 中要求。`BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 不再读取，也不再能补足或覆盖 JSON。
-- 当前过期策略：归属明确且版本兼容的 v2 快照即使已离开教学周，仍会按本地快照返回；不会自动刷新。合同没有明确“过期是提示刷新还是继续读快照”，这里先选择严格离线、显式刷新，需整合者确认后再补跨学期用例。
+- 当前学期策略：只看运行当天是否在快照日期闭区间内，不看 `--date`、不看 TTL、不按抓取时间淘汰；学期内不会因快照“旧”而自动刷新。跨学期时按上述边界自动刷新一次。
 
 ## 暂不能黑盒验证的场景与最小测试缝
 
@@ -73,14 +95,12 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
    - `test_cli_errors.py::test_undergraduate_role_is_not_blocked` 同样需要该缝才能验证“本科生不会被守卫挡住”。
 5. **Chrome/CDP/临时 profile 生命周期**（`test_grad_browser.py` 全部、`test_cdp.py` 全部）
    - 需要可替换浏览器路径、可脚本化的 CDP 端点以及可替换临时目录。本轮明确不启动浏览器、不实现或测试安全控制绕过；这些应在实现阶段以单元测试或专门的本地假 Chrome 缝覆盖。
-6. **课表保存权限/原子替换**（`test_timetable.py::test_save_and_load_round_trip` 中 `0600`）
-   - 需要成功的 `schedule update` 注入缝，或实现侧的存储单元测试。当前只验证读取/拒绝时不会改写缓存。
-7. **过期但归属明确的快照**
-   - 合同没有明确“过期快照是直接返回、还是提示刷新”。本轮用围绕当天生成的教学周避开歧义；若实现选择提示刷新，应补一条明确的跨学期用例，而不是让测试依赖运行日期。
-8. **本周/今天/明天的本地日与时钟边界**
-   - 旧 Python 用 `date.today()`（用户本地日）；当前 Rust 只用 `std::time`，没有本地时区 API，因此 today/tomorrow/week 暂用 UTC 日，DTSTAMP 按合同保持 UTC。这是明确的未决差异，不冒充已修复。
-   - 具体依赖请求：由整合者批准并加入共享依赖 `time`（启用 `local-offset`）或 `jiff`，或提供可注入的共享 clock；在此之前不修改本线 Cargo。跨周（周日/周一）、学期外 fallback 仍需该 seam 后补。
-9. **Windows 下打开导出目录失败**
+6. **课表保存权限**（`test_timetable.py::test_save_and_load_round_trip` 中 `0600`）
+   - 当前刷新写缓存与导出写 `.ics` 都走同目录临时文件 + 替换，失败时保留旧文件；但还没有验证 Unix `0600` 权限或 Windows 覆盖已有目标的行为。需要成功的刷新注入缝和平台验收。
+7. **本周/今天/明天的本地日与时钟边界**
+   - 旧 Python 用 `date.today()`（用户本地日）；当前 Rust 只用 `std::time`，没有本地时区 API，因此选择边界、today/tomorrow/week 暂用 UTC 日，DTSTAMP 按合同保持 UTC。选择函数已经显式接收 `today`，测试可以固定日期，但生产运行时仍是 UTC；这是明确的未决差异，不冒充已修复。
+   - 具体依赖请求：由整合者批准并加入共享依赖 `time`（启用 `local-offset`）或 `jiff`，或提供可注入的共享 clock；在此之前不修改本线 Cargo。跨周（周日/周一）、学期首尾闭区间与学期外 fallback 仍需该 seam 或既有注入日期补足。
+8. **Windows 下打开导出目录失败**
    - 当前 Unix 用 sentinel 证明伪造 `open` 被调用且退出 9 后导出仍成功；Windows 的 explorer 路径与启动失败仍未实测，需在 Windows 验收或实现侧的启动器抽象中覆盖。
-10. **课表/考试页面真实上游结构**
-    - 属于校园网真实验收，按合同另行记录并经用户确认后运行；不得混入离线测试。
+9. **课表/考试页面真实上游结构**
+   - 属于校园网真实验收，按合同另行记录并经用户确认后运行；不得混入离线测试。

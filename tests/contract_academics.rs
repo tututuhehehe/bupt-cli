@@ -217,8 +217,8 @@ fn assert_refresh_required(invocation: Invocation, cache: &Path, before: &[u8], 
     assert_eq!(payload["ok"], json!(false), "{label}: {payload}");
     let text = error_text(&payload);
     assert!(
-        text.contains("schedule update"),
-        "{label}: refusal must point at the explicit refresh entry, got: {text}"
+        text.contains("刷新") && text.contains("课表"),
+        "{label}: refusal must identify the unavailable timetable refresh, got: {text}"
     );
     assert_eq!(
         fs::read(cache).expect("read cache after refusal"),
@@ -809,6 +809,58 @@ fn invalid_weekday_entries_are_ignored_not_wrapped_or_fabricated() {
     assert_eq!(fs::read(&cache).expect("read cache after query"), before);
 }
 
+#[test]
+fn missing_snapshot_reports_unavailable_refresh_without_fabricating_cache() {
+    let sandbox = Sandbox::new();
+    write_credentials(&sandbox, USER, "graduate");
+
+    let invocation = run(&sandbox, &["schedule"]);
+    assert_eq!(
+        invocation.code(),
+        5,
+        "an unconnected upstream must be an explicit upstream error; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&invocation.0.stdout),
+        String::from_utf8_lossy(&invocation.0.stderr)
+    );
+    assert!(invocation.0.stdout.is_empty());
+    let payload = invocation.stderr_json();
+    assert_schema(&payload);
+    let text = error_text(&payload);
+    assert!(
+        text.contains("没有接通") && text.contains("不会伪造"),
+        "the temporary production source must say that no timetable was fabricated: {text}"
+    );
+    assert!(
+        !cache_path(&sandbox).exists(),
+        "a failed refresh must not create a fabricated snapshot"
+    );
+}
+
+#[test]
+fn manual_update_without_a_source_preserves_the_existing_snapshot() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    write_credentials(&sandbox, USER, "graduate");
+    let (cache, before) = write_cache(&sandbox, &snapshot.entry);
+
+    let invocation = run(&sandbox, &["schedule", "update"]);
+    assert_eq!(invocation.code(), 5);
+    assert!(invocation.0.stdout.is_empty());
+    let payload = invocation.stderr_json();
+    assert_schema(&payload);
+    let text = error_text(&payload);
+    assert!(
+        text.contains("没有接通") && text.contains("不会伪造"),
+        "manual refresh must be explicit about the unconnected upstream: {text}"
+    );
+    assert_eq!(
+        fs::read(&cache).expect("read unchanged cache"),
+        before,
+        "a failed manual refresh must preserve the previous snapshot"
+    );
+    assert!(!cache.with_extension("json.tmp").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Role routing: undergraduate-only commands refuse graduate accounts before
 // any source is contacted. Unsupported roles are not guessed either.
@@ -1037,65 +1089,121 @@ fn date_arguments_require_ascii_yyyy_mm_dd_and_valid_year() {
 }
 
 #[test]
-fn valid_leap_day_is_accepted_by_the_local_query() {
+fn date_outside_the_current_term_reports_the_range_without_switching_terms() {
     let sandbox = Sandbox::new();
     let snapshot = synthetic_snapshot(USER, "graduate");
     write_credentials(&sandbox, USER, "graduate");
     let (cache, before) = write_cache(&sandbox, &snapshot.entry);
+    let term_start = snapshot.monday.iso();
+    let term_end = snapshot.last_date.iso();
 
-    let payload = assert_success(&run(&sandbox, &["schedule", "--date", "2024-02-29"]));
-    assert_eq!(payload["range"], json!(["2024-02-29", "2024-02-29"]));
-    assert_eq!(payload["count"], json!(0));
-    assert_eq!(payload["classes"], json!([]));
-    assert_eq!(fs::read(&cache).expect("read unchanged snapshot"), before);
+    let payload = assert_usage(run(&sandbox, &["schedule", "--date", "2024-02-29"]));
+    let text = error_text(&payload);
+    assert!(
+        text.contains("2024-02-29") && text.contains(&term_start) && text.contains(&term_end),
+        "the refusal must report the requested date and the selected term range: {text}"
+    );
+    assert_eq!(
+        fs::read(&cache).expect("read unchanged snapshot"),
+        before,
+        "an out-of-term --date must not refresh or replace the snapshot"
+    );
 }
 
 #[test]
-fn export_omits_events_with_invalid_clock_times() {
+fn export_rejects_invalid_start_or_end_clocks_and_preserves_an_existing_file() {
+    for (label, field, value, expected) in [
+        ("坏开始时钟课程", "time_start", "25:00", "开始时间"),
+        ("坏结束时钟课程", "time_end", "09:60", "结束时间"),
+    ] {
+        let sandbox = Sandbox::new();
+        let snapshot = synthetic_snapshot(USER, "graduate");
+        let mut entry = snapshot.entry.clone();
+        let mut invalid = json!({
+            "name": label,
+            "weekday_index": 2,
+            "weeks": [2],
+            "period_start": 1,
+            "period_end": 1,
+            "time_start": "08:00",
+            "time_end": "09:35",
+            "teachers": [],
+            "rooms": [],
+            "campus": ""
+        });
+        invalid[field] = json!(value);
+        entry["courses"] = json!([
+            {
+                "name": "有效合成课程",
+                "weekday_index": 2,
+                "weeks": [2],
+                "period_start": 1,
+                "period_end": 2,
+                "time_start": "08:00",
+                "time_end": "09:35",
+                "teachers": [],
+                "rooms": [],
+                "campus": ""
+            },
+            invalid
+        ]);
+        write_credentials(&sandbox, USER, "graduate");
+        write_cache(&sandbox, &entry);
+        let out = sandbox.root().join("clocks.ics");
+        fs::write(&out, b"OLD ICS").expect("write pre-existing export");
+
+        let invocation = run(
+            &sandbox,
+            &[
+                "schedule",
+                "export",
+                "--out",
+                out.to_str().unwrap(),
+                "--no-open-folder",
+            ],
+        );
+        assert_eq!(
+            invocation.code(),
+            5,
+            "{label}: invalid course clocks are an upstream data error; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&invocation.0.stdout),
+            String::from_utf8_lossy(&invocation.0.stderr)
+        );
+        assert!(invocation.0.stdout.is_empty());
+        let payload = invocation.stderr_json();
+        assert_schema(&payload);
+        assert_eq!(payload["ok"], json!(false));
+        let text = error_text(&payload);
+        assert!(
+            text.contains(label) && text.contains(expected),
+            "{label}: the error must name the affected course and {expected}: {text}"
+        );
+        assert_eq!(
+            fs::read(&out).expect("read preserved export"),
+            b"OLD ICS",
+            "{label}: a failed export must not overwrite an existing .ics"
+        );
+        assert!(!out.with_extension("ics.tmp").exists());
+    }
+}
+
+#[test]
+fn export_normalizes_recognizable_times_and_allows_missing_teacher_or_room() {
     let sandbox = Sandbox::new();
     let snapshot = synthetic_snapshot(USER, "graduate");
     let mut entry = snapshot.entry.clone();
-    entry["courses"] = json!([
-        {
-            "name": "有效合成课程",
-            "weekday_index": 2,
-            "weeks": [2],
-            "period_start": 1,
-            "period_end": 2,
-            "time_start": "08:00",
-            "time_end": "09:35",
-            "teachers": [],
-            "rooms": [],
-            "campus": ""
-        },
-        {
-            "name": "坏开始时钟课程",
-            "weekday_index": 2,
-            "weeks": [2],
-            "period_start": 1,
-            "period_end": 1,
-            "time_start": "25:00",
-            "time_end": "09:35",
-            "teachers": [],
-            "rooms": [],
-            "campus": ""
-        },
-        {
-            "name": "坏结束时钟课程",
-            "weekday_index": 2,
-            "weeks": [2],
-            "period_start": 1,
-            "period_end": 1,
-            "time_start": "08:00",
-            "time_end": "09:60",
-            "teachers": [],
-            "rooms": [],
-            "campus": ""
-        }
-    ]);
+    entry["courses"] = json!([{
+        "name": "可识别时间课程",
+        "weekday_index": 2,
+        "weeks": [2],
+        "period_start": 1,
+        "period_end": 1,
+        "time_start": " 8：00 ",
+        "time_end": "0935"
+    }]);
     write_credentials(&sandbox, USER, "graduate");
     write_cache(&sandbox, &entry);
-    let out = sandbox.root().join("clocks.ics");
+    let out = sandbox.root().join("normalized.ics");
 
     let payload = assert_success(&run(
         &sandbox,
@@ -1108,12 +1216,68 @@ fn export_omits_events_with_invalid_clock_times() {
         ],
     ));
     assert_eq!(payload["events"], json!(1));
-    let ics = fs::read_to_string(&out).expect("read clock-filtered ICS");
-    assert!(ics.contains("有效合成课程"));
-    assert!(!ics.contains("坏开始时钟课程"));
-    assert!(!ics.contains("坏结束时钟课程"));
-    assert!(!ics.contains("T250000"));
-    assert!(!ics.contains("T096000"));
+    let ics = fs::read_to_string(&out).expect("read normalized ICS");
+    assert!(ics.contains(&format!(
+        "DTSTART;TZID=Asia/Shanghai:{}T080000",
+        snapshot.class_date.ics_date()
+    )));
+    assert!(ics.contains(&format!(
+        "DTEND;TZID=Asia/Shanghai:{}T093500",
+        snapshot.class_date.ics_date()
+    )));
+    assert!(ics.contains("SUMMARY:可识别时间课程"));
+    assert!(
+        !ics.contains("LOCATION:"),
+        "missing teacher/room is allowed"
+    );
+}
+
+#[test]
+fn export_rejects_missing_calendar_dates_and_names_the_course() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    let mut entry = snapshot.entry.clone();
+    entry["courses"] = json!([{
+        "name": "缺日期课程",
+        "weekday_index": 2,
+        "weeks": [99],
+        "period_start": 1,
+        "period_end": 1,
+        "time_start": "08:00",
+        "time_end": "08:45",
+        "teachers": [],
+        "rooms": [],
+        "campus": ""
+    }]);
+    write_credentials(&sandbox, USER, "graduate");
+    write_cache(&sandbox, &entry);
+    let out = sandbox.root().join("missing-date.ics");
+    fs::write(&out, b"OLD ICS").expect("write pre-existing export");
+
+    let invocation = run(
+        &sandbox,
+        &[
+            "schedule",
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+            "--no-open-folder",
+        ],
+    );
+    assert_ne!(invocation.code(), 0);
+    assert!(invocation.0.stdout.is_empty());
+    let payload = invocation.stderr_json();
+    assert_schema(&payload);
+    let text = error_text(&payload);
+    assert!(
+        text.contains("缺日期课程") && text.contains("日期"),
+        "the error must name the course and the missing date: {text}"
+    );
+    assert_eq!(
+        fs::read(&out).expect("read preserved export"),
+        b"OLD ICS",
+        "a failed export must not overwrite an existing .ics"
+    );
 }
 
 #[test]
