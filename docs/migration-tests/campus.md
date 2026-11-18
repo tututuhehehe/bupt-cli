@@ -6,47 +6,47 @@ Rust 合同：`docs/rust-migration.md`。本文件只记录测试阶段，不含
 
 ## 已执行的离线用例
 
-`tests/contract_campus.rs` 全部通过公开 CLI 进程边界验证，使用共享 `Sandbox`，不读取真实凭据、不访问校园网。所有错误用例都断言：stdout 为空、stderr 是单个 JSON、带 `schema: "bupt.v1"`、`ok: false`、正确的 `error.type` 和退出码。
+`tests/contract_campus.rs` 全部通过公开 CLI 进程边界验证，使用共享 `Sandbox`，只用合成输入，不读取真实凭据、不依赖校园网响应。所有错误用例都断言：stdout 为空、stderr 是单个 JSON、带 `schema: "bupt.v1"`、`ok: false`、正确的 `error.type` 和退出码。没有离线传输缝时，这些断言只能区分本地参数、配置和凭据层，不能证明实现没有发起请求。
 
 | Rust 用例 | 覆盖语义 | Python 来源 |
 |---|---|---|
-| `library_search_rejects_blank_keyword_without_reading_credentials` | 空白/空关键词在任何凭据读取前以 usage 失败；错误点名「关键词」 | `test_search_rejects_blank_keyword`，`library.py:search` |
+| `library_search_rejects_blank_keyword_without_reading_credentials` | 空白/空关键词在凭据解析前以 usage 失败；损坏的 credentials 不会抢先成为 auth | `test_search_rejects_blank_keyword`，`library.py:search` |
 | `library_hold_and_ebook_reject_blank_ids_without_reading_credentials` | hold/ebook 空 id 在凭据读取前以 usage 失败；错误点名 `recCtrlId` | `test_holdings_rejects_blank_id`、`test_electronic_resources_rejects_blank_id` |
 | `library_requires_explicit_subcommands_and_arguments` | `library`、`search`、`hold`、`ebook` 缺子命令/位置参数均为 usage | `cli.py` library 分派 |
-| `library_rejects_invalid_pagination_before_any_state_or_network` | `--page` / `--page-size` 下界、非整数、`--timeout 0` 在状态读写前拒绝 | `cli.py:_int_at_least`、`_positive_float` |
+| `library_rejects_invalid_pagination` | `--page` / `--page-size` 下界、非整数、`--timeout 0` 在参数解析阶段拒绝 | `cli.py:_int_at_least`、`_positive_float` |
 | `electricity_default_placeholder_needs_a_campus_session` | 无参数使用占位宿舍后进入凭据层，返回 auth 3；不创建会话缓存 | `test_default_dorm_is_xitucheng_xue1_101` 的本地部分 |
 | `electricity_building_flag_requires_a_room_without_falling_back` | 传 `--building` 时即使 env/config 有 room 也要求 `--room` | `test_building_without_room_is_usage_error`、`resolve_dorm` |
 | `electricity_rejects_unknown_building` | 未知楼名是 usage，提示指向 `electricity buildings` | `test_unknown_building_is_usage_error` |
 | `electricity_accepts_documented_building_aliases_before_auth` | 学五楼/学5楼/学5/5/5楼/学十一楼/学29楼/SHAHE_A/shahe_a/沙河校区雁北园A楼均可本地解析并进入凭据层 | `test_building_aliases` |
 | `electricity_environment_building_wins_over_config` | env building 覆盖 config，且不会因 config 楼名无效而失败 | `test_env_beats_config` |
 | `electricity_flag_building_wins_over_environment` | flag building 覆盖 env | `test_flags_beat_env_and_config` 的楼名分支 |
-| `electricity_config_building_is_used_when_flags_and_env_are_absent` | 无 flag/env 时读取 config 中的楼名 | `test_config_used_when_no_flag_or_env` |
-| `electricity_rejects_legacy_area_on_the_query_command` | 顶层 `electricity --area` 是 usage，提示改用 `electricity buildings`；不读配置 | `test_area_is_rejected_on_top_level_electricity` |
-| `electricity_buildings_rejects_unknown_area_before_any_state` | `buildings --area mars` 在凭据/配置前拒绝 | `test_buildings_subcommand_rejects_bad_area` |
-| `electricity_buildings_ignores_malformed_dorm_config` | 损坏的 `config.json` 不阻塞 `buildings`；无凭据时返回 auth 而不是 config 错误 | `test_buildings_subcommand_ignores_broken_config` |
-| `electricity_buildings_accepts_documented_area_aliases` | shahe/沙河/2/xitucheng/haidian/西土城/海淀/1 均本地解析；不读 dorm config | `_resolve_area`、`test_buildings_subcommand_accepts_xitucheng` |
+| `electricity_config_building_is_used_when_flags_and_env_are_absent` | 无 flag/env 时读取 config：有效楼名返回 auth；把 config 楼名改为无效值后必须 usage 并回显输入，证明不是忽略 config 而用了默认值 | `test_config_used_when_no_flag_or_env` |
+| `electricity_rejects_legacy_area_on_the_query_command` | 顶层 `electricity --area` 是 usage，提示改用 `electricity buildings`；损坏 config 没有抢先 | `test_area_is_rejected_on_top_level_electricity` |
+| `electricity_buildings_rejects_unknown_area` | `buildings --area mars` 在缺失凭据/损坏配置前给出 usage | `test_buildings_subcommand_rejects_bad_area` |
+| `electricity_buildings_ignores_malformed_dorm_config` | 损坏的 `config.json` + 缺失凭据时返回 auth 并提示登录，而不是 config usage；只证明配置失败没有抢先，不证明请求次数 | `test_buildings_subcommand_ignores_broken_config` |
+| `electricity_buildings_accepts_documented_area_aliases` | shahe/沙河/2/xitucheng/haidian/西土城/海淀/1 均本地解析并到达凭据层；不证明请求次数 | `_resolve_area`、`test_buildings_subcommand_accepts_xitucheng` |
 | `electricity_rejects_invalid_thresholds` | 负值、NaN、inf、非数字为 usage | `cli.py:_float_at_least` |
 | `electricity_accepts_zero_threshold_before_auth` | 阈值 0 合法，继续到凭据层 | `test_default_dorm_query_shape` 的 threshold 边界 |
-| `electricity_reports_malformed_config_as_usage_error` | 损坏 JSON 是 usage，消息点名 config，提示提到 JSON | `test_bad_config_json_is_usage_error` |
+| `electricity_reports_malformed_config_as_usage_error` | 损坏 JSON 是 usage，hint 提到 JSON；不断言具体文案或底层 IO 措辞 | `test_bad_config_json_is_usage_error` |
 | `electricity_rejects_non_object_config_and_dorm_sections` | 顶层非对象、`dorm` 非对象均为 usage | `test_non_object_dorm_config_is_usage_error` |
-| `electricity_reports_unreadable_config_without_json_hint` | 路径是目录时报告不可读/权限，而不是 JSON 语法错误 | `test_unreadable_config_is_usage_error_not_json_hint` |
-| `notices_requires_credentials_before_network` | 无凭据时 notices 返回 auth 3，提示登录；不创建会话 | `commands.py:cmd_notices_list` |
-| `card_requires_credentials_before_network` | 无凭据时 card 返回 auth 3，提示登录；不创建会话 | `commands.py:cmd_card` |
-| `notices_rejects_unknown_types_before_auth` | 未知/混合类型在凭据前 usage，提示列出类别；尾随逗号按旧版忽略，不在此列 | `commands.py:_notice_types` |
+| `electricity_reports_unreadable_config_without_json_hint` | 路径是目录时是 usage，且消息/hint 不含 JSON；不断言权限或 IO 文案 | `test_unreadable_config_is_usage_error_not_json_hint` |
+| `notices_requires_credentials_without_creating_session` | 无凭据时 notices 返回 auth 3，提示登录；不创建会话文件（不等于证明无请求） | `commands.py:cmd_notices_list` |
+| `card_requires_credentials_without_creating_session` | 无凭据时 card 返回 auth 3，提示登录；不创建会话文件（不等于证明无请求） | `commands.py:cmd_card` |
+| `notices_rejects_unknown_types_before_auth` | 未知/混合类型在凭据前 usage，hint 含 `notice` 类别 token；尾随逗号按旧版忽略，不在此列 | `commands.py:_notice_types` |
 | `notices_accepts_case_insensitive_types_before_auth` | 类型大小写不敏感，合法类型继续到凭据层 | `_notice_types`、`NoticeType` |
 | `notices_rejects_invalid_count_as_usage_error` | `--count` 负数/非整数/小数在凭据前 usage | `test_invalid_numeric_arguments_are_usage_errors` |
 | `notices_show_requires_a_url_and_non_negative_max_chars` | 缺 URL、负 `--max-chars` 为 usage | `cli.py` notices show 参数 |
-| `notices_show_requires_credentials_before_fetching_detail` | 有效 URL 但无凭据时 auth 3；使用 `.invalid` 合成 URL，不发请求 | `commands.py:cmd_notices_show` |
-| `notices_and_card_do_not_read_the_dorm_config` | 损坏 dorm config 不影响 notices/card 的凭据错误 | `commands.py` portal 分派 |
+| `notices_show_requires_credentials_without_creating_session` | 有效 URL 但无凭据时 auth 3 并提示登录；使用 `.invalid` 合成 URL；不创建会话文件（不等于证明无请求） | `commands.py:cmd_notices_show` |
+| `notices_and_card_are_not_blocked_by_malformed_dorm_config` | 损坏 dorm config + 缺失凭据时 auth 并提示登录，config usage 没有抢先 | `commands.py` portal 分派 |
 | `card_rejects_unexpected_arguments` | card 不收 `--area`/位置参数 | `cli.py` card 参数 |
 
 ### 边界与副作用断言
 
-- 所有 usage/auth 用例都断言没有 `cache/session.json` 新文件。
-- library 的空白输入用例故意放一个损坏的 `credentials.json`；library 仍报 usage，证明匿名校验不读账号配置。
-- `electricity buildings` 用例故意放损坏的 `config.json`；报 auth 而不是 config，证明楼栋列表路径不依赖宿舍默认值。
-- 缺 room、顶层 `--area` 用例故意放损坏配置；报具体参数错误，证明这些参数校验先于业务配置读取。未知楼名在 Python 中位于配置读取之后，未用损坏配置做顺序断言。
-- 所有断言只使用合成输入：楼名是公开常量或占位符，URL 使用 `example.invalid`，没有真实学号、密码、Cookie、token 或校园网请求。
+- 所有 usage/auth 用例都断言没有 `cache/session.json` 新文件。这只是没有落盘会话的证据，不是没有发起请求的证据。
+- library 的空白输入用例故意放一个损坏的 `credentials.json`；library 仍报 usage，证明匿名校验不会解析账号配置并转成 auth。
+- `electricity buildings` 用例故意放损坏的 `config.json` 并保持无凭据；返回 auth 且提示登录，说明 config usage 没有抢先。错误文案不作断言，也不能证明没有请求。
+- 缺 room、顶层 `--area` 用例故意放损坏配置；报具体 flag/参数错误，证明这些参数校验先于业务配置读取。未知楼名在 Python 中位于配置读取之后，未用损坏配置做顺序断言。
+- 所有断言只使用合成输入：楼名是公开常量或占位符，URL 使用 `example.invalid`，没有真实学号、密码、Cookie 或 token；测试不依赖校园网响应。脚手架红跑在 exit 78 前不会发起上游请求，实现后的请求次数需由离线缝验证。
 
 ## 合成夹具
 
@@ -89,7 +89,7 @@ Rust 集成测试目前不能在不联网的前提下替换 HTTP 响应。需要
 1. **library 上游错误退出码**：Python `cmd_library_search` / `cmd_library_hold` / `cmd_library_ebook` 把 `LibraryError` 统一转成 `UsageError`（退出 2），包括上游返回 `result.code != 0` 和 hold 页面 404/500。Rust 合同的分层错误可能更适合 upstream 5；本轮没有写断言，交给整合者定。
 2. **`notices show ""`**：Python 在建立会话前抛 `ValueError`，最终落成通用 upstream 5，而不是 usage 2。合同要求非法参数在联网前拒绝；空 URL 是否应成为 usage 尚未决定，本轮未写断言。
 3. **`notices --count 0`**：Python 仍先建立会话（无凭据时 auth 3），然后客户端短路返回空列表。是否应允许无会话的空查询未定，本轮未测。
-4. **损坏 config 与完整 flag 的关系**：Python `resolve_dorm` 无条件读取 `config.json`，因此即使 flag 已给全，损坏配置仍会让查询失败。本轮只验证「参数本身非法时先报参数错误」和「buildings 不读配置」，没有决定完整 flag 是否应绕过损坏配置。
+4. **损坏 config 与完整 flag 的关系**：Python `resolve_dorm` 无条件读取 `config.json`，因此即使 flag 已给全，损坏配置仍会让查询失败。本轮验证了「参数本身非法时先报参数错误」「buildings 不因 dorm config 失败而抢先」，以及「无 flag/env 时 config 中的无效楼名会触发 usage（证明配置被读取）」；没有决定完整 flag 是否应绕过损坏配置，也没有验证最终电表请求的来源。
 5. **`electricity buildings` 是否需要登录**：Python 走 `_session(required=True)`，所以无凭据是 auth 3。若上游元数据实际可匿名读取，这是合同未写明的新行为；本轮按旧版断言 auth。
 6. **card 数字容错**：Python 把无法解析的 `qkje/oddfare/mail` 静默变成 null。是否保留静默容错还是报 parse 错误，本轮未决定。
 7. **notices 详情输出字段**：CLI 只输出 `title/url/author/time/content_text/content_truncated/attachments/images`，不输出 `content_html` 与 `blocks`。本轮按「保留能沿用的字段」记录，不扩字段。
@@ -106,4 +106,4 @@ cargo test --offline --test contract_campus -- --test-threads=1
 
 - `cargo fmt --check`：通过。共享 `tests/contract_support/mod.rs` 由整合者维护，本 lane 不加格式改动；`contract_campus.rs` 对 `mod contract_support` 使用 `#[rustfmt::skip]`，避免本 lane 改写共享文件。
 - `cargo test --offline --test contract_campus --no-run`：编译通过。
-- 红跑：29 个用例全部失败，退化为脚手架行为——进程 exit 78，stderr 是纯文本 `Rust CLI not implemented; test migration scaffold only`，因此每个用例在解析 JSON 时准确失败。没有真实联网、编译错误、`#[ignore]` 或 `#[should_panic]`。
+- 红跑：29 个用例全部失败，退化为脚手架行为——进程 exit 78，stderr 是纯文本 `Rust CLI not implemented; test migration scaffold only`，因此每个用例在解析 JSON 时准确失败。没有编译错误、`#[ignore]` 或 `#[should_panic]`；脚手架在 exit 78 前没有发起请求。
