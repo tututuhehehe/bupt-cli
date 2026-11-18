@@ -1,6 +1,6 @@
 # 身份测试迁移清单（login / status / logout / diagnose）
 
-Python 对照版本：`d7c35ef`。本清单只记录测试阶段，不包含实现。
+Python 对照版本：`d7c35ef`。本清单记录测试迁移和第一批本地身份实现的验收状态。
 
 ## 范围
 
@@ -31,6 +31,14 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 ```
 
 共享 harness 的格式问题已在整合分支 `008c9f3` 修复。本 lane 不修改 `tests/contract_support/mod.rs`，只在本地用 `skip_children=true` 检查本 lane 的测试文件；整合后应以普通 `cargo fmt --check` 复跑。
+
+## 第一批本地实现状态
+
+`src/identity.rs` 已实现本地 `login` 参数校验、只读 `status`、会话归属判定和 `logout`。未接 CAS 验证、网络传输或在线 `diagnose`。
+
+- 有效的 `login --user … --password … --role …` 在校验后返回明确的 pending 错误（退出码 `5`，`type: upstream`），不读取或写入账号状态。
+- `diagnose --only cas` 在没有缓存 CAS Cookie 时返回本地 skipped 报告；其他需要联网的组返回 pending，不写会话。
+- 本 lane 的 21 个进程测试全部通过；待实现场景没有以永远通过或伪造断言的形式保留。
 
 ## 用例映射
 
@@ -71,7 +79,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 
 ## 待实现场景与所需测试缝
 
-以下场景不能在当前共享 harness 下可靠验证。没有用永远通过的空断言或猜测内部 API 代替；需要整合者先确认最小测试缝。
+以下场景不能在当前共享 harness 下可靠验证。当前没有对应的失败测试；它们需要整合者先确认最小测试缝，不能用永远通过的空断言或猜测内部 API 代替。
 
 1. **延迟 CAS 拒绝时保留旧状态**（与非法参数用例分开）。
    需要可注入的传输层或脚本化 CAS 响应，让 `login` 在参数合法后得到确定的 auth/network 失败；断言旧 `credentials.json`、旧 `session.json` 和课表/配置均不变。当前 `invalid_login_arguments_...` 只覆盖联网前拒绝，不能代替本场景。
