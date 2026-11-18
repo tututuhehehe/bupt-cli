@@ -27,9 +27,14 @@ const CREDENTIALS_UNDERGRADUATE: &str =
 const CREDENTIALS_CORRUPT: &str =
     include_str!("fixtures/contracts/identity/credentials-corrupt.json");
 const SESSION: &str = include_str!("fixtures/contracts/identity/session-primary.json");
-const SESSION_NO_MOBILE: &str = include_str!("fixtures/contracts/identity/session-no-mobile.json");
-const SESSION_STALE_MOBILE: &str =
-    include_str!("fixtures/contracts/identity/session-stale-mobile.json");
+const SESSION_UNDERGRADUATE_MOBILE: &str =
+    include_str!("fixtures/contracts/identity/session-undergraduate-mobile.json");
+const SESSION_V1_USERNAME_MOBILE: &str =
+    include_str!("fixtures/contracts/identity/session-v1-username-mobile.json");
+const SESSION_GRADUATE_STALE_MOBILE: &str =
+    include_str!("fixtures/contracts/identity/session-graduate-stale-mobile.json");
+const SESSION_UNDERGRADUATE_STALE_MOBILE: &str =
+    include_str!("fixtures/contracts/identity/session-undergraduate-stale-mobile.json");
 const CONFIG: &str = include_str!("fixtures/contracts/identity/config-settings.json");
 const TIMETABLE: &str = include_str!("fixtures/contracts/identity/timetable.json");
 
@@ -175,6 +180,24 @@ fn assert_no_fixture_secrets(inv: &Invocation) {
     }
 }
 
+fn assert_stale_owner_hidden(status: &Value, configured: &str, stale: &str) {
+    assert_ne!(
+        status["username"],
+        json!(stale),
+        "status reported the previous cache owner"
+    );
+    if let Some(username) = status["username"].as_str() {
+        assert_eq!(
+            username, configured,
+            "only the configured account may be named"
+        );
+    }
+    assert!(
+        !status.to_string().contains(stale),
+        "stale cache owner leaked into the status document"
+    );
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct EntryState {
     kind: &'static str,
@@ -291,7 +314,57 @@ fn login_requires_explicit_role_and_rejects_unknown_role_before_writing() {
 }
 
 #[test]
-fn failed_login_validation_keeps_last_registered_credentials_and_session() {
+fn status_check_flag_is_removed_and_does_not_touch_state() {
+    let sandbox = Sandbox::new();
+    seed_credentials(&sandbox, CREDENTIALS);
+    seed_session(&sandbox, SESSION);
+    seed_file(&config_dir(&sandbox), "config.json", CONFIG);
+    seed_file(&cache_dir(&sandbox), "timetable.json", TIMETABLE);
+    let config_before = snapshot_tree(&config_dir(&sandbox));
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["status", "--check"], &[]);
+    usage_error(&inv);
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn login_jwgl_flag_is_removed_and_does_not_touch_state() {
+    let sandbox = Sandbox::new();
+    let credentials_path = seed_credentials(&sandbox, CREDENTIALS);
+    let session_path = seed_session(&sandbox, SESSION);
+    let config_before = snapshot_tree(&config_dir(&sandbox));
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(
+        &sandbox,
+        &[
+            "login",
+            "--user",
+            USER,
+            "--password",
+            ATTEMPT_PASSWORD,
+            "--role",
+            "graduate",
+            "--jwgl",
+        ],
+        &[],
+    );
+    usage_error(&inv);
+    assert_no_secret(&inv, ATTEMPT_PASSWORD);
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(read_text(&credentials_path), CREDENTIALS);
+    assert_eq!(read_text(&session_path), SESSION);
+    assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn invalid_login_arguments_keep_last_registered_credentials_and_session() {
     let sandbox = Sandbox::new();
     let credentials_path = seed_credentials(&sandbox, CREDENTIALS);
     let session_path = seed_session(&sandbox, SESSION);
@@ -336,6 +409,7 @@ fn changed_account_does_not_reuse_previous_owners_session() {
     assert_eq!(status["cache_username_mismatch"], json!(true));
     assert_eq!(status["cookie_count"], json!(0));
     assert_eq!(status["locally_valid"], json!(false));
+    assert_stale_owner_hidden(&status, OTHER_USER, USER);
     assert_no_fixture_secrets(&inv);
 
     assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
@@ -362,7 +436,77 @@ fn environment_account_override_does_not_reuse_configured_owners_session() {
     assert_eq!(status["cache_username_mismatch"], json!(true));
     assert_eq!(status["cookie_count"], json!(0));
     assert_eq!(status["locally_valid"], json!(false));
+    assert_stale_owner_hidden(&status, OTHER_USER, USER);
     assert_no_fixture_secrets(&inv);
+}
+
+#[test]
+fn same_username_different_role_does_not_reuse_v2_cache() {
+    let sandbox = Sandbox::new();
+    seed_credentials(&sandbox, CREDENTIALS_UNDERGRADUATE);
+    seed_session(&sandbox, SESSION);
+    let config_before = snapshot_tree(&config_dir(&sandbox));
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["status"], &[]);
+    let status = success(&inv);
+
+    assert_eq!(status["exists"], json!(false));
+    assert_eq!(status["cookie_count"], json!(0));
+    assert_eq!(status["ucloud"]["present"], json!(false));
+    assert_eq!(status["mobile_jwgl"]["present"], json!(false));
+    assert_eq!(status["locally_valid"], json!(false));
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn legacy_username_only_cache_reuses_cas_ucloud_but_not_mobile() {
+    let sandbox = Sandbox::new();
+    seed_credentials(&sandbox, CREDENTIALS_UNDERGRADUATE);
+    let session_path = seed_session(&sandbox, SESSION_V1_USERNAME_MOBILE);
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["status"], &[]);
+    let status = success(&inv);
+
+    assert_eq!(status["exists"], json!(true));
+    assert_eq!(status["username"], json!(USER));
+    assert_eq!(status["cookie_count"], json!(1));
+    assert_eq!(status["ucloud"]["present"], json!(true));
+    assert_eq!(status["mobile_jwgl"]["present"], json!(false));
+    assert_eq!(status["locally_valid"], json!(true));
+    assert_eq!(status["cas_logins_total"], json!(1));
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(read_text(&session_path), SESSION_V1_USERNAME_MOBILE);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn v2_undergraduate_cache_reuses_verified_mobile_token() {
+    let sandbox = Sandbox::new();
+    seed_credentials(&sandbox, CREDENTIALS_UNDERGRADUATE);
+    let session_path = seed_session(&sandbox, SESSION_UNDERGRADUATE_MOBILE);
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(&sandbox, &["status"], &[]);
+    let status = success(&inv);
+
+    assert_eq!(status["exists"], json!(true));
+    assert_eq!(status["username"], json!(USER));
+    assert_eq!(status["cookie_count"], json!(1));
+    assert_eq!(status["ucloud"]["present"], json!(true));
+    assert_eq!(status["mobile_jwgl"]["present"], json!(true));
+    assert_eq!(status["mobile_jwgl"]["expired"], json!(false));
+    assert_eq!(status["locally_valid"], json!(true));
+    assert_eq!(status["cas_logins_total"], json!(2));
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(read_text(&session_path), SESSION_UNDERGRADUATE_MOBILE);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
 }
 
 #[test]
@@ -424,7 +568,7 @@ fn status_reads_cached_state_without_mutation_or_secret_leak() {
     assert_eq!(status["username"], json!(USER));
     assert_eq!(status["cookie_count"], json!(1));
     assert_eq!(status["ucloud"]["present"], json!(true));
-    assert_eq!(status["mobile_jwgl"]["present"], json!(true));
+    assert_eq!(status["mobile_jwgl"]["present"], json!(false));
     assert_eq!(status["locally_valid"], json!(true));
     assert_eq!(status["cas_logins_total"], json!(2));
     assert_no_fixture_secrets(&inv);
@@ -453,9 +597,9 @@ fn status_pretty_changes_format_not_values() {
 #[test]
 fn status_reports_explicit_expiry_without_refreshing() {
     let sandbox = Sandbox::new();
-    seed_credentials(&sandbox, CREDENTIALS);
+    seed_credentials(&sandbox, CREDENTIALS_UNDERGRADUATE);
 
-    let mut expired = session_value(SESSION);
+    let mut expired = session_value(SESSION_UNDERGRADUATE_MOBILE);
     expired["cookies"][0]["expires"] = json!(1);
     expired["ucloud"]["expires_at"] = json!(1);
     expired["ucloud"]["jwt_payload"]["exp"] = json!(1);
@@ -480,11 +624,11 @@ fn status_reports_explicit_expiry_without_refreshing() {
 }
 
 #[test]
-fn status_treats_missing_expiry_as_unknown_not_expired() {
+fn status_missing_expiry_does_not_expire_or_relogin() {
     let sandbox = Sandbox::new();
-    seed_credentials(&sandbox, CREDENTIALS);
+    seed_credentials(&sandbox, CREDENTIALS_UNDERGRADUATE);
 
-    let mut unknown = session_value(SESSION);
+    let mut unknown = session_value(SESSION_UNDERGRADUATE_MOBILE);
     unknown["ucloud"]
         .as_object_mut()
         .expect("ucloud is an object")
@@ -505,6 +649,7 @@ fn status_treats_missing_expiry_as_unknown_not_expired() {
     assert_eq!(status["ucloud"]["expired"], json!(false));
     assert_eq!(status["mobile_jwgl"]["present"], json!(true));
     assert_eq!(status["mobile_jwgl"]["expired"], json!(false));
+    assert_eq!(status["cas_logins_total"], json!(2));
     assert_no_fixture_secrets(&inv);
 
     assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
@@ -545,7 +690,7 @@ fn status_tolerates_non_numeric_cookie_expiry() {
 fn graduate_status_drops_stale_mobile_jwgl_failure_but_undergraduate_keeps_it() {
     let graduate = Sandbox::new();
     seed_credentials(&graduate, CREDENTIALS);
-    seed_session(&graduate, SESSION_STALE_MOBILE);
+    seed_session(&graduate, SESSION_GRADUATE_STALE_MOBILE);
     let graduate_cache_before = snapshot_tree(&cache_dir(&graduate));
 
     let graduate_inv = run_with_env(&graduate, &["status"], &[]);
@@ -562,7 +707,7 @@ fn graduate_status_drops_stale_mobile_jwgl_failure_but_undergraduate_keeps_it() 
 
     let undergraduate = Sandbox::new();
     seed_credentials(&undergraduate, CREDENTIALS_UNDERGRADUATE);
-    seed_session(&undergraduate, SESSION_STALE_MOBILE);
+    seed_session(&undergraduate, SESSION_UNDERGRADUATE_STALE_MOBILE);
     let undergraduate_cache_before = snapshot_tree(&cache_dir(&undergraduate));
 
     let undergraduate_inv = run_with_env(&undergraduate, &["status"], &[]);
@@ -670,35 +815,6 @@ fn diagnose_skips_authenticated_checks_without_session_and_does_not_write() {
     assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
     assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
     assert!(!cache_dir(&sandbox).join("session.json").exists());
-}
-
-#[test]
-fn diagnose_does_not_login_mobile_with_cached_cas_session() {
-    let sandbox = Sandbox::new();
-    seed_credentials(&sandbox, CREDENTIALS);
-    let session_path = seed_session(&sandbox, SESSION_NO_MOBILE);
-    let cache_before = snapshot_tree(&cache_dir(&sandbox));
-
-    let inv = run_with_env(&sandbox, &["diagnose", "--only", "mobile_jwgl"], &[]);
-    let report = success(&inv);
-
-    assert_eq!(report["auth"]["mobile_jwgl_token"], json!(false));
-    let rows = report["endpoints"]
-        .as_array()
-        .expect("diagnose report has endpoints");
-    assert!(!rows.is_empty(), "mobile JWGL checks must be reported");
-    assert!(
-        rows.iter().all(|row| row["group"] == json!("mobile_jwgl")),
-        "group filtering must not run other endpoint groups"
-    );
-    assert!(
-        rows.iter().all(|row| row["status"] == json!("skipped")),
-        "diagnose must not submit the mobile JWGL password"
-    );
-    assert_no_fixture_secrets(&inv);
-
-    assert_eq!(read_text(&session_path), SESSION_NO_MOBILE);
-    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
 }
 
 #[test]

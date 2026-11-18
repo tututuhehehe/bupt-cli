@@ -1,6 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
   "username": "2026000001",
+  "role": "graduate",
   "created_at": "2026-01-01T00:00:00Z",
   "updated_at": "2026-01-02T03:04:05Z",
   "cookies": [
@@ -26,10 +27,6 @@
       "exp": 4102444800,
       "user_id": "42"
     },
-    "expires_at": 4102444800
-  },
-  "mobile_jwgl": {
-    "token": "TEST-ONLY-MOBILE-TOKEN-SECRET-g7h8",
     "expires_at": 4102444800
   },
   "cas_logins_total": 2

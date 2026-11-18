@@ -28,5 +28,9 @@
     },
     "expires_at": 4102444800
   },
-  "cas_logins_total": 3
+  "mobile_jwgl": {
+    "token": "TEST-ONLY-MOBILE-TOKEN-SECRET-g7h8",
+    "expires_at": 4102444800
+  },
+  "cas_logins_total": 1
 }
