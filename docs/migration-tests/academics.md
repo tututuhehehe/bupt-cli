@@ -38,9 +38,12 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `role_guards_only_refuse_graduate_accounts_not_unknown_passwords` | `test_cli_errors.py::test_undergraduate_role_is_not_blocked` | 缺密码时 `exams`（研究生）/`scores`（本科生）都停在 auth，而不是被本科教务守卫误拒；不写 session/cache |
 | `unsupported_role_is_rejected_before_backend_selection` | 合同“登记显式选择的本科/研究生身份” | 未知 role 不被猜测为本科/研究生，命令在选后端前退出 2；不触碰缓存/session |
 
-## 预期红（空实现）
+## 实施状态（本地第一批）
 
-`src/main.rs` 当前只向 stderr 打印 `Rust CLI not implemented; test migration scaffold only` 并退出 78。因此本轮所有用例以“stderr 不是 JSON / 退出码不是 2 或 0”失败；这是缺少 CLI 行为，而不是编译错误。等实现接入后，应按上表逐项转绿。
+- `src/academics.rs` 已实现本地部分：v2 快照归属校验、`schedule` 单日/周/原始查询、`schedule calendar`、`schedule export`（含 ICS 折行和 opener 失败隔离），以及 `scores` / `classrooms` / `exams` 的本地身份与数据源路由校验。
+- 本清单 18 个进程用例全部通过；没有用跳过或假断言绕过尚未接通的远端路径。
+- `schedule update`、本科生 `scores` / `classrooms` / `exams` 和研究生 `exams` 在通过本地校验后返回 upstream pending（退出 5），不访问 transport、校园网或浏览器。对应的成功输出场景仍在下面的暂缓清单中，尚未编译成用例，因此当前也不会以红测出现。
+- 当前过期策略：归属明确且版本兼容的 v2 快照即使已离开教学周，仍会按本地快照返回；不会自动刷新。合同没有明确“过期是提示刷新还是继续读快照”，这里先选择严格离线、显式刷新，需整合者确认后再补跨学期用例。
 
 ## 暂不能黑盒验证的场景与最小测试缝
 
