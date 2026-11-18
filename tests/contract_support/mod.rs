@@ -39,7 +39,12 @@ impl Sandbox {
     }
 
     pub fn run(&self, args: &[&str]) -> Invocation {
-        Invocation(self.command().args(args).output().expect("run isolated CLI"))
+        Invocation(
+            self.command()
+                .args(args)
+                .output()
+                .expect("run isolated CLI"),
+        )
     }
 }
 
