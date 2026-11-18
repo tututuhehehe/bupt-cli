@@ -1,0 +1,8 @@
+{
+  "dorm": {
+    "building": "学一楼",
+    "room": "101",
+    "floor": "1"
+  },
+  "custom_note": "synthetic settings; logout must keep this"
+}
