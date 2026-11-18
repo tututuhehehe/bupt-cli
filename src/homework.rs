@@ -1,3 +1,5 @@
+#[allow(dead_code)] // Exercised by in-process tests; CLI wiring follows the session adapter.
+mod read;
 mod submit;
 
 use crate::cli::{CliError, CliResult, Context, Outcome};

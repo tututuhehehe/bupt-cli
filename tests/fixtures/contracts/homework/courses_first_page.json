@@ -1,0 +1,77 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "course-01",
+                "siteName": "合成课程 01",
+                "teacherName": "合成老师"
+              },
+              {
+                "siteId": "course-02",
+                "siteName": "合成课程 02"
+              },
+              {
+                "siteId": "course-03",
+                "siteName": "合成课程 03"
+              },
+              {
+                "siteId": "course-04",
+                "siteName": "合成课程 04"
+              },
+              {
+                "siteId": "course-05",
+                "siteName": "合成课程 05"
+              },
+              {
+                "siteId": "course-06",
+                "siteName": "合成课程 06"
+              },
+              {
+                "siteId": "course-07",
+                "siteName": "合成课程 07"
+              },
+              {
+                "siteId": "course-08",
+                "siteName": "合成课程 08"
+              },
+              {
+                "siteId": "course-09",
+                "siteName": "合成课程 09"
+              },
+              {
+                "siteId": "course-10",
+                "siteName": "合成课程 10"
+              },
+              {
+                "siteId": "course-11",
+                "siteName": "合成课程 11"
+              }
+            ],
+            "total": 11
+          }
+        }
+      }
+    }
+  ]
+}
