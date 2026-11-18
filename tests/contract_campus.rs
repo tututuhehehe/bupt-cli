@@ -99,8 +99,9 @@ fn assert_no_session_file(sandbox: &Sandbox) {
 }
 
 // ---------------------------------------------------------------------------
-// Library OPAC: anonymous input validation. Upstream parsing is deferred until
-// the integrator agrees on an offline response seam (see migration notes).
+// Library OPAC: anonymous input validation. Response parsing is covered by the
+// in-process Scripted transport tests in src/campus/library.rs; process-level success
+// output still needs an integrator-agreed transport seam (see migration notes).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -570,6 +571,25 @@ fn notices_show_requires_a_url_and_non_negative_max_chars() {
         2,
         "usage",
     );
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
+fn notices_show_rejects_blank_url_before_auth() {
+    let sandbox = Sandbox::new();
+
+    for url in ["", " ", "\t\n"] {
+        let payload = assert_error_with_context(
+            sandbox.run(&["notices", "show", url]),
+            2,
+            "usage",
+            &format!("blank notice URL {url:?}"),
+        );
+        assert!(
+            error_hint(&payload).contains("bupt notices"),
+            "blank URL hint should point at the listing command; stderr={payload}"
+        );
+    }
     assert_no_session_file(&sandbox);
 }
 
