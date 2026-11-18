@@ -43,17 +43,29 @@
 | 不把源码文件当作可卸载二进制（Unix 可执行位） | `test_uninstall_never_targets_source_files` | `uninstall_does_not_delete_a_source_file_named_like_the_binary` |
 | `update` 的帮助保留 `--check` / `--repo OWNER/REPO` | `cli.build_parser` | `update_help_documents_check_and_repo_inputs` |
 | `update` 的仓库输入在联网前校验；非法参数不落盘 | 合同“非法参数在…联网前拒绝”；`--repo` 的 `OWNER/REPO` 形态 | `update_rejects_invalid_inputs_before_release_access` |
+| `update --check` 用 GET `/releases/latest` 且不跟随重定向；字段和退出信封沿用 Python | `_release_tag`、`test_update_uses_release_redirect_not_the_api`、`test_release_tag_reads_the_redirect` | `update_check_reports_a_newer_release_without_side_effects` |
+| 无 release 是成功结果：`latest=null`、`update_available=false`、有说明 | `test_update_reports_missing_release` | `update_check_reports_missing_release_and_no_upgrade` |
+| 只接受同一仓库 `releases/tag/<tag>` 的 HTTPS Location；外来主机、其他仓库、畸形重定向失败关闭 | 合同“校验重定向目标不扩大访问范围” | `release_location_must_name_the_same_repository_tag`、`update_check_rejects_a_foreign_redirect` |
+| 版本按数字段比较，旧 tag/等版本不算升级 | Python `_versions_tuple` | `version_ordering_does_not_promote_older_tags`、`update_check_reports_missing_release_and_no_upgrade` |
+| release 检查区分传输失败=4 network、HTTP=5 upstream、401/403=3 auth，且零文件副作用 | 合同错误分层；`from_campus_error` | `release_check_layers_transport_and_http_failures`、`update_check_reports_a_newer_release_without_side_effects` |
+| 生产 `Offline` transport 下运行时 `update --check` 明确为 network=4，不写状态 | 合同“runtime check blocked on scoped production transport” | `update_check_is_blocked_without_a_scoped_production_transport` |
+| 默认 `update`（无 `--check`）仍 pending，不联网、不写文件 | 合同“apply remains pending” | `apply_update_remains_pending_without_network_or_files` |
 
-## 第一批实现（本地路径）
+## 实现（离线与本地路径）
 
 实现文件：`src/lifecycle.rs`。只使用临时目录、合成 JSON 和假发行物名；没有联网，没有扫描或删除真实安装，也没有执行真实的 `update`。
 
 ### `update`
 
 - `--check` / `--repo OWNER/REPO` 保留；`--repo` 只接受严格的 `OWNER/REPO`，URL、空值、额外路径段在联网和写状态前以 usage（退出 2）拒绝。
+- `--check` 通过注入的 `Transport` 发起一次 `GET https://github.com/OWNER/REPO/releases/latest`，带 `User-Agent: bupt-cli`；不跟随重定向，不访问 `api.github.com`，不下载 asset。
+- 只有 301/302/303/307/308 且 `Location` 是同一仓库的 `https://github.com/OWNER/REPO/releases/tag/<tag>` 才接受；主机、仓库或路径不符、query/fragment、额外路径段、缺失 Location 都以 upstream（退出 5）失败关闭。`<tag> == latest` 保留 Python 的“无版本号”成功结果。
+- 成功字段沿用 Python：`current`、`repo`、`latest`（去掉前导 `v`）、`update_available`、`note`。`current` 取编译时的 `CARGO_PKG_VERSION`（当前迁移包为 `0.0.0`），不硬编码 Python 的 `__version__`。无 release（404 且无有效 Location）是成功结果（`update_available=false`），不是错误。
+- 版本比较只取前三个数字段，并按 Python 的短元组规则比较，`1.10.0 > 1.9.0`；相等或更旧的 tag 不报告升级。
+- 错误分层：传输失败=4 network；401/403=3 auth；其他 HTTP 状态和畸形/外来重定向=5 upstream。检查不写 config/cache/暂存文件。
 - 发行物按平台选择：macOS Apple Silicon 用 `bupt-macos-arm64.zip`，Windows x64 用 `bupt-windows-x64.zip`。Windows 名称沿用 macOS 的命名习惯，发布工作流尚未确认；这是需要整合者确认的歧义点，目前只用单元测试固定选择逻辑。
 - 更新目标只从当前正在运行的、已验证的可执行文件取得，不依赖 Python 的 `sys.frozen` 语义。
-- release 检查、下载、完整性校验、备份替换和 Windows 运行中 `.exe` 替换仍待实现。当前合法输入返回明确的 upstream（退出 5）待实现错误，不发起请求、不创建暂存文件，也不声称已检查或已更新。
+- 下载、完整性校验、备份替换、Windows 运行中 `.exe` 替换和实机 runtime check 仍待实现；生产 `Offline` transport 下运行时 `update --check` 会在联网前返回 network（退出 4）。默认 `update`（无 `--check`）保持原有 pending 行为，不联网、不写文件。
 
 ### `uninstall`
 
@@ -68,28 +80,24 @@
 
 ```sh
 cargo test --locked --offline --lib
-# 17 passed
+# 82 passed（lifecycle::tests 23 个）
 
 cargo test --locked --offline --test contract_lifecycle
-# 20 passed; 3 failed
+# 24 passed; 0 failed
 ```
 
-新增/相关的单元用例：`repo_must_be_owner_slash_repo`、`release_assets_are_selected_per_supported_platform`、`only_a_regular_bupt_executable_is_a_target`、`removal_plans_only_the_given_executable`、`dry_run_plans_without_removing_the_executable`、`owned_data_requires_recognized_payloads`、`timetable_ownership_requires_known_shape`、`logged_out_credentials_remain_recognizable`、`dry_run_keeps_the_vetted_directory`、`mixed_directory_is_rejected_before_removal`、`late_unknown_file_survives_execution`、`changed_owned_file_survives_execution`、`replaced_directory_survives_execution`、`uninstall_note_distinguishes_completion_from_skips_and_keep_data`、`dangerous_roots_are_refused_without_following_aliases`。
+新增/相关的单元用例：`repo_must_be_owner_slash_repo`、`release_assets_are_selected_per_supported_platform`、`only_a_regular_bupt_executable_is_a_target`、`removal_plans_only_the_given_executable`、`dry_run_plans_without_removing_the_executable`、`owned_data_requires_recognized_payloads`、`timetable_ownership_requires_known_shape`、`logged_out_credentials_remain_recognizable`、`dry_run_keeps_the_vetted_directory`、`mixed_directory_is_rejected_before_removal`、`late_unknown_file_survives_execution`、`changed_owned_file_survives_execution`、`replaced_directory_survives_execution`、`uninstall_note_distinguishes_completion_from_skips_and_keep_data`、`dangerous_roots_are_refused_without_following_aliases`、`update_check_reports_a_newer_release_without_side_effects`、`update_check_reports_missing_release_and_no_upgrade`、`update_check_reports_a_redirect_without_a_version`、`release_location_must_name_the_same_repository_tag`、`update_check_rejects_a_foreign_redirect`、`release_check_layers_transport_and_http_failures`、`version_ordering_does_not_promote_older_tags`、`apply_update_remains_pending_without_network_or_files`。
 
-仍失败的 lane 用例都属于其他功能线尚未接入，不是本 lane 的断言变化：
-
-- `status_is_one_compact_json_document_with_schema`：identity 的 `status` 仍是 `CliError::pending()`。
-- `pretty_changes_layout_without_changing_values`：该用例通过 `status` 取成功 JSON；identity 尚未实现。
-- `homework_uses_the_canonical_default_entry`：homework/identity 尚未实现鉴权路径，目前退出 5 而不是 3。
+此前因 identity / homework 尚未接入而失败的三条 lane 用例（`status_is_one_compact_json_document_with_schema`、`pretty_changes_layout_without_changing_values`、`homework_uses_the_canonical_default_entry`）在当前基线已通过；本轮 lane 合同测试全绿。
 
 ## 暂不能离线验证（需要已约定的测试缝）
 
 以下场景仍未完成或需要整合者先确定最小测试缝，不能用假断言或猜测内部 API 代替。网络、真实 GitHub、真实已安装二进制和真实更新动作均不进入本轮测试。
 
-1. **release 检查（暂缓）**
+1. **release 检查：离线已覆盖，真实 GitHub 未验收**
    - Python：`_release_tag`、`test_update_uses_release_redirect_not_the_api`、`test_release_tag_reads_the_redirect`、`test_update_reports_missing_release`。
-   - 缺口：需要可注入的 release 元数据/重定向解析器，或只读的本地 release 夹具源；不得访问 `github.com` / `api.github.com`。
-   - 待验证：从 `/releases/latest` 形态读取 tag；无 release 时 `latest=null`、`update_available=false`、有说明；检查失败时是 network 错误且不破坏本地状态；不依赖 API token。
+   - 已覆盖：注入 `Transport`/`Scripted` 下的 GET、不跟随重定向、同仓库 tag 路径校验、无 release、畸形/外来重定向、版本边界、network/upstream/auth 分层和零文件副作用。
+   - 仍缺：scoped production transport 和真实 GitHub 的 runtime check。当前生产入口仍用 `Offline`，运行时 `update --check` 直接返回 network（退出 4），不得把离线用例当作线上验收。
 
 2. **更新 staging / 原子替换 / 失败回滚（暂缓）**
    - Python：`cmd_update`、`test_update_replaces_a_frozen_binary`、`test_update_install_path_from_source_is_honest`；`build.sh` 的“先打包到 staging、冒烟、再原子替换，失败不覆盖旧二进制”。
@@ -103,8 +111,8 @@ cargo test --locked --offline --test contract_lifecycle
 
 3. **`update` 的网络/上游错误分层**
    - Python：`from_campus_error`、`test_http_status_network_error_maps_upstream`、`test_http_401_network_error_maps_auth`（同属错误合同）。
-   - 缺口：可注入的传输层错误或本地假响应；不能用真实校外网络。
-   - 待验证：超时/断网=4 network，HTTP 4xx/5xx 上游=5 upstream，401/403=auth=3；无论哪层都只产生一个 stderr JSON，stdout 为空。
+   - release 检查已用可注入传输覆盖：传输失败=4 network，其他 HTTP 4xx/5xx=5 upstream，401/403=3 auth；错误路径只产生一个 stderr JSON、stdout 为空，成功路径只写 stdout JSON。
+   - 仍缺：真实校外网络下的超时/断网和 scoped production transport 验收；不能用真实网络假装通过。
 
 4. **凭据脱敏覆盖**
    - Python：`test_cli_error_messages_are_redacted`。
@@ -116,8 +124,9 @@ cargo test --locked --offline --test contract_lifecycle
    - 若后续改为扫描 PATH/CWD，必须把被拒绝的候选放进 `skipped`，并重新审视“只作用于获准目标”的合同。
 
 6. **在线更新与 Windows swap（暂缓、待实测）**
-   - 真实 GitHub release 检查、asset 下载、在线更新和 Windows 原位替换/运行中文件锁行为均未在本轮运行；不得用 live network/publish 假装通过。Windows 上的运行中 `.exe` 移除/替换仍只报告 skipped；下载和远端替换仍未实现、未声称完成。
-   - macOS Apple Silicon 与 Windows x64 的真实 release 可执行文件、权限位、替换行为和 `--version` 冒烟测试需要两个平台的实际运行。
+   - `update --check` 的协议逻辑已离线覆盖，但生产 `Offline` transport 尚未接入 scoped production transport：运行时 check 仍被阻断为 network（退出 4），真实 GitHub 检查未验收。
+   - asset 下载、在线更新和 Windows 原位替换/运行中文件锁行为均未在本轮运行；不得用 live network/publish 假装通过。Windows 上的运行中 `.exe` 移除/替换仍只报告 skipped；下载和远端替换仍未实现、未声称完成。
+   - macOS Apple Silicon 与 Windows x64 的真实 release 可执行文件、权限位、替换行为和 `--version` 冒烟测试需要两个平台的实际运行；Windows 替换和 runtime check 都阻塞在 scoped production transport 上。
 
 ## 历史红测记录
 

@@ -968,3 +968,16 @@ fn update_rejects_invalid_inputs_before_release_access() {
         tree(sandbox.root())
     );
 }
+
+#[test]
+fn update_check_is_blocked_without_a_scoped_production_transport() {
+    let sandbox = Sandbox::new();
+
+    let inv = sandbox.run(&["update", "--check", "--repo", "owner/repo"]);
+    assert_error_json(&inv, 4, "network");
+    assert!(
+        tree(sandbox.root()).is_empty(),
+        "a blocked release check must not create state or stage files: {:?}",
+        tree(sandbox.root())
+    );
+}
