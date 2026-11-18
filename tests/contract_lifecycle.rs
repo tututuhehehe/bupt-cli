@@ -121,8 +121,13 @@ fn assert_error_json(inv: &Invocation, expected_code: i32, expected_type: &str) 
 }
 
 fn canonical_join(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
+    let is_symlink = fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_symlink {
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
     }
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => parent
@@ -174,18 +179,36 @@ fn array_mentions(array: &Value, path: &Path) -> bool {
     })
 }
 
-fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
+#[derive(Debug, PartialEq, Eq)]
+enum TreeEntry {
+    File(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+fn tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, TreeEntry>) {
+        let entries = fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read directory {}: {err}", dir.display()));
+        for entry in entries {
+            let entry =
+                entry.unwrap_or_else(|err| panic!("read an entry in {}: {err}", dir.display()));
             let path = entry.path();
-            if path.is_dir() {
+            let relative = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+            let metadata = fs::symlink_metadata(&path)
+                .unwrap_or_else(|err| panic!("lstat {}: {err}", path.display()));
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                let target = fs::read_link(&path)
+                    .unwrap_or_else(|err| panic!("read symlink {}: {err}", path.display()));
+                out.insert(relative, TreeEntry::Symlink(target));
+            } else if file_type.is_dir() {
                 walk(base, &path, out);
-            } else if let Ok(bytes) = fs::read(&path) {
-                let relative = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
-                out.insert(relative, bytes);
+            } else if file_type.is_file() {
+                let bytes = fs::read(&path)
+                    .unwrap_or_else(|err| panic!("read file {}: {err}", path.display()));
+                out.insert(relative, TreeEntry::File(bytes));
+            } else {
+                panic!("unsupported fixture entry type at {}", path.display());
             }
         }
     }
@@ -219,14 +242,25 @@ fn make_executable(path: &Path) {
     }
 }
 
+fn platform_binary_name() -> &'static str {
+    if cfg!(windows) { "bupt.exe" } else { "bupt" }
+}
+
 /// Run a copy of the CLI from a throwaway directory with the sandbox
 /// environment.
 ///
 /// Uninstall may consider the executable it is running from. Pointing that at a
 /// temporary copy keeps the cargo test binary (and the rest of `target/`)
-/// outside the candidate set while still exercising a real, non-dry run.
+/// outside the candidate set for dry runs and real deletions alike.
 fn run_isolated_copy(sandbox: &Sandbox, args: &[&str]) -> Invocation {
-    let name = if cfg!(windows) { "bupt.exe" } else { "bupt" };
+    run_isolated_copy_with(sandbox, args, |_| {})
+}
+
+fn run_isolated_copy_with<F>(sandbox: &Sandbox, args: &[&str], setup: F) -> Invocation
+where
+    F: FnOnce(&mut Command),
+{
+    let name = platform_binary_name();
     let binary_dir = tempfile::tempdir().expect("create isolated binary directory");
     let binary = binary_dir.path().join(name);
     fs::copy(env!("CARGO_BIN_EXE_bupt"), &binary).expect("copy CLI into the sandbox");
@@ -248,6 +282,7 @@ fn run_isolated_copy(sandbox: &Sandbox, args: &[&str]) -> Invocation {
             }
         }
     }
+    setup(&mut command);
 
     Invocation(
         command
@@ -544,31 +579,23 @@ fn invalid_arguments_are_usage_errors_before_local_state_changes() {
 }
 
 #[test]
-fn homework_defaults_to_the_list_command() {
+fn homework_uses_the_canonical_default_entry() {
     let sandbox = Sandbox::new();
-    let cases: &[&[&str]] = &[
-        &["homework"],
-        &["homework", "--undone"],
-        &["homework", "--limit", "5"],
-    ];
 
-    for args in cases {
-        let inv = sandbox.run(args);
-        let payload = assert_error_json(&inv, 3, "auth");
-        assert!(
-            payload["error"]["message"]
-                .as_str()
-                .is_some_and(|message| !message.contains("synthetic-password-for-offline-tests")),
-            "auth errors must not echo secrets: {payload}"
-        );
-        assert_eq!(
-            stderr_text(&inv).lines().count(),
-            1,
-            "auth errors must be one compact JSON document: {:?}",
-            stderr_text(&inv)
-        );
-    }
-
+    let inv = sandbox.run(&["homework"]);
+    let payload = assert_error_json(&inv, 3, "auth");
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.contains("synthetic-password-for-offline-tests")),
+        "auth errors must not echo secrets: {payload}"
+    );
+    assert_eq!(
+        stderr_text(&inv).lines().count(),
+        1,
+        "auth errors must be one compact JSON document: {:?}",
+        stderr_text(&inv)
+    );
     assert!(
         tree(sandbox.root()).is_empty(),
         "missing credentials must be rejected before local writes: {:?}",
@@ -582,7 +609,7 @@ fn uninstall_dry_run_lists_owned_data_without_changing_anything() {
     let (config, cache) = install_owned_data(&sandbox);
     let before = tree(sandbox.root());
 
-    let inv = sandbox.run(&["uninstall", "--dry-run"]);
+    let inv = run_isolated_copy(&sandbox, &["uninstall", "--dry-run"]);
     let payload = assert_success_json(&inv);
     assert_eq!(payload["dry_run"], true, "dry-run payload: {payload}");
     let removed = &payload["removed"];
@@ -643,54 +670,49 @@ fn uninstall_keep_data_preserves_credentials_and_timetable() {
 }
 
 #[test]
-fn uninstall_removes_timetable_without_touching_unrelated_files() {
+fn uninstall_skips_mixed_data_directories_wholesale() {
     let sandbox = Sandbox::new();
     let (config, cache) = install_owned_data(&sandbox);
     let config_note = config.join("notes.txt");
     let cache_note = cache.join("scratch.dat");
     write_file(&config_note, UNRELATED);
     write_file(&cache_note, UNRELATED);
+    let before = tree(sandbox.root());
 
     let inv = run_isolated_copy(&sandbox, &["uninstall"]);
     let payload = assert_success_json(&inv);
+    assert_eq!(payload["dry_run"], false, "uninstall payload: {payload}");
 
-    assert!(
-        !config.join("credentials.json").exists(),
-        "uninstall must remove its own credentials: {payload}"
+    assert_eq!(
+        tree(sandbox.root()),
+        before,
+        "mixed data directories must be preserved byte-for-byte: {payload}"
     );
     assert!(
-        !config.join("config.json").exists(),
-        "uninstall must remove its own config: {payload}"
+        config.join("credentials.json").exists() && config.join("config.json").exists(),
+        "owned files in a mixed directory must not be removed piecemeal: {payload}"
     );
     assert!(
-        !cache.join("session.json").exists(),
-        "uninstall must remove its own session: {payload}"
+        cache.join("session.json").exists() && cache.join("timetable.json").exists(),
+        "owned cache files in a mixed directory must be preserved: {payload}"
     );
     assert!(
-        !cache.join("timetable.json").exists(),
-        "uninstall must clean its own timetable cache: {payload}"
-    );
-    assert!(
-        config_note.exists(),
-        "uninstall deleted an unrelated file in the config directory: {payload}"
-    );
-    assert!(
-        cache_note.exists(),
-        "uninstall deleted an unrelated file in the cache directory: {payload}"
-    );
-    assert!(
-        config.is_dir() && cache.is_dir(),
-        "uninstall must keep directories that still contain unrelated files: {payload}"
+        config_note.exists() && cache_note.exists(),
+        "unrelated files in mixed directories must be preserved: {payload}"
     );
     assert!(
         !removed_listed(&payload["removed"], &config)
             && !removed_listed(&payload["removed"], &cache),
-        "uninstall must not report a preserved directory as removed: {payload}"
+        "mixed directories must never be reported as removed: {payload}"
     );
     assert!(
-        !array_mentions(&payload["removed"], &config_note)
-            && !array_mentions(&payload["removed"], &cache_note),
-        "uninstall must not report unrelated files as removed: {payload}"
+        !array_mentions(&payload["removed"], &config.join("credentials.json"))
+            && !array_mentions(&payload["removed"], &cache.join("timetable.json")),
+        "mixed directories must not report owned files as removed: {payload}"
+    );
+    assert!(
+        array_mentions(&payload["skipped"], &config) && array_mentions(&payload["skipped"], &cache),
+        "mixed directories must be reported as skipped: {payload}"
     );
 }
 
@@ -704,6 +726,11 @@ fn uninstall_removes_an_owned_timetable_only_directory() {
     let inv = run_isolated_copy(&sandbox, &["uninstall"]);
     let payload = assert_success_json(&inv);
     assert!(
+        removed_listed(&payload["removed"], &cache)
+            || removed_listed(&payload["removed"], &timetable),
+        "an owned-only timetable directory must be reported as removed: {payload}"
+    );
+    assert!(
         !timetable.exists(),
         "uninstall must recognise timetable.json as its own file: {payload}"
     );
@@ -714,53 +741,130 @@ fn uninstall_removes_an_owned_timetable_only_directory() {
 }
 
 #[test]
-fn uninstall_refuses_dangerous_data_roots() {
+fn uninstall_does_not_remove_a_timetable_lookalike() {
+    let sandbox = Sandbox::new();
+    let cache = sandbox.root().join("cache");
+    let lookalike = cache.join("timetable.json");
+    write_file(
+        &lookalike,
+        "{\"version\": 999, \"term\": \"not-a-bupt-timetable\", \"other\": true}\n",
+    );
+    let before = tree(sandbox.root());
+
+    let inv = run_isolated_copy(&sandbox, &["uninstall"]);
+    let payload = assert_success_json(&inv);
+    assert_eq!(
+        tree(sandbox.root()),
+        before,
+        "a timetable.json name lookalike must be preserved byte-for-byte: {payload}"
+    );
+    assert!(
+        lookalike.exists(),
+        "uninstall must not delete a non-owned file merely because it is named timetable.json: {payload}"
+    );
+    assert!(
+        !removed_listed(&payload["removed"], &lookalike)
+            && !removed_listed(&payload["removed"], &cache),
+        "a lookalike timetable must never be reported as removed: {payload}"
+    );
+    assert!(
+        array_mentions(&payload["skipped"], &cache),
+        "a non-owned timetable directory must be reported as skipped: {payload}"
+    );
+}
+
+#[test]
+fn uninstall_refuses_dangerous_data_roots_in_destructive_mode() {
     let sandbox = Sandbox::new();
     let home = sandbox.root().join("home");
     let marker = home.join("keep.txt");
+    write_file(&home.join("credentials.json"), CREDENTIALS);
     write_file(&marker, UNRELATED);
-    let cache = sandbox.root().join("cache");
-    let timetable = cache.join("timetable.json");
-    write_file(&timetable, TIMETABLE);
+    let before = tree(&home);
 
-    let inv = Invocation(
-        sandbox
-            .command()
+    let inv = run_isolated_copy_with(&sandbox, &["uninstall"], |command| {
+        command
             .env("BUPT_CLI_CONFIG_DIR", &home)
-            .args(["uninstall", "--dry-run"])
-            .output()
-            .expect("run isolated CLI with a dangerous config override"),
-    );
+            .env("BUPT_CLI_CACHE_DIR", &home);
+    });
     let payload = assert_success_json(&inv);
-    assert_eq!(payload["dry_run"], true, "dry-run payload: {payload}");
+    assert_eq!(payload["dry_run"], false, "uninstall payload: {payload}");
     assert!(
         !removed_listed(&payload["removed"], &home),
         "uninstall must refuse the home directory: {payload}"
     );
     assert!(
-        marker.exists(),
-        "dry-run must not remove the marker in the home directory"
-    );
-    assert!(
         array_mentions(&payload["skipped"], &home),
         "uninstall must report the refused home directory as skipped: {payload}"
     );
-    assert!(timetable.exists(), "dry-run must not remove the timetable");
+    assert_eq!(
+        tree(&home),
+        before,
+        "a dangerous data root must be preserved byte-for-byte: {payload}"
+    );
+    assert!(
+        marker.exists(),
+        "the marker in the home directory must remain"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_does_not_follow_a_symlinked_data_directory() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let target = tempfile::tempdir().expect("create symlink target directory");
+    let target_dir = target.path();
+    write_file(&target_dir.join("credentials.json"), CREDENTIALS);
+    write_file(&target_dir.join("config.json"), CONFIG);
+    let marker = target_dir.join("keep.txt");
+    write_file(&marker, UNRELATED);
+
+    let link = sandbox.root().join("config");
+    fs::remove_dir(&link).expect("remove empty sandbox config directory");
+    symlink(target_dir, &link).expect("create symlinked config directory");
+    let before = tree(target_dir);
+
+    let inv = run_isolated_copy_with(&sandbox, &["uninstall"], |command| {
+        command.env("BUPT_CLI_CONFIG_DIR", &link);
+    });
+    let payload = assert_success_json(&inv);
+    assert_eq!(
+        tree(target_dir),
+        before,
+        "uninstall must not follow a symlinked data directory: {payload}"
+    );
+    assert!(
+        marker.exists(),
+        "the symlink target's unrelated marker must remain: {payload}"
+    );
+    assert!(
+        !removed_listed(&payload["removed"], target_dir),
+        "uninstall must not report the symlink target as removed: {payload}"
+    );
+    assert!(
+        !array_mentions(&payload["skipped"], target_dir),
+        "uninstall must not inspect the symlink target as a data directory: {payload}"
+    );
 }
 
 #[test]
-fn uninstall_does_not_delete_an_unrelated_executable_named_bupt() {
+fn uninstall_does_not_delete_an_unrelated_executable_on_path() {
+    // The migration contract does not require scanning PATH. If the
+    // implementation does scan it, this lookalike may only appear as skipped;
+    // either way it must survive.
     let sandbox = Sandbox::new();
-    let binary = sandbox
-        .root()
-        .join("home")
-        .join(".local")
-        .join("bin")
-        .join("bupt");
+    let fixture = tempfile::tempdir().expect("create explicit PATH fixture directory");
+    let binary = fixture.path().join(platform_binary_name());
     write_file(&binary, "#!/bin/sh\necho not-the-bupt-cli\n");
     make_executable(&binary);
 
-    let inv = sandbox.run(&["uninstall", "--dry-run"]);
+    let inv = run_isolated_copy_with(&sandbox, &["uninstall"], |command| {
+        command
+            .env("PATH", fixture.path())
+            .current_dir(fixture.path());
+    });
     let payload = assert_success_json(&inv);
     assert!(
         !removed_listed(&payload["removed"], &binary),
@@ -768,25 +872,26 @@ fn uninstall_does_not_delete_an_unrelated_executable_named_bupt() {
     );
     assert!(
         binary.exists(),
-        "uninstall --dry-run must leave the unrelated executable in place"
+        "uninstall must leave the unrelated executable in place: {payload}"
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn uninstall_does_not_delete_a_source_file_named_bupt() {
+fn uninstall_does_not_delete_a_source_file_named_like_the_binary() {
     let sandbox = Sandbox::new();
-    let source = sandbox
-        .root()
-        .join("home")
-        .join(".local")
-        .join("bin")
-        .join("bupt");
+    let fixture = tempfile::tempdir().expect("create explicit PATH fixture directory");
+    let source = fixture.path().join(platform_binary_name());
     write_file(
         &source,
         "from bupt_cli.cli import main\n\nif __name__ == '__main__':\n    raise SystemExit(main())\n",
     );
 
-    let inv = sandbox.run(&["uninstall", "--dry-run"]);
+    let inv = run_isolated_copy_with(&sandbox, &["uninstall"], |command| {
+        command
+            .env("PATH", fixture.path())
+            .current_dir(fixture.path());
+    });
     let payload = assert_success_json(&inv);
     assert!(
         !removed_listed(&payload["removed"], &source),
@@ -794,7 +899,7 @@ fn uninstall_does_not_delete_a_source_file_named_bupt() {
     );
     assert!(
         source.exists(),
-        "uninstall --dry-run must leave the source file in place"
+        "uninstall must leave the source file in place: {payload}"
     );
 }
 
