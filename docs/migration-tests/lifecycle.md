@@ -42,16 +42,52 @@
 | `update` 的帮助保留 `--check` / `--repo OWNER/REPO` | `cli.build_parser` | `update_help_documents_check_and_repo_inputs` |
 | `update` 的仓库输入在联网前校验；非法参数不落盘 | 合同“非法参数在…联网前拒绝”；`--repo` 的 `OWNER/REPO` 形态 | `update_rejects_invalid_inputs_before_release_access` |
 
+## 第一批实现（本地路径）
+
+实现文件：`src/lifecycle.rs`。只使用临时目录、合成 JSON 和假发行物名；没有联网，没有扫描或删除真实安装，也没有执行真实的 `update`。
+
+### `update`
+
+- `--check` / `--repo OWNER/REPO` 保留；`--repo` 只接受严格的 `OWNER/REPO`，URL、空值、额外路径段在联网和写状态前以 usage（退出 2）拒绝。
+- 发行物按平台选择：macOS Apple Silicon 用 `bupt-macos-arm64.zip`，Windows x64 用 `bupt-windows-x64.zip`。Windows 名称沿用 macOS 的命名习惯，发布工作流尚未确认；这是需要整合者确认的歧义点，目前只用单元测试固定选择逻辑。
+- 更新目标只从当前正在运行的、已验证的可执行文件取得，不依赖 Python 的 `sys.frozen` 语义。
+- release 检查、下载、完整性校验、备份替换和 Windows 运行中 `.exe` 替换仍待实现。当前合法输入返回明确的 upstream（退出 5）待实现错误，不发起请求、不创建暂存文件，也不声称已检查或已更新。
+
+### `uninstall`
+
+- 可执行文件候选只有当前正在运行的 `bupt` / `bupt.exe`：必须是普通文件、非空、文件名匹配且（Unix）有执行位。不扫描 PATH，不删除其他同名条目，不把源码文件当作二进制。
+- 数据目录逐目录规划：符号链接、危险根（根目录、HOME 或其上级、当前目录或其上级）、`--keep-data`、未知/混合/不可验证内容，全部记为 skipped，不做部分删除。
+- 只有目录内所有文件都可识别为自己的 JSON（`credentials.json`、`session.json`、`config.json`、`timetable.json`，且内容形态匹配）时才整体删除。`timetable.json` 使用 `version` 1/2、`courses` 数组和 `calendar` 对象识别；同名但内容不符的 lookalike 会跳过。
+- `--dry-run` 只生成计划，不删除可执行文件或数据；`--keep-data` 保留数据目录但移除当前可执行文件（Unix）。Windows 运行中 `.exe` 的移除/替换仍待实现，明确报告为 skipped，不报告为 removed。
+
+### 本轮测试结果
+
+```sh
+cargo test --locked --offline --lib
+# 10 passed
+
+cargo test --locked --offline --test contract_lifecycle
+# 20 passed; 3 failed
+```
+
+新增/相关的单元用例：`repo_must_be_owner_slash_repo`、`release_assets_are_selected_per_supported_platform`、`only_a_regular_bupt_executable_is_a_target`、`removal_plans_only_the_given_executable`、`dry_run_plans_without_removing_the_executable`、`owned_data_requires_recognized_payloads`、`logged_out_credentials_remain_recognizable`、`dangerous_roots_are_refused_without_following_aliases`。
+
+仍失败的 lane 用例都属于其他功能线尚未接入，不是本 lane 的断言变化：
+
+- `status_is_one_compact_json_document_with_schema`：identity 的 `status` 仍是 `CliError::pending()`。
+- `pretty_changes_layout_without_changing_values`：该用例通过 `status` 取成功 JSON；identity 尚未实现。
+- `homework_uses_the_canonical_default_entry`：homework/identity 尚未实现鉴权路径，目前退出 5 而不是 3。
+
 ## 暂不能离线验证（需要已约定的测试缝）
 
-以下场景需要整合者先确定最小测试缝，不能用假断言或猜测内部 API 代替。网络、真实 GitHub、真实已安装二进制和真实更新动作均不进入本轮测试。
+以下场景仍未完成或需要整合者先确定最小测试缝，不能用假断言或猜测内部 API 代替。网络、真实 GitHub、真实已安装二进制和真实更新动作均不进入本轮测试。
 
-1. **release 检查**
+1. **release 检查（暂缓）**
    - Python：`_release_tag`、`test_update_uses_release_redirect_not_the_api`、`test_release_tag_reads_the_redirect`、`test_update_reports_missing_release`。
    - 缺口：需要可注入的 release 元数据/重定向解析器，或只读的本地 release 夹具源；不得访问 `github.com` / `api.github.com`。
    - 待验证：从 `/releases/latest` 形态读取 tag；无 release 时 `latest=null`、`update_available=false`、有说明；检查失败时是 network 错误且不破坏本地状态；不依赖 API token。
 
-2. **更新 staging / 原子替换 / 失败回滚**
+2. **更新 staging / 原子替换 / 失败回滚（暂缓）**
    - Python：`cmd_update`、`test_update_replaces_a_frozen_binary`、`test_update_install_path_from_source_is_honest`；`build.sh` 的“先打包到 staging、冒烟、再原子替换，失败不覆盖旧二进制”。
    - 缺口：需要可注入的 asset 字节和安装目标路径；目标必须是临时夹具，不能碰真实 `bupt`。native Rust 二进制的安装形态由实现显式判定，不把 Python 的 `sys.frozen` 语义当作公共前提。
    - 待验证：
@@ -72,30 +108,26 @@
    - 待验证：合成密码出现在上游错误文本里时被替换为 `[REDACTED]`；日志、help 和错误信封不携带秘密。
 
 5. **卸载的 PATH/CWD 扫描范围**
-   - 当前用例把无关可执行文件/源码放在显式临时 `PATH` 与 CWD，并断言它不会被删除。
-   - 如果最终实现选择扫描 PATH/CWD，它必须把被拒绝的候选放进 `skipped`；如果确定不扫描，则此用例只证明“不会误删”，扫描范围需在实现合同里写清。
+   - 当前实现明确不扫描 `PATH`/CWD；只把当前正在运行的已验证可执行文件作为候选。用例把无关可执行文件/源码放在显式临时 `PATH` 与 CWD，并断言它不会被删除。
+   - 若后续改为扫描 PATH/CWD，必须把被拒绝的候选放进 `skipped`，并重新审视“只作用于获准目标”的合同。
 
-6. **在线更新与 Windows swap（待实测）**
+6. **在线更新与 Windows swap（暂缓、待实测）**
    - 真实 GitHub release 检查、asset 下载、在线更新和 Windows 原位替换/运行中文件锁行为均未在本轮运行；不得用 live network/publish 假装通过。
    - macOS Apple Silicon 与 Windows x64 的真实 release 可执行文件、权限位、替换行为和 `--version` 冒烟测试需要两个平台的实际运行。
 
-## 红测记录
+## 历史红测记录
 
-```sh
-cargo test --offline --test contract_lifecycle -- --test-threads=1
-```
-
-结果：`0 passed; 23 failed`。全部失败都停在共享夹具启动的二进制：
+测试迁移阶段的 23 个用例曾在脚手架 `src/main.rs` 上全部失败，失败统一为：
 
 ```text
 unexpected exit code; stdout=""; stderr="Rust CLI not implemented; test migration scaffold only\n"
 left: 78
 ```
 
-这是预期的红测：`src/main.rs` 仍是空实现，尚未进入任何命令解析、JSON 信封或卸载逻辑；没有网络调用、没有删除真实程序、没有读取个人凭据。
+现在 lifecycle 的本地实现已接入，上述失败只剩其他功能线的待接用例（见“本轮测试结果”）。
 
 ## 格式与编译
 
-- `cargo test --offline --test contract_lifecycle --no-run`：通过。
-- 本 lane 的 scoped 格式检查：`cargo fmt --check -- --config skip_children=true` 通过。
-- 共享 `tests/contract_support/mod.rs` 不在本 lane 的写入范围，保持未修改；其 rustfmt 收口归整合分支。若本地 worktree 尚未带上整合分支的格式修复，plain `cargo fmt --check` 仍可能报告该共享文件。
+- `cargo test --locked --offline --test contract_lifecycle --no-run`：通过。
+- `cargo fmt --check` 通过（基线已包含共享 harness 的格式修复）。
+- 共享 `tests/contract_support/mod.rs`、`Cargo.toml`、`Cargo.lock`、`src/cli.rs`、`src/transport.rs` 均未修改。
