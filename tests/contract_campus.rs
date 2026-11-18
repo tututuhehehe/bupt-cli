@@ -192,8 +192,9 @@ fn library_rejects_invalid_pagination() {
 }
 
 // ---------------------------------------------------------------------------
-// Electricity: local precedence and validation. A successful meter query and
-// the exact upstream request shape need the shared offline transport seam.
+// Electricity: local precedence and validation. Response/request mapping is
+// covered by Scripted tests in src/campus/electricity.rs; full CLI success
+// still needs the session/room resolver.
 // ---------------------------------------------------------------------------
 
 #[test]

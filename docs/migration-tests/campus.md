@@ -1,7 +1,7 @@
 # campus lane：测试迁移清单
 
 范围：`library search|hold|ebook`、`electricity`、`electricity buildings`、`notices`、`notices show`、`card`。
-Python 基准：`d7c35ef` 的 `tests/test_library.py`、`tests/test_electricity.py`、`src/bupt_cli/{library,commands,config}.py`，以及 `src/bupt_cli/_vendor/campus_api/bupt/portal.py`。
+Python 基准：`d7c35ef` 的 `tests/test_library.py`、`tests/test_electricity.py`、`src/bupt_cli/{library,commands,config}.py`，以及 `src/bupt_cli/_vendor/campus_api/bupt/{portal,electricity,models,constants}.py`。
 Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与未决项；合同冲突时以 `docs/rust-migration.md` 为准。
 
 ## 已执行的离线用例
@@ -65,21 +65,25 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `portal_notice_detail.html` | 详情：标题、发布部门/时间、正文、相对图片、装饰图过滤、附件 |
 | `portal_card.json` / `portal_card_invalid.txt` | 卡余额字段映射；非 JSON 错误 |
 | `portal_login_page.html` | 门户登录页识别（auth 分类，而不是 parse/network） |
-| `electricity_buildings_shahe.json`、`electricity_floors.json`、`electricity_rooms.json`、`electricity_meter.json` | 楼栋/楼层/房间/电表查询链与输出字段 |
-| `electricity_auth_error.json` | 上游 `e/m` 未登录错误分类 |
+| `electricity_buildings_shahe.json`、`electricity_buildings_empty.json` | 楼栋列表字段原样映射、空列表 `count=0` |
+| `electricity_floors.json`、`electricity_rooms.json` | 后续楼层/房间解析的合成形状；本轮未消费 |
+| `electricity_meter.json`、`electricity_meter_empty.json` | 电表余额字段映射；空/零值的默认值、`freeEnd` 回退 |
+| `electricity_auth_error.json` | 上游 `e/m` 未登录标记 |
+| `electricity_upstream_error.json` | `e != 0` 且无登录标记的维护错误 |
 
 ## 第一批实现（本地路径）
 
-`src/campus.rs` 保留命令注册、路由、参数校验和占位 portal 桥；`src/campus/library.rs` 负责匿名 OPAC；`src/campus/dorm.rs` 负责宿舍配置与楼名。已实现：
+`src/campus.rs` 保留命令注册、路由、参数校验和占位 portal 桥；`src/campus/library.rs` 负责匿名 OPAC；`src/campus/dorm.rs` 负责宿舍配置与楼名；`src/campus/electricity.rs` 负责电费响应到 CLI 字段的离线映射。已实现：
 
 - `library search|hold|ebook` 的参数规格：`--page`、`--page-size`、`--location`、`--with-ebook`、位置参数与空白校验。
 - 匿名 OPAC 请求和响应解析：书目字段、HTML 高亮/实体清理、馆藏状态列与偏移回退、电子资源扁平列表和 `\x1e` 清理；`--with-ebook` 的旁路查询失败只记 `null`。
 - `electricity` / `electricity buildings` 的参数规格、楼名与校区别名、`config.json` 的 `dorm` 解析，以及 flag > env > config > built-in placeholder 的优先级。
+- `electricity buildings` 的 `area`/`count`/原样列表映射，以及余额的 `building/floor/room/surplus/price/remaining_kwh/total_consumed_kwh/meter_time/low_balance/threshold/source` 映射。`src/campus/electricity.rs` 提供 typed `MeterTarget` 和基于共享 `Transport` 的 Scripted 测试缝；生产会话/楼层房间解析尚未接线，`run_electricity` 有 profile 时仍停在 pending。
 - `notices` / `notices show` / `card` 的本地参数校验与类型筛选；`notices show` 的空白 URL 在读取 profile 前以 usage 2 拒绝。受保护命令统一使用 `identity::require_authenticated_profile`，只从临时目录的 `credentials.json` 读取 username 和非空密码，不读取账号环境变量，也不要求 role；无本地 profile 或凭据损坏时返回 auth 3，有 profile 时停在 session adapter pending，不伪造成功。匿名 `library` 路径不读取凭据。
 
 ### 本轮新增的内部 fixture 测试
 
-这些测试在 `src/campus/library.rs` / `src/campus/dorm.rs` 的 `#[cfg(test)]` 中；图书馆测试通过共享 `Scripted` 传输回放合成夹具，不联网：
+这些测试在 `src/campus/library.rs` / `src/campus/dorm.rs` / `src/campus/electricity.rs` 的 `#[cfg(test)]` 中；图书馆和电费映射测试通过共享 `Scripted` 传输回放合成夹具，不联网：
 
 | Rust 测试 | 覆盖 |
 |---|---|
@@ -93,15 +97,22 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `library_transport_errors_do_not_echo_internal_diagnostics` | 传输错误仍按 Python 分类映射为 usage 2；消息不含内部诊断，hint 保留 `diagnose` |
 | `dorm_config_defaults_and_config_values_are_resolved_locally` | 内置占位符、config 值、`source=config` |
 | `dorm_flags_win_over_environment_and_config` | flag > env > config、楼名/room/floor |
+| `buildings_maps_area_count_and_response_items` | `/part` 的 `areaid` 请求、shahe/xitucheng 回显、空列表、楼栋字段原样保留 |
+| `balance_maps_fixture_fields_and_response_overrides` | `/search` 表单、响应 `parName/floorName` 覆盖 fallback、余额/价格/剩余量/总用量/时间/阈值/source 映射 |
+| `balance_keeps_empty_and_zero_values_compatible` | 空 surplus、零/空 price、空 `vTotal` 回退 `freeEnd`、空名称/时间、低余额阈值 |
+| `confirmed_login_markers_are_auth_errors` | 四个确认登录标记在 `e != 0` 时映射 auth 3，不把普通错误猜成 auth |
+| `nonzero_status_without_auth_marker_keeps_python_classification` | 维护错误为 network 4；`请登录` 近似文本不升级为 auth；`无数据` 为 not_found 5 |
+| `malformed_payloads_are_parse_errors` | 非对象、缺 `e`、缺 `d.data`、错误数据类型均为 parse 5 |
+| `invalid_json_is_a_parse_error` | 非 JSON 响应为 parse 5 |
 
 ## 仍未接通的场景
 
 这些场景没有写成 `#[ignore]` 或永远通过的假测试；当前没有对应的红测在失败，等会话/传输能力接通后再补：
 
 1. **library 上游错误分层**：传输错误、HTTP 非 2xx、`result.code != 0`、hold 404/500、JSON 形状错误。本轮按 Python 旧版全部归为 usage 2；是否改为 network/upstream 分层仍未决定。
-2. **electricity 查询成功**：默认/env/config/flag 的 `source`、`building/floor/room/surplus/price/remaining_kwh/total_consumed_kwh/meter_time/low_balance/threshold`、楼层推断和最终电表请求来源；需要会话适配器和电费传输。
-3. **electricity buildings 成功**：默认 shahe、别名的 `areaid` 请求、上游楼栋列表和 `area` 回显；需要会话适配器。
-4. **electricity 上游错误**：`e != 0`、未登录 `m`、缺 `d.data` 的 auth/upstream/parse 分类。
+2. **electricity 余额完整请求链**：楼层推断/楼层 ID 查询、房间匹配与 `dromNum`、楼栋 `partmentId`/`areaId` 元数据，以及会话适配器。响应到 CLI 的字段映射已由 typed `MeterTarget` 离线覆盖；`run_electricity` 尚未接线。
+3. **electricity buildings 生产接线**：`areaid` 请求和列表映射已离线覆盖，仍缺会话适配器、真实传输和进程级成功输出。
+4. **electricity 会话/HTTP 边界**：401/403 的会话失效与是否续期、3xx/登录页处理、真实 cookie；本轮只按合成 `e/m` 和 HTTP 状态映射，不猜测登录重定向。
 5. **notices 列表成功**：默认 `notice,news`、显式类型、按时间倒序、`--count` 截断、列表缺失/空列表 parse 错误、明确过期后最多续期一次。
 6. **notices 详情成功**：`title/url/author/time/content_text/attachments/images`、`--max-chars` 截断、正文/标题缺失错误、相对 URL 解析。
 7. **card 成功/错误**：`qkje/oddfare/mail/a` 映射、无效数字为 null、非 JSON/非对象/登录页、明确过期后最多续期一次。
@@ -114,6 +125,7 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 - `notices show` 目前只拒绝空白 URL；接 portal adapter 时必须校验目标在允许的校园门户域名/路径内，重定向后也要复核。
 - 不得把校园凭据、Cookie 或 token 发送到任意 `--url` 指向的地址。
 - 本轮只做本地空白 URL 校验，未连接 portal adapter、未发起真实请求，也未实现域名白名单。
+- electricity 映射不跟随或解释重定向；3xx 交由响应体解析，登录页不会被猜成 auth，只有确认的 `e/m` 标记或 401/403 才进入 auth。
 
 ## 解析与编码边界
 
@@ -122,7 +134,9 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 - HTML 只做简单的标签/实体扫描，不覆盖畸形或深度嵌套 HTML、复杂表格合并单元格等；线上结构变化可能改变 `page_title`、馆藏行或正文提取。
 - 路径段编码按 UTF-8 字节百分号编码，空格在路径用 `%20`、表单用 `+`；未验证上游是否接受所有保留字符 ID，也未做 URL 规范化。
 - 搜索 `data` 非数组时当前按空列表处理；浮点计数截断；这些形状变化没有线上回归证据。
-- notices 列表/详情、card、电费查询仍未接入响应解析；夹具只描述预期形状。
+- 电费数值按 Python 的 `or` 默认规则处理已测试的空/零标量；非法字符串和 NaN/Infinity 会转为默认值或 null，但没有单独夹具，也没有线上对照。
+- 电费 `MeterTarget` 依赖调用方已经解析出的楼层/房间 ID 与显示 fallback；本轮不实现楼层推断、房间列表匹配或楼栋元数据。
+- 电费列表项原样透传，不逐项验证对象形状；notices 列表/详情与 card 仍未接入响应解析。
 
 ## 旧版歧义（未在本轮决定）
 
@@ -141,9 +155,11 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 cargo fmt --check
 cargo test --locked --offline --lib
 cargo test --locked --offline --test contract_campus
+cargo test --locked --offline
 ```
 
 - `cargo fmt --check`：通过。
-- `cargo test --locked --offline --lib`：12 passed（10 个 campus fixture/配置/编码测试 + 2 个共享 CLI 测试）。
-- `cargo test --locked --offline --test contract_campus`：30 passed。
+- `cargo test --locked --offline --lib`：81 passed（含 campus 的 library/dorm/electricity 离线测试）。
+- `cargo test --locked --offline --test contract_campus`：33 passed。
+- `cargo test --locked --offline`：204 passed，0 failed；覆盖 lib 与全部离线 contract 测试。
 - 上述未接通场景没有对应的红测，也没有用 `#[ignore]`/`#[should_panic]` 隐藏；本轮没有真实校园网请求。

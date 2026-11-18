@@ -3,6 +3,7 @@ use crate::identity;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 mod dorm;
+mod electricity;
 mod library;
 
 pub(crate) fn commands() -> Vec<Command> {
@@ -211,6 +212,8 @@ fn run_electricity(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult
     let dorm = dorm::resolve_dorm(&flags, &dorm::dorm_env(), &context.config_dir)?;
     let _floor = dorm.floor.as_deref();
     let _source = dorm.source;
+    // The room/floor resolver and authenticated transport are not connected
+    // yet. Response/CLI mapping lives in electricity.rs and is tested offline.
     Err(session_unavailable(
         context,
         &format!("electricity {} {}", dorm.building.name, dorm.room),
