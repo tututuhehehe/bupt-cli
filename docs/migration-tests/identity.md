@@ -22,7 +22,7 @@ Python 对照版本：`d7c35ef`。本清单记录测试迁移和第一批本地�
 cargo test --offline --test contract_identity
 ```
 
-当时的 21 个用例全部失败，失败原因一致：`src/main.rs` 仍以退出码 `78` 输出 `Rust CLI not implemented; test migration scaffold only`，没有实现任何公开入口。没有编译错误、网络访问、`#[ignore]` 或 `#[should_panic]`。当前实现新增了 5 个审查用例，总数变为 26。
+当时的 21 个用例全部失败，失败原因一致：`src/main.rs` 仍以退出码 `78` 输出 `Rust CLI not implemented; test migration scaffold only`，没有实现任何公开入口。没有编译错误、网络访问、`#[ignore]` 或 `#[should_panic]`。当前实现新增了 6 个审查用例，总数变为 27。
 
 格式检查：
 
@@ -38,12 +38,12 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 
 - 有效的 `login --user … --password … --role …` 在校验后返回明确的 pending 错误（退出码 `5`，`type: upstream`），不读取或写入账号状态。
 - 当前 `login` 是非交互解析里程碑：缺少 `--user`/`--password` 会 usage 退出；最终登录仍必须恢复交互式提示。
-- `status` 的 `user` 只输出 `user_id`、`user_name`、`real_name`；未知键忽略。缓存中的 `mobile_jwgl.last_error` 不原样输出，统一映射为不含细节的安全诊断。
+- `status` 的 `user` 只输出 `user_id`、`user_name`、`real_name`；未知键忽略。`user_id` 只接受字符串或整数，两个名称字段只接受字符串；对象/数组等嵌套值直接省略。缓存中的 `mobile_jwgl.last_error` 不原样输出，统一映射为不含细节的安全诊断。
 - 没有密码的已保存 profile 可以在 `status` 中显示学号，但不会激活任何缓存会话；没有 profile 时同样不激活。
-- `locally_valid` 要求至少一个可用的 CAS Cookie：有名、有值且未明确过期。过期或格式不完整的 Cookie 只增加 `cookie_count`，不能单独让状态变成可用；缺失/不可解析的过期时间仍按未知处理。
+- `locally_valid` 要求至少一个可用的 CAS Cookie：非空 domain、非空 name、字符串 value，且未明确过期。过期或格式不完整的 Cookie 只增加 `cookie_count`，不能单独让状态变成可用；缺失/不可解析的过期时间仍按未知处理。
 - `diagnose --only cas` 在没有可用 CAS Cookie 时返回本地 skipped 报告；其他需要联网的组返回 pending，不写会话。
 - `logout` 分别 unlink 自己拥有的 `credentials.json` 和 `session.json`，不重写打开的文件；`config.json` 和 `timetable.json` 保持原样。符号链接和非普通文件会被拒绝并报 auth 错误。
-- 本 lane 的 26 个进程测试全部通过；待实现场景没有以永远通过或伪造断言的形式保留。
+- 本 lane 的 27 个进程测试全部通过；待实现场景没有以永远通过或伪造断言的形式保留。
 
 ## 用例映射
 
@@ -63,12 +63,13 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 | `missing_profile_does_not_activate_cached_session` | 合同“只复用归属可验证且兼容的旧会话” | 没有 profile、但缓存里有完整会话时，`status` 不激活缓存；只读且不泄露缓存秘密。 |
 | `passwordless_profile_is_named_but_does_not_activate_cached_session` | 合同“只复用归属可验证且兼容的旧会话” | 无密码的已保存 profile 可以在 `status` 中显示学号，但不能激活缓存会话；配置和缓存都不变。 |
 | `status_allowlists_user_fields_and_suppresses_cached_diagnostics` | 合同对 `status` 只读和秘密边界的要求 | `user` 只允许 `user_id`/`user_name`/`real_name`，未知键中的合成秘密不输出；缓存 JWGL 错误不含原始自由文本，而是安全诊断。 |
+| `status_public_user_omits_nested_public_values` | 合同对缓存 `user` 对象的最小输出要求 | 公共字段下放对象或数组时直接省略；`user_id` 的整数标量保留，`user_name`/`real_name` 的合法字符串保留；嵌套合成秘密不进入输出。 |
 | `status_reads_cached_state_without_mutation_or_secret_leak` | `test_session_file_permissions_and_status_redaction` | `status` 读取合法缓存但不改写配置/缓存；可以显示配置中的当前学号，但密码、Cookie、UCloud token、移动教务 token 不泄露；`cas_logins_total` 不变。 |
 | `status_pretty_changes_format_not_values` | `test_pretty_flag_after_subcommand`、`test_success_envelope_has_ok` | `--pretty` 只改排版；成功输出为单个 `schema: "bupt.v1"` 文档。 |
 | `status_reports_explicit_expiry_without_refreshing` | `session.py::BuptSession.status`、`test_session_file_permissions_and_status_redaction` | 只有缓存中明确的过期时间才标记 expired；`status` 不自动续期、不写回、不增加 CAS 登录计数。 |
 | `status_missing_expiry_does_not_expire_or_relogin` | `auth.py::is_token_expired`（无 `exp` 时返回 false） | 缺少过期信息不等于过期，也不意味着要重新登录；`status` 不续期、不写回、不改变登录计数。 |
 | `status_tolerates_non_numeric_cookie_expiry` | `test_status_tolerates_non_numeric_cookie_expiry` | 单个 Cookie 的过期值不可解析时，其他 Cookie 仍参与计数和最早过期时间计算；不可解析的过期值按未知处理，不单独判定过期。 |
-| `locally_valid_requires_a_usable_cookie_and_keeps_unknown_expiry` | 合同对 `status` 本地可用性和过期语义的要求 | 只有 Cookie 槽位不够：过期或缺少 name/value 的 Cookie 不能使 `locally_valid=true`；缺失过期时间仍是未知且可用；`diagnose` 同样不把这种槽位当成可用 CAS 会话。 |
+| `locally_valid_requires_a_usable_cookie_and_keeps_unknown_expiry` | 合同对 `status` 本地可用性和过期语义的要求 | 只有 Cookie 槽位不够：过期、缺少 domain/name/value 或类型不对的 Cookie 不能使 `locally_valid=true`；缺失过期时间仍是未知且可用；`diagnose` 同样不把这种槽位当成可用 CAS 会话。 |
 | `graduate_status_drops_stale_mobile_jwgl_failure_but_undergraduate_keeps_it` | `test_graduate_status_drops_stale_mobile_jwgl_error`、`test_undergraduate_status_keeps_mobile_jwgl_error` | 研究生身份不展示本科教务的陈旧失败；本科生仍能看到一个安全、非原始的错误诊断；`status` 只在内存中处理，不写回。两类夹具分别带匹配的角色。 |
 | `unreadable_credentials_are_auth_error_before_network_or_write` | `credentials.py::_read_config` 的 `AuthError`、`test_error_envelope_exit_codes` | 凭据文件不可解析时走 auth 退出码 `3`，错误流是 `bupt.v1` 信封，不联网、不写会话、不泄露文件内容。 |
 | `logout_clears_password_and_session_but_keeps_timetable_and_config` | `test_delete_session`；合同对旧行为的变更 | `logout` 分别删除自己拥有的凭据和会话文件；`config.json` 和 `timetable.json` 原样保留；重复执行幂等（`removed=false`）。 |
@@ -84,7 +85,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - Python `probe._save_probe_state()` 会在探测过程中写 `session.json`；Rust `diagnose` 明确不写本地会话，测试用前后快照约束。
 - Python `login` 在验证前保存新凭据；合同要求失败时保留上一次有效登记和会话。当前实现还在 pending 前，后续接线必须保持这个顺序。
 - Python `logout` 只删 `session.json`，不清密码；合同要求同时忘掉本地凭据和会话，但保留课表和设置。Rust 直接 unlink 两个自有文件，不重写或截断；符号链接/非普通文件拒绝。
-- Python `status.user` 原样返回缓存对象；Rust 只允许 `user_id`、`user_name`、`real_name`。Python `mobile_jwgl.last_error` 原样返回；Rust 映射为安全诊断，不输出缓存自由文本。
+- Python `status.user` 原样返回缓存对象；Rust 只允许 `user_id`、`user_name`、`real_name`，且只接受字符串/整数 ID 和字符串名称，嵌套值不输出。Python `mobile_jwgl.last_error` 原样返回；Rust 映射为安全诊断，不输出缓存自由文本。
 - Python 只要缓存有 Cookie 且学号相同就可能复用；Rust 要求 profile 含密码、v2 归属元组 `(username, role)`，并要求至少一个未明确过期且 name/value 完整的 CAS Cookie。v1 只复用身份无关的 CAS/UCloud 状态，不复用无法确认角色的移动教务状态。
 - 当前 Rust `login` 只实现非交互参数解析；Python 在缺参数时提示输入。最终登录仍必须恢复交互式提示；本轮只把它记录为里程碑，不把非交互行为当作最终合同。
 - 成功/错误输出统一带 `schema: "bupt.v1"`；这是迁移合同的新增外壳。

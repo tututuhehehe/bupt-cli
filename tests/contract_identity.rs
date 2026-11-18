@@ -638,6 +638,44 @@ fn status_allowlists_user_fields_and_suppresses_cached_diagnostics() {
 }
 
 #[test]
+fn status_public_user_omits_nested_public_values() {
+    for (case, user, expected_user) in [
+        (
+            "nested object under user_name and array under real_name",
+            json!({
+                "user_id": 42,
+                "user_name": {"nested": COOKIE_SECRET},
+                "real_name": ["Synthetic Tester", PRIMARY_PASSWORD, ACCESS_SECRET]
+            }),
+            json!({"user_id": 42}),
+        ),
+        (
+            "nested object under user_id",
+            json!({
+                "user_id": {"nested": ACCESS_SECRET},
+                "user_name": USER,
+                "real_name": "Synthetic Tester"
+            }),
+            json!({"user_name": USER, "real_name": "Synthetic Tester"}),
+        ),
+    ] {
+        let sandbox = Sandbox::new();
+        seed_credentials(&sandbox, CREDENTIALS);
+        let mut session = session_value(SESSION);
+        session["user"] = user;
+        seed_json(&cache_dir(&sandbox), "session.json", &session);
+        let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+        let inv = run_with_env(&sandbox, &["status"], &[]);
+        let status = success(&inv);
+
+        assert_eq!(status["user"], expected_user, "{case}");
+        assert_no_fixture_secrets(&inv);
+        assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+    }
+}
+
+#[test]
 fn status_reads_cached_state_without_mutation_or_secret_leak() {
     let sandbox = Sandbox::new();
     let credentials_path = seed_credentials(&sandbox, CREDENTIALS);
@@ -797,9 +835,16 @@ fn locally_valid_requires_a_usable_cookie_and_keeps_unknown_expiry() {
         .expect("cookie fixture is an object")
         .remove("expires");
 
+    let mut missing_domain = session_value(SESSION);
+    missing_domain["cookies"][0]
+        .as_object_mut()
+        .expect("cookie fixture is an object")
+        .remove("domain");
+
     for (case, session, expected_locally_valid) in [
         ("expired cookie", expired, false),
         ("malformed cookie", malformed, false),
+        ("missing cookie domain", missing_domain, false),
         ("unknown cookie expiry", unknown_expiry, true),
     ] {
         let sandbox = Sandbox::new();

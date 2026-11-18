@@ -416,6 +416,10 @@ fn cookie_status(cookies: Option<&Value>, now: f64) -> CookieStatus {
                     .map_or(expiry, |current| current.min(expiry)),
             );
         }
+        let domained = cookie
+            .get("domain")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
         let named = cookie
             .get("name")
             .and_then(Value::as_str)
@@ -425,7 +429,7 @@ fn cookie_status(cookies: Option<&Value>, now: f64) -> CookieStatus {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty());
         let expired = expiry.is_some_and(|value| value <= now);
-        if named && valued && !expired {
+        if domained && named && valued && !expired {
             status.usable += 1;
         }
     }
@@ -434,11 +438,26 @@ fn cookie_status(cookies: Option<&Value>, now: f64) -> CookieStatus {
 
 fn public_user(user: Option<&Value>) -> Value {
     let mut public = Map::new();
-    if let Some(user) = user.and_then(Value::as_object) {
-        for field in PUBLIC_USER_FIELDS {
-            if let Some(value) = user.get(*field) {
-                public.insert((*field).to_owned(), value.clone());
+    let Some(user) = user.and_then(Value::as_object) else {
+        return Value::Object(public);
+    };
+    for field in PUBLIC_USER_FIELDS {
+        let Some(value) = user.get(*field) else {
+            continue;
+        };
+        let scalar = if *field == "user_id" {
+            if let Some(value) = value.as_str() {
+                Some(Value::String(value.to_owned()))
+            } else if let Some(value) = value.as_i64() {
+                Some(Value::from(value))
+            } else {
+                value.as_u64().map(Value::from)
             }
+        } else {
+            value.as_str().map(|value| Value::String(value.to_owned()))
+        };
+        if let Some(scalar) = scalar {
+            public.insert((*field).to_owned(), scalar);
         }
     }
     Value::Object(public)
