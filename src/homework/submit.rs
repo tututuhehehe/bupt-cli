@@ -598,15 +598,15 @@ fn submit_once(
         body,
     }) {
         Ok(response) => response,
-        Err(error) => {
-            return Ok(SubmitAttempt::Ambiguous(format!(
-                "the transport failed after the submit request was sent: {}",
-                error.message
-            )));
+        Err(_) => {
+            return Ok(SubmitAttempt::Ambiguous(
+                "no confirming response was received".into(),
+            ));
         }
     };
 
-    if response.status == 401 || response.status == 403 {
+    let status = response.status;
+    if status == 401 || status == 403 {
         return Ok(SubmitAttempt::Refused(CliError::new(
             3,
             "auth",
@@ -614,14 +614,16 @@ fn submit_once(
             "Run `bupt login --force`, then retry only after confirming the previous attempt.",
         )));
     }
-    if !(200..300).contains(&response.status) {
+    if status < 200 || status == 408 || (300..400).contains(&status) || status >= 500 {
+        return Ok(SubmitAttempt::Ambiguous(format!(
+            "the submit request received HTTP {status} without a confirmable success response"
+        )));
+    }
+    if !(200..300).contains(&status) {
         return Ok(SubmitAttempt::Refused(CliError::new(
             5,
             "upstream",
-            format!(
-                "UCloud submission was explicitly refused with HTTP {}",
-                response.status
-            ),
+            format!("UCloud submission was explicitly refused with HTTP {status}"),
             "The command did not retry the submit request.",
         )));
     }
@@ -1248,6 +1250,25 @@ mod tests {
     }
 
     #[test]
+    fn timeout_server_error_and_redirect_statuses_after_submit_are_ambiguous_and_not_retried() {
+        let (_directory, file) = answer_file();
+        for status in [302, 408, 502] {
+            let request = request("1000000000000000005", file.clone(), false, true, false);
+            let (result, transport) = execute_with_reply(
+                &request,
+                json_response(
+                    status,
+                    json!({"msg": "synthetic status synthetic-access-token"}),
+                ),
+            );
+
+            let outcome =
+                result.expect("a redirect, 408, or 5xx submit response must remain ambiguous");
+            assert_ambiguous(&outcome, &transport);
+        }
+    }
+
+    #[test]
     fn explicit_http_and_upstream_refusals_are_not_ambiguous_and_not_retried() {
         let (_directory, file) = answer_file();
         for reply in [
@@ -1296,6 +1317,14 @@ mod tests {
         let warning = outcome.data["warning"]
             .as_str()
             .expect("ambiguous outcome needs a warning");
+        assert!(
+            warning.contains("no confirming response was received"),
+            "transport failures must not claim the request reached the server: {warning}"
+        );
+        assert!(
+            !warning.contains("after the submit request was sent"),
+            "transport failures must not claim bytes were delivered: {warning}"
+        );
         assert!(
             !warning.contains("synthetic-access-token"),
             "diagnostics must redact the session token: {warning}"

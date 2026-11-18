@@ -53,11 +53,12 @@
 | `empty_submit_acknowledgement_is_ambiguous_and_verify_only` | 2xx `{}` 退 6，`submitted=null`，warning/diagnostic 只指向 `verify`；写入恰为 `[upload, submit]` |
 | `invalid_submit_acknowledgement_is_ambiguous_and_verify_only` | 非法 `success` 标志、互相矛盾的 success/code 等畸形回执退 6，不报 `submitted=true`；不重发 submit |
 | `non_json_submit_response_is_ambiguous_and_verify_only` | 2xx 非 JSON 响应退 6，`submitted=null`，verify-only 指引；不重发 submit |
-| `explicit_http_and_upstream_refusals_are_not_ambiguous_and_not_retried` | 明确 HTTP/上游拒绝走错误（HTTP/上游 5，401/403 鉴权 3），不回显原始 `msg`/token，不重发；与超时/断连的 6 区分 |
+| `timeout_server_error_and_redirect_statuses_after_submit_are_ambiguous_and_not_retried` | 302 / 408 / 502 退 6，`submitted=null`，verify-only 指引；恰一次 submit，不重发 |
+| `explicit_http_and_upstream_refusals_are_not_ambiguous_and_not_retried` | 明确 400 与 JSON 负回执走错误（HTTP/上游 5，401/403 鉴权 3），不回显原始 `msg`/token，不重发 |
 | `lost_submit_response_is_ambiguous_and_never_retried` | 恰好一次 submit；超时/断连退 6，`submitted`/`verified` 为 null，verify-only 指引；无自动重发 |
 | `upstream_message_echoing_token_is_redacted_at_the_boundary` | 上游 `msg` 回显合成 token 时，结果边界统一替换为 `[REDACTED]` |
 
-回执判定只接受肯定证据：显式 `success: true`，或认可的 `code`（0/200）。空对象、缺失/非法指示、互相矛盾的 success/code、2xx 非 JSON 回退 6 且 `submitted=null`；明确 HTTP/上游拒绝走错误（HTTP/上游 5，401/403 鉴权 3），不伪装成 unknown。所有分支都不自动重发 submit。
+回执判定只接受肯定证据：显式 `success: true`，或认可的 `code`（0/200）。空对象、缺失/非法指示、互相矛盾的 success/code、2xx 非 JSON、408、5xx、意外重定向以及没有确认响应的 transport failure 都退 6 且 `submitted=null`，并只指向只读 `verify`。明确 4xx（408 除外）、JSON 负回执和 401/403 仍走显式错误（HTTP/上游 5，鉴权 3），不伪装成 unknown。所有分支都不自动重发 submit；transport failure 只说明没有收到确认响应，不回显原始诊断。
 
 当前真实 CLI 在提交 helper 之前没有会话适配器，因此带凭据时仍以“session wiring 未实现”退 5，绝不发起 HTTP。`courses`、作业列表、`show`、`download`、`verify` 同样在通过凭据检查后以 unsupported 退 5；本批没有课程分页、列表、详情、下载或只读核验实现，`verify` 保持 pending。成功提交但未跑 `--no-verify` 时 helper 也返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`。
 
@@ -165,7 +166,7 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 ## 当前验证状态
 
 - `cargo fmt --check`：通过。
-- `cargo test --locked --offline --lib`：12 个通过（2 个共享 CLI + 10 个 homework 提交 helper）。
+- `cargo test --locked --offline --lib`：13 个通过（2 个共享 CLI + 11 个 homework 提交 helper）。
 - `cargo test --locked --offline --test contract_homework`：11 个通过。
 - `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此 30 个草稿全部不可运行，也没有伪装通过。
 - 同一 worktree 的 `contract_lifecycle` 红跑仍有 12 个失败，均属于 `status` / `update` / `uninstall` 等其它 lane 的空实现；`homework` 入口、帮助树、移除别名相关用例已通过。该红跑不是本 lane 的验收门禁。
