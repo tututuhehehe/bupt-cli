@@ -1,0 +1,26 @@
+{
+  "result": {"code": 0, "msg": ""},
+  "total": 2,
+  "pageNo": 1,
+  "totalPage": 1,
+  "data": [
+    {
+      "recCtrlId": "fixture-book-1",
+      "title": "\n\n  <b>示例</b> &amp; 标题\n\n",
+      "authors": "示例作者",
+      "isn": "9780000000001",
+      "publisher": "示例出版社",
+      "pubdateDate": "2026",
+      "bookSearchNo": "TP000/F001",
+      "libraryName": "示例图书馆",
+      "guancangCount": "5",
+      "kejieCount": "2"
+    },
+    {
+      "recCtrlId": "fixture-book-2",
+      "title": "缺少计数的记录",
+      "guancangCount": "unknown",
+      "kejieCount": null
+    }
+  ]
+}
