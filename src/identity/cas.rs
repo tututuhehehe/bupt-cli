@@ -1,10 +1,16 @@
 //! Transport-injected CAS and UCloud protocol slice.
 //!
-//! This module is deliberately not wired to a production session. It proves
-//! the request shape, redirect policy and response classification with
-//! synthetic `Scripted` transports. A successful `cas_login` is the only way to
-//! obtain a `CasLogin`; future account persistence must take that value so a
-//! failed login cannot write local state.
+//! PROTOTYPE ONLY: the hand-written URL and cookie handling below is suitable
+//! for synthetic protocol tests, not for live Rust wiring. Before any
+//! production transport is connected, replace it with maintained URL/cookie
+//! support covering host-only cookies, expiration, default paths, and strict
+//! URL parsing. This module is not wired to a production session.
+//!
+//! It proves the request shape, redirect policy and response classification
+//! with synthetic `Scripted` transports. A successful `cas_login` is the only
+//! way to obtain a `CasLogin`, and it must include a service ticket issued by
+//! the ordinary CAS verification request. Future account persistence must take
+//! that value so a failed login cannot write local state.
 
 use crate::cli::{CliError, CliResult};
 use crate::transport::{Request, Response, Transport};
@@ -22,11 +28,11 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const MAX_CAS_REDIRECTS: usize = 5;
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
-/// A verified CAS login. Fields are private so only a completed CAS exchange
-/// can construct this value.
+/// A verified CAS login with a service ticket issued by CAS. Fields are
+/// private so only a completed login can construct this value.
 pub(super) struct CasLogin {
     cookies: CookieJar,
-    final_url: String,
+    ticket: Option<String>,
     ucloud: Option<UCloudToken>,
 }
 
@@ -45,7 +51,7 @@ impl fmt::Debug for CasLogin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CasLogin")
-            .field("final_url", &"<redacted>")
+            .field("ticket", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -62,16 +68,9 @@ impl fmt::Debug for UCloudToken {
 }
 
 impl CasLogin {
-    /// The final URL reached after the single credential POST and its GET-only
-    /// redirect chain. It can contain a service ticket, so it is for in-memory
-    /// diagnostics only; callers must not persist or log it.
-    #[allow(dead_code)]
-    pub(super) fn final_url(&self) -> &str {
-        &self.final_url
-    }
-
-    /// Fetch a UCloud token only when a caller needs one. A valid in-memory
-    /// token is reused without another CAS login or ticket exchange.
+    /// Fetch a UCloud token only when a caller needs one. The service ticket
+    /// obtained during login is consumed first; later needs request a new CAS
+    /// service ticket. No OAuth token request happens before this call.
     pub(super) fn ucloud_token(
         &mut self,
         transport: &mut dyn Transport,
@@ -81,7 +80,10 @@ impl CasLogin {
             .as_ref()
             .is_some_and(|token| !token.is_expired());
         if !cached {
-            let ticket = self.issue_ucloud_ticket(transport)?;
+            let ticket = match self.ticket.take() {
+                Some(ticket) => ticket,
+                None => request_cas_service_ticket(transport, &mut self.cookies)?,
+            };
             let token = exchange_ucloud_token(transport, &ticket)?;
             self.ucloud = Some(token);
         }
@@ -110,31 +112,6 @@ impl CasLogin {
         )?;
         ensure_http_ok(&response, "UCloud authenticated read")?;
         parse_json_object(&response.body, "UCloud authenticated read")
-    }
-
-    fn issue_ucloud_ticket(&mut self, transport: &mut dyn Transport) -> CliResult<String> {
-        let response = send_get(transport, &mut self.cookies, super::CAS_SERVICE_URL)?;
-        if matches!(response.status, 401 | 403) {
-            return Err(auth_error(format!(
-                "CAS ticket exchange rejected authentication (HTTP {})",
-                response.status
-            )));
-        }
-        if response.status >= 400 {
-            return Err(network_error(format!(
-                "CAS ticket exchange failed with HTTP {}",
-                response.status
-            )));
-        }
-        if response.status < 400 && is_login_page_body(&response.body) {
-            return Err(auth_error(
-                "BUPT CAS session is no longer valid; no UCloud ticket was issued",
-            ));
-        }
-        let location = header(&response.headers, "location").ok_or_else(|| {
-            auth_error("No CAS ticket issued for UCloud (login may have expired)")
-        })?;
-        ticket_from_location(location)
     }
 }
 
@@ -217,11 +194,45 @@ pub(super) fn cas_login(
         ));
     }
 
+    let ticket = request_cas_service_ticket(transport, &mut cookies)?;
     Ok(CasLogin {
         cookies,
-        final_url,
+        ticket: Some(ticket),
         ucloud: None,
     })
+}
+
+/// Ask CAS for a service ticket and require an explicit redirect carrying a
+/// ticket. A 2xx page, even with a Location header, is not proof of success.
+fn request_cas_service_ticket(
+    transport: &mut dyn Transport,
+    cookies: &mut CookieJar,
+) -> CliResult<String> {
+    let response = send_get(transport, cookies, super::CAS_SERVICE_URL)?;
+    match response.status {
+        401 | 403 => Err(auth_error(format!(
+            "CAS service ticket rejected authentication (HTTP {})",
+            response.status
+        ))),
+        301 | 302 | 303 | 307 | 308 => {
+            let location = header(&response.headers, "location").ok_or_else(|| {
+                parse_error("CAS service redirect response has no Location header")
+            })?;
+            ticket_from_location(location)
+        }
+        200..=299 => {
+            if is_login_page_body(&response.body) {
+                Err(auth_error(
+                    "BUPT CAS session is no longer valid; no service ticket was issued",
+                ))
+            } else {
+                Err(auth_error(
+                    "BUPT CAS login did not produce a service ticket",
+                ))
+            }
+        }
+        status => Err(upstream_http_error("CAS service ticket request", status)),
+    }
 }
 
 fn exchange_ucloud_token(transport: &mut dyn Transport, ticket: &str) -> CliResult<UCloudToken> {
@@ -434,10 +445,22 @@ fn ensure_http_ok(response: &Response, operation: &str) -> CliResult<()> {
             "{operation} rejected authentication (HTTP {})",
             response.status
         ))),
-        status => Err(network_error(format!(
-            "{operation} failed with HTTP {status}"
-        ))),
+        status => Err(upstream_http_error(operation, status)),
     }
+}
+
+fn upstream_http_error(operation: &str, status: u16) -> CliError {
+    let hint = if status == 429 {
+        "The campus service is rate limiting requests; wait before retrying."
+    } else {
+        "The campus service returned an unexpected response."
+    };
+    CliError::new(
+        5,
+        "upstream",
+        format!("{operation} failed with HTTP {status}"),
+        hint,
+    )
 }
 
 fn parse_json_object(bytes: &[u8], operation: &str) -> CliResult<Value> {
@@ -482,15 +505,6 @@ fn parse_error(message: impl Into<String>) -> CliError {
         "upstream",
         message,
         "The campus service returned an unexpected response.",
-    )
-}
-
-fn network_error(message: impl Into<String>) -> CliError {
-    CliError::new(
-        4,
-        "network",
-        message,
-        "Check the network connection and retry.",
     )
 }
 
@@ -887,7 +901,9 @@ mod tests {
     const ACCESS_SECRET: &str = "eyJhbGciOiJub25lIn0.eyJ1c2VyX2lkIjoiNDIiLCJ1c2VyX25hbWUiOiIyMDI2MDAwMDAxIiwicmVhbF9uYW1lIjoiU3ludGhldGljIFRlc3RlciIsImV4cCI6NDEwMjQ0NDgwMH0.synthetic-signature";
     const EXPIRED_ACCESS_SECRET: &str =
         "eyJhbGciOiJub25lIn0.eyJ1c2VyX2lkIjoiNDIiLCJleHAiOjF9.synthetic-signature";
+    const TICKET_SECRET: &str = "ST-TEST-ONLY-TICKET-c3d4";
     const TICKET_URL: &str = "https://ucloud.bupt.edu.cn/uclass?ticket=ST-TEST-ONLY-TICKET-c3d4";
+    const FINAL_BODY: &str = "<html><body>synthetic ucloud workspace</body></html>";
 
     fn response(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
         Response {
@@ -913,6 +929,19 @@ mod tests {
             .push_back((method, url.to_owned(), Ok(response(status, headers, body))));
     }
 
+    fn enqueue_transport_error(transport: &mut Scripted, method: &'static str, url: &str) {
+        transport.expected.push_back((
+            method,
+            url.to_owned(),
+            Err(CliError::new(
+                4,
+                "network",
+                "synthetic connection failure",
+                "Check the network connection and retry.",
+            )),
+        ));
+    }
+
     fn login_page() -> Response {
         response(
             200,
@@ -926,7 +955,7 @@ mod tests {
         )
     }
 
-    fn successful_cas_script() -> Scripted {
+    fn cas_script_before_ticket_with_final_body(final_body: &str) -> Scripted {
         let mut transport = Scripted::default();
         transport
             .expected
@@ -945,30 +974,87 @@ mod tests {
             ],
             "",
         );
+        enqueue(&mut transport, "GET", TICKET_URL, 200, &[], final_body);
+        transport
+    }
+
+    fn cas_script_before_ticket() -> Scripted {
+        cas_script_before_ticket_with_final_body(FINAL_BODY)
+    }
+
+    fn cas_script_with_ticket_response(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Scripted {
+        let mut transport = cas_script_before_ticket();
         enqueue(
             &mut transport,
             "GET",
-            TICKET_URL,
-            200,
-            &[],
-            "<html><body>synthetic ucloud workspace</body></html>",
+            super::super::CAS_SERVICE_URL,
+            status,
+            headers,
+            body,
         );
         transport
+    }
+
+    fn successful_cas_script() -> Scripted {
+        cas_script_with_ticket_response(302, &[("Location", TICKET_URL)], "")
+    }
+
+    fn assert_no_secret(error: &CliError) {
+        for secret in [PASSWORD, COOKIE_SECRET, ACCESS_SECRET, TICKET_SECRET] {
+            assert!(!error.message.contains(secret));
+            assert!(!error.hint.contains(secret));
+        }
+        assert!(!error.hint.to_ascii_lowercase().contains("password"));
     }
 
     fn assert_auth_error(error: CliError) {
         assert_eq!(error.code, 3, "expected auth exit: {error:?}");
         assert_eq!(error.kind, "auth");
-        for secret in [PASSWORD, COOKIE_SECRET, ACCESS_SECRET] {
+        for secret in [PASSWORD, COOKIE_SECRET, ACCESS_SECRET, TICKET_SECRET] {
             assert!(!error.message.contains(secret));
             assert!(!error.hint.contains(secret));
         }
     }
 
+    fn assert_upstream_error(error: CliError) {
+        assert_eq!(error.code, 5, "expected upstream exit: {error:?}");
+        assert_eq!(error.kind, "upstream");
+        assert_no_secret(&error);
+    }
+
     fn assert_network_error(error: CliError) {
         assert_eq!(error.code, 4, "expected network exit: {error:?}");
         assert_eq!(error.kind, "network");
-        assert!(!error.message.contains(PASSWORD));
+        for secret in [PASSWORD, COOKIE_SECRET, ACCESS_SECRET, TICKET_SECRET] {
+            assert!(!error.message.contains(secret));
+            assert!(!error.hint.contains(secret));
+        }
+    }
+
+    fn assert_no_token_request(transport: &Scripted) {
+        assert!(
+            transport
+                .calls
+                .iter()
+                .all(|call| call.url != UCLOUD_TOKEN_URL),
+            "login must not request a UCloud OAuth token"
+        );
+    }
+
+    fn assert_single_password_post(transport: &Scripted) {
+        assert_eq!(
+            transport
+                .calls
+                .iter()
+                .filter(|call| call.method == "POST" && call.url == CAS_LOGIN_URL)
+                .count(),
+            1,
+            "the password must be submitted exactly once"
+        );
     }
 
     fn request_header<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
@@ -980,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn cas_login_posts_the_form_once_and_accepts_a_verified_redirect() {
+    fn cas_login_posts_the_form_once_and_accepts_a_verified_ticket() {
         let mut transport = successful_cas_script();
         let login = cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
         let debug = format!("{login:?}");
@@ -989,10 +1075,10 @@ mod tests {
             "CAS login Debug must not leak cookies or tickets"
         );
 
-        assert_eq!(login.final_url(), TICKET_URL);
-        assert_eq!(transport.calls.len(), 3);
+        assert_eq!(login.ticket.as_deref(), Some(TICKET_SECRET));
+        assert_eq!(transport.calls.len(), 4);
         let methods: Vec<&str> = transport.calls.iter().map(|call| call.method).collect();
-        assert_eq!(methods, ["GET", "POST", "GET"]);
+        assert_eq!(methods, ["GET", "POST", "GET", "GET"]);
         let post = &transport.calls[1];
         assert_eq!(post.url, CAS_LOGIN_URL);
         let body = String::from_utf8_lossy(&post.body);
@@ -1016,15 +1102,15 @@ mod tests {
             request_header(&transport.calls[2], "cookie").is_none(),
             "host-scoped CAS cookies must not cross into ucloud.bupt.edu.cn"
         );
-        assert_eq!(
-            transport
-                .calls
-                .iter()
-                .filter(|call| call.method == "POST")
-                .count(),
-            1,
-            "the password must be submitted exactly once"
+        let ticket_get = &transport.calls[3];
+        assert_eq!(ticket_get.method, "GET");
+        assert_eq!(ticket_get.url, super::super::CAS_SERVICE_URL);
+        assert!(
+            request_header(ticket_get, "cookie").is_some(),
+            "the CAS cookie jar must authenticate the service-ticket request"
         );
+        assert_single_password_post(&transport);
+        assert_no_token_request(&transport);
     }
 
     #[test]
@@ -1045,14 +1131,8 @@ mod tests {
         let error = cas_login(&mut transport, USERNAME, PASSWORD).expect_err("login must fail");
         assert_auth_error(error);
         assert_eq!(transport.calls.len(), 2);
-        assert_eq!(
-            transport
-                .calls
-                .iter()
-                .filter(|call| call.method == "POST")
-                .count(),
-            1
-        );
+        assert_single_password_post(&transport);
+        assert_no_token_request(&transport);
     }
 
     #[test]
@@ -1075,15 +1155,8 @@ mod tests {
                 .expect_err("method-preserving redirect must fail");
             assert_auth_error(error);
             assert_eq!(transport.calls.len(), 2);
-            assert_eq!(
-                transport
-                    .calls
-                    .iter()
-                    .filter(|call| call.method == "POST")
-                    .count(),
-                1,
-                "a 307/308 redirect must not replay the credential POST"
-            );
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
         }
     }
 
@@ -1117,12 +1190,20 @@ mod tests {
                 2,
                 "redirect target must not be fetched"
             );
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
         }
     }
 
     #[test]
     fn cas_login_classifies_http_failures_without_retrying() {
-        for (status, auth) in [(401, true), (403, true), (500, false)] {
+        for (status, auth) in [
+            (401, true),
+            (403, true),
+            (400, false),
+            (429, false),
+            (500, false),
+        ] {
             let mut transport = Scripted::default();
             transport
                 .expected
@@ -1134,10 +1215,32 @@ mod tests {
             if auth {
                 assert_auth_error(error);
             } else {
-                assert_network_error(error);
+                assert_upstream_error(error);
             }
             assert_eq!(transport.calls.len(), 2);
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
         }
+    }
+
+    #[test]
+    fn connection_failure_is_network_without_retry() {
+        let mut transport = Scripted::default();
+        enqueue_transport_error(&mut transport, "GET", CAS_LOGIN_URL);
+        let error = cas_login(&mut transport, USERNAME, PASSWORD)
+            .expect_err("page connection failure must fail");
+        assert_network_error(error);
+        assert_eq!(transport.calls.len(), 1);
+        assert_no_token_request(&transport);
+
+        let mut transport = cas_script_before_ticket();
+        enqueue_transport_error(&mut transport, "GET", super::super::CAS_SERVICE_URL);
+        let error = cas_login(&mut transport, USERNAME, PASSWORD)
+            .expect_err("ticket connection failure must fail");
+        assert_network_error(error);
+        assert_eq!(transport.calls.len(), 4);
+        assert_single_password_post(&transport);
+        assert_no_token_request(&transport);
     }
 
     #[test]
@@ -1153,26 +1256,113 @@ mod tests {
         );
 
         let error = cas_login(&mut transport, USERNAME, PASSWORD).expect_err("must fail");
-        assert_eq!(error.code, 5);
-        assert_eq!(error.kind, "upstream");
+        assert_upstream_error(error);
         assert_eq!(transport.calls.len(), 1);
         assert_eq!(transport.calls[0].method, "GET");
+        assert_no_token_request(&transport);
     }
 
     #[test]
-    fn ucloud_token_is_lazy_and_reuses_one_ticket_exchange() {
+    fn allowed_redirect_to_unrelated_200_without_ticket_fails_closed() {
+        for final_body in ["", "<html><body>synthetic interstitial</body></html>"] {
+            let mut transport = cas_script_before_ticket_with_final_body(final_body);
+            enqueue(
+                &mut transport,
+                "GET",
+                super::super::CAS_SERVICE_URL,
+                200,
+                &[],
+                "",
+            );
+
+            let error = cas_login(&mut transport, USERNAME, PASSWORD)
+                .expect_err("a 200 page without a ticket must not prove login");
+            assert_auth_error(error);
+            assert_eq!(
+                transport.calls.len(),
+                4,
+                "the ticket check must fail closed after the final 200 page"
+            );
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
+        }
+    }
+
+    #[test]
+    fn cas_login_requires_a_ticket_from_an_explicit_redirect() {
+        for (status, location, body, code) in [
+            (401, None, "", 3),
+            (403, None, "", 3),
+            (429, None, "", 5),
+            (500, None, "", 5),
+            (304, Some(TICKET_URL), "", 5),
+            (302, None, "", 5),
+            (302, Some("https://ucloud.bupt.edu.cn/uclass"), "", 3),
+            (
+                302,
+                Some("https://ucloud.bupt.edu.cn/uclass?ticket="),
+                "",
+                3,
+            ),
+            (302, Some("https://evil.example/uclass?ticket=ST-x"), "", 3),
+            (200, Some(TICKET_URL), "", 3),
+            (200, None, "", 3),
+            (
+                200,
+                None,
+                "<html><input name=\"execution\" value=\"TEST-ONLY-EXPIRED\"></html>",
+                3,
+            ),
+        ] {
+            let mut transport = cas_script_before_ticket();
+            let headers: Vec<(&str, &str)> = location
+                .into_iter()
+                .map(|value| ("Location", value))
+                .collect();
+            enqueue(
+                &mut transport,
+                "GET",
+                super::super::CAS_SERVICE_URL,
+                status,
+                &headers,
+                body,
+            );
+
+            let error = cas_login(&mut transport, USERNAME, PASSWORD)
+                .expect_err("ticket verification must fail closed");
+            assert_eq!(error.code, code, "wrong class for status {status}");
+            if code == 3 {
+                assert_auth_error(error);
+            } else {
+                assert_upstream_error(error);
+            }
+            assert_eq!(transport.calls.len(), 4);
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
+        }
+    }
+
+    #[test]
+    fn cas_login_accepts_explicit_redirect_statuses_for_service_tickets() {
+        for status in [301, 302, 303, 307, 308] {
+            let mut transport =
+                cas_script_with_ticket_response(status, &[("Location", TICKET_URL)], "");
+            let login = cas_login(&mut transport, USERNAME, PASSWORD)
+                .expect("an explicit redirect with a ticket proves login");
+            assert_eq!(login.ticket.as_deref(), Some(TICKET_SECRET));
+            assert_eq!(transport.calls.len(), 4);
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
+        }
+    }
+
+    #[test]
+    fn ucloud_token_is_lazy_and_uses_the_login_ticket_once() {
         let mut transport = successful_cas_script();
         let mut login = cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
-        assert_eq!(transport.calls.len(), 3, "login must not prewarm UCloud");
+        assert_eq!(transport.calls.len(), 4, "login must not prewarm UCloud");
+        assert_no_token_request(&transport);
 
-        enqueue(
-            &mut transport,
-            "GET",
-            super::super::CAS_SERVICE_URL,
-            302,
-            &[("Location", TICKET_URL)],
-            "",
-        );
         enqueue(
             &mut transport,
             "POST",
@@ -1207,7 +1397,7 @@ mod tests {
         assert_eq!(ticket_get.url, super::super::CAS_SERVICE_URL);
         assert!(
             request_header(ticket_get, "cookie").is_some(),
-            "the CAS cookie jar must authenticate the ticket exchange"
+            "the CAS cookie jar must authenticate the service-ticket request"
         );
         let token_post = &transport.calls[4];
         assert_eq!(token_post.url, UCLOUD_TOKEN_URL);
@@ -1218,6 +1408,10 @@ mod tests {
         let body = String::from_utf8_lossy(&token_post.body);
         assert!(body.contains("grant_type=third"));
         assert!(body.contains("ticket=ST-TEST-ONLY-TICKET-c3d4"));
+        assert!(
+            !body.to_ascii_lowercase().contains("password"),
+            "the UCloud token request must not carry the CAS password"
+        );
         assert!(
             request_header(token_post, "cookie").is_none(),
             "CAS cookies must not leak to the UCloud API host"
@@ -1273,21 +1467,27 @@ mod tests {
             let error = ucloud_read_url(path).expect_err("path must be rejected");
             assert_eq!(error.code, 5, "unexpected class for {path:?}");
             assert_eq!(error.kind, "upstream");
+            assert_no_secret(&error);
         }
+
+        let mut transport = successful_cas_script();
+        let mut login = cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
+        let error = login
+            .ucloud_read(&mut transport, "/../ykt-site/work")
+            .expect_err("invalid path must fail before token lookup");
+        assert_upstream_error(error);
+        assert_eq!(
+            transport.calls.len(),
+            4,
+            "an invalid read path must not trigger a UCloud token request"
+        );
+        assert_no_token_request(&transport);
     }
 
     #[test]
     fn expired_ucloud_token_is_not_reused() {
         let mut transport = successful_cas_script();
         let mut login = cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
-        enqueue(
-            &mut transport,
-            "GET",
-            super::super::CAS_SERVICE_URL,
-            302,
-            &[("Location", TICKET_URL)],
-            "",
-        );
         enqueue(
             &mut transport,
             "POST",
@@ -1331,61 +1531,6 @@ mod tests {
     }
 
     #[test]
-    fn ucloud_ticket_issue_requires_a_usable_ticket() {
-        for (status, location, body, code) in [
-            (401, None, "", 3),
-            (500, None, "", 4),
-            (302, Some("https://ucloud.bupt.edu.cn/uclass"), "", 3),
-            (
-                302,
-                Some("https://ucloud.bupt.edu.cn/uclass?ticket="),
-                "",
-                3,
-            ),
-            (
-                200,
-                None,
-                "<html><input name=\"execution\" value=\"TEST-ONLY-EXPIRED\"></html>",
-                3,
-            ),
-        ] {
-            let mut transport = successful_cas_script();
-            let mut login =
-                cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
-            let headers: Vec<(&str, &str)> = location
-                .into_iter()
-                .map(|value| ("Location", value))
-                .collect();
-            enqueue(
-                &mut transport,
-                "GET",
-                super::super::CAS_SERVICE_URL,
-                status,
-                &headers,
-                body,
-            );
-
-            let error = login
-                .ucloud_token(&mut transport)
-                .expect_err("ticket issue must fail");
-            assert_eq!(error.code, code, "wrong class for status {status}");
-            if code == 3 {
-                assert_auth_error(error);
-            } else {
-                assert_network_error(error);
-            }
-            assert_eq!(transport.calls.len(), 4);
-            assert!(
-                transport
-                    .calls
-                    .iter()
-                    .all(|call| call.method != "POST" || call.url != UCLOUD_TOKEN_URL),
-                "a missing or rejected ticket must not reach the token endpoint"
-            );
-        }
-    }
-
-    #[test]
     fn ucloud_ticket_redirect_is_validated_before_token_exchange() {
         for location in [
             "https://evil.example/uclass?ticket=ST-x",
@@ -1394,6 +1539,18 @@ mod tests {
             let mut transport = successful_cas_script();
             let mut login =
                 cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
+            enqueue(
+                &mut transport,
+                "POST",
+                UCLOUD_TOKEN_URL,
+                200,
+                &[],
+                &format!("{{\"access_token\":\"{EXPIRED_ACCESS_SECRET}\"}}"),
+            );
+            login
+                .ucloud_token(&mut transport)
+                .expect("the login ticket is consumed");
+            let baseline = transport.calls.len();
             enqueue(
                 &mut transport,
                 "GET",
@@ -1407,12 +1564,11 @@ mod tests {
                 .ucloud_token(&mut transport)
                 .expect_err("foreign ticket redirect must fail");
             assert_auth_error(error);
-            assert_eq!(transport.calls.len(), 4);
+            assert_eq!(transport.calls.len(), baseline + 1);
             assert!(
-                transport
-                    .calls
+                transport.calls[baseline..]
                     .iter()
-                    .all(|call| call.method != "POST" || call.url != UCLOUD_TOKEN_URL),
+                    .all(|call| call.url != UCLOUD_TOKEN_URL),
                 "invalid ticket redirect must not reach the token endpoint"
             );
         }
@@ -1422,7 +1578,9 @@ mod tests {
     fn ucloud_token_response_requires_explicit_success() {
         for (status, body, code) in [
             (401, "{\"error\":\"unauthorized\"}", 3),
-            (500, "{}", 4),
+            (403, "{\"error\":\"forbidden\"}", 3),
+            (429, "{\"error\":\"slow down\"}", 5),
+            (500, "{}", 5),
             (200, "not json", 5),
             (200, "[]", 5),
             (200, "{\"refresh_token\":\"missing-access\"}", 3),
@@ -1431,14 +1589,6 @@ mod tests {
             let mut transport = successful_cas_script();
             let mut login =
                 cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
-            enqueue(
-                &mut transport,
-                "GET",
-                super::super::CAS_SERVICE_URL,
-                302,
-                &[("Location", TICKET_URL)],
-                "",
-            );
             enqueue(&mut transport, "POST", UCLOUD_TOKEN_URL, status, &[], body);
 
             let error = login
@@ -1448,7 +1598,7 @@ mod tests {
             if code == 3 {
                 assert_auth_error(error);
             } else {
-                assert!(!error.message.contains(ACCESS_SECRET));
+                assert_upstream_error(error);
             }
             assert_eq!(transport.calls.len(), 5);
         }

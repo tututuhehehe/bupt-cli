@@ -14,7 +14,7 @@ const PUBLIC_USER_FIELDS: &[&str] = &["user_id", "user_name", "real_name"];
 const CAS_SERVICE_URL: &str =
     "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fucloud.bupt.edu.cn%2Fuclass";
 
-// The protocol slice is exercised only by unit tests until login wiring is authorized.
+// Test-only protocol prototype; the live-wiring gate is documented in docs/migration-tests/identity.md.
 #[allow(dead_code)]
 mod cas;
 

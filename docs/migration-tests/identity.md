@@ -81,12 +81,14 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 `src/identity/cas.rs` 是从 Python `auth.py` 抽出的单个平铺子模块，只服务测试和后续接线，当前没有接到任何生产命令、传输工厂或会话持久化：
 
 - `cas_login` 先 GET CAS 登录页并提取 `execution`，然后只提交一次账号密码表单。所有重定向都校验 URL、host 和 path；POST 不跟随 307/308，返回明确的 auth 错误，避免重放密码。其余重定向只以 GET 跟随，目标必须是 HTTPS 的 `auth.bupt.edu.cn/authserver/*` 或 `ucloud.bupt.edu.cn/uclass*`；端口、userinfo、非 TLS、外部 host、路径穿越和超长重定向链都拒绝。TLS 证书校验由最终传输实现负责；本切片只保证请求 URL 和重定向目标不会离开 HTTPS 白名单。
-- CAS 成功必须是 2xx，且最终 URL 不是 `/authserver/login`、响应里也不再出现登录 `execution` 表单。单独的 HTTP 200 登录页不算成功。
-- `CasLogin` 的字段私有，只有成功完成上述交换才能构造。当前切片不写任何文件；后续 `login` 接线必须从该值取得已确认身份后再写 `credentials.json`/`session.json`，失败路径不得写状态。
-- `ucloud_token` 是惰性的：CAS 登录本身不预取 UCloud token。第一次需要时 GET 带 service 的 CAS 地址，只从 `Location` 提取 ticket，立刻 POST `ykt-basics/oauth/token`（`grant_type=third`，Basic `sword:sword_secret`）；token 只缓存在内存，并按既有 `UCLOUD_EXPIRY_BUFFER_SECONDS`/JWT `exp` 判断是否过期。ticket 交换不跟随进入 UCloud，后续读取用 `Blade-Auth`、`Tenant-Id: 000000` 和同一 Basic 头，不把 CAS Cookie 或密码带到 UCloud API。
-- 错误按现有分层输出：401/403 是 auth `3`，其他 HTTP/传输失败是 network `4`；缺少 execution、畸形页面或 JSON 是 upstream `5`；没有 ticket、ticket 重定向不合法或缺少 `access_token` 是 auth `3`。错误消息不回显密码、Cookie 或 token。
-- 12 个 lib 单测使用 `Scripted` 和 `TEST-ONLY-` 合成值：单次密码 POST 与 GET 重定向、200 登录页拒绝、307/308 拒绝、非 TLS/外部 host 拒绝、HTTP 失败分类、缺失 execution、惰性 token 与缓存复用、过期 token 不重用、UCloud 读取路径校验、ticket 重定向/缺失/拒绝校验、token 响应成功条件。当前 lib 共 53 个测试；`contract_identity` 仍是 28 个进程测试。
+- CAS 表单最终页必须是 2xx，且不能仍是 `/authserver/login` 登录页。随后必须再走普通 CAS service-ticket 校验请求：只有 301/302/303/307/308 这类明确重定向状态，且 `Location` 指向允许的 UCloud path 并携带 ticket，才算登录成功。2xx 即使带 `Location` 也不算；空页、无关页、登录页、300/304、缺失 ticket 或无 `Location` 的 3xx 都 fail closed。
+- `CasLogin` 的字段私有，只有拿到 service ticket 才能构造；最终 URL 不再暴露，ticket 不进入 `Debug`。当前切片不写任何文件；后续 `login` 接线必须从该值取得已确认身份后再写 `credentials.json`/`session.json`，失败路径不得写状态。
+- `ucloud_token` 是惰性的：CAS 登录本身不请求 OAuth token。登录拿到的 service ticket 在第一次真正需要 token 时使用；之后 ticket 已消费或 token 过期时，再通过同一 CAS service-ticket 校验请求取新 ticket。token 只缓存在内存，并按既有 `UCLOUD_EXPIRY_BUFFER_SECONDS`/JWT `exp` 判断是否过期；ticket 交换不跟随进入 UCloud。后续读取使用 `Blade-Auth`、`Tenant-Id: 000000` 和既有 UCloud 客户端 Basic 授权头，不把 CAS Cookie 或密码带到 UCloud API。
+- 错误按全局合同分层：401/403 是 auth `3`；其他 HTTP 4xx/5xx（包括限流 429）是 upstream `5`，其中 429 只提示等待，其他提示服务响应异常，均不提示重试密码；连接/传输失败是 network `4`。缺少 execution、畸形页面/JSON、缺失 `Location` 是 upstream `5`；没有 ticket、ticket 重定向不合法或缺少 `access_token` 是 auth `3`。错误消息不回显密码、Cookie、ticket 或 token。
+- 15 个 lib 单测使用 `Scripted` 和 `TEST-ONLY-` 合成值：单次密码 POST、service ticket 正向证据、显式重定向状态（301/302/303/307/308）、允许 302 后空/无关 200 无 ticket 的失败关闭、200 带 `Location` 不得当 ticket、307/308 拒绝、非 TLS/外部 host 拒绝、HTTP 4xx/5xx 与连接失败分层（含 429）、缺失 execution、惰性 token 与缓存复用、过期 token 不重用、UCloud 读取路径校验、ticket 重定向校验、token 响应成功条件。当前 lib 共 56 个测试；`contract_identity` 仍是 28 个进程测试。
 - 未实现：真实传输接线、账号/会话写入、自动续期/登录次数上限、在线 `diagnose`、Windows ACL、真实校园网验收。以上仍保留在下面的待实现场景中。
+
+**集成门槛（live wiring）**：当前手写 URL parser 和 cookie jar 只是合成测试原型，不能直接接真实 Rust 流量。上线前必须换成维护中的 URL/cookie 实现，至少覆盖 host-only cookie、expiration、default path、domain/path 校验、IDNA/端口/重定向规范化；替换并独立审查前不接生产 transport、不扩大 host 白名单、不增加依赖或网络流量。
 
 ## 用例映射
 
