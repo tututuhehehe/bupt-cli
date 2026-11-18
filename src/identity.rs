@@ -99,7 +99,7 @@ pub(crate) fn run(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Role {
+pub(crate) enum Role {
     Graduate,
     Undergraduate,
 }
@@ -118,11 +118,26 @@ impl Role {
     }
 }
 
-#[derive(Debug)]
-struct Account {
+/// Read-only local profile metadata; it contains no password or session material.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalProfile {
     username: String,
     role: Option<Role>,
     has_password: bool,
+}
+
+impl LocalProfile {
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn role(&self) -> Option<Role> {
+        self.role
+    }
+
+    pub(crate) fn has_password(&self) -> bool {
+        self.has_password
+    }
 }
 
 fn run_login(matches: &ArgMatches) -> CliResult<Outcome> {
@@ -152,7 +167,7 @@ fn login_arguments(matches: &ArgMatches) -> CliResult<(String, String, Role)> {
 }
 
 fn run_status(context: &mut Context<'_>) -> CliResult<Outcome> {
-    let account = load_account(&context.config_dir)?;
+    let account = load_profile(&context.config_dir)?;
     let session = load_session(&context.cache_dir, account.as_ref());
     Ok(Outcome {
         data: status_document(context, account.as_ref(), &session),
@@ -161,7 +176,14 @@ fn run_status(context: &mut Context<'_>) -> CliResult<Outcome> {
     })
 }
 
-fn load_account(config_dir: &Path) -> CliResult<Option<Account>> {
+fn load_account(config_dir: &Path) -> CliResult<Option<LocalProfile>> {
+    load_account_with_env(config_dir, |key| env::var(key).ok())
+}
+
+fn load_account_with_env(
+    config_dir: &Path,
+    env: impl Fn(&str) -> Option<String>,
+) -> CliResult<Option<LocalProfile>> {
     let path = config_dir.join(CREDENTIALS_FILENAME);
     let config = match fs::read(&path) {
         Ok(bytes) => {
@@ -197,8 +219,7 @@ fn load_account(config_dir: &Path) -> CliResult<Option<Account>> {
     };
 
     let config_username = config.get("username").and_then(Value::as_str);
-    let username = env::var("BUPT_USERNAME")
-        .ok()
+    let username = env("BUPT_USERNAME")
         .filter(|value| !value.trim().is_empty())
         .or_else(|| config_username.map(str::to_owned))
         .map(|value| value.trim().to_owned())
@@ -211,22 +232,24 @@ fn load_account(config_dir: &Path) -> CliResult<Option<Account>> {
         .get("role")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let role_text = env::var("BUPT_ROLE")
-        .ok()
+    let role_text = env("BUPT_ROLE")
         .filter(|value| !value.trim().is_empty())
         .or(config_role);
     let config_has_password = config
         .get("password")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.is_empty());
-    let env_has_password = env::var("BUPT_PASSWORD")
-        .ok()
-        .is_some_and(|value| !value.is_empty());
-    Ok(Some(Account {
+    let env_has_password = env("BUPT_PASSWORD").is_some_and(|value| !value.is_empty());
+    Ok(Some(LocalProfile {
         username,
         role: role_text.as_deref().and_then(Role::parse),
         has_password: config_has_password || env_has_password,
     }))
+}
+
+/// Load local profile metadata without reading the session cache or writing state.
+pub(crate) fn load_profile(config_dir: &Path) -> CliResult<Option<LocalProfile>> {
+    load_account(config_dir)
 }
 
 #[derive(Debug)]
@@ -248,7 +271,7 @@ impl SessionSnapshot {
     }
 }
 
-fn load_session(cache_dir: &Path, account: Option<&Account>) -> SessionSnapshot {
+fn load_session(cache_dir: &Path, account: Option<&LocalProfile>) -> SessionSnapshot {
     let path = cache_dir.join(SESSION_FILENAME);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -268,7 +291,7 @@ fn load_session(cache_dir: &Path, account: Option<&Account>) -> SessionSnapshot 
     let Some(account) = account else {
         return SessionSnapshot::empty("no configured account; session cache not adopted");
     };
-    if !account.has_password {
+    if !account.has_password() {
         return SessionSnapshot::empty(
             "the saved profile has no password; session cache not adopted",
         );
@@ -281,7 +304,7 @@ fn load_session(cache_dir: &Path, account: Option<&Account>) -> SessionSnapshot 
     else {
         return SessionSnapshot::empty("the session cache has no account owner");
     };
-    if session_username != account.username {
+    if session_username != account.username() {
         let mut snapshot =
             SessionSnapshot::empty("the session cache belongs to a different account");
         snapshot.mismatch = true;
@@ -306,7 +329,7 @@ fn load_session(cache_dir: &Path, account: Option<&Account>) -> SessionSnapshot 
                 .get("role")
                 .and_then(Value::as_str)
                 .and_then(Role::parse);
-            match (account.role, session_role) {
+            match (account.role(), session_role) {
                 (Some(expected), Some(actual)) if expected == actual => SessionSnapshot {
                     data,
                     accepted: true,
@@ -322,7 +345,7 @@ fn load_session(cache_dir: &Path, account: Option<&Account>) -> SessionSnapshot 
 
 fn status_document(
     context: &Context<'_>,
-    account: Option<&Account>,
+    account: Option<&LocalProfile>,
     session: &SessionSnapshot,
 ) -> Value {
     let now = unix_now();
@@ -340,7 +363,7 @@ fn status_document(
             .map(|value| json!(value))
     } else {
         account
-            .map(|account| json!(account.username))
+            .map(|account| json!(account.username()))
             .or(Some(Value::Null))
     }
     .unwrap_or(Value::Null);
@@ -348,7 +371,7 @@ fn status_document(
     let cookies = cookie_status(data.get("cookies"), now);
     let ucloud = ucloud_status(data.get("ucloud"), now);
     let mobile_data =
-        if session.accepted && account.and_then(|account| account.role) != Some(Role::Graduate) {
+        if session.accepted && account.and_then(|account| account.role()) != Some(Role::Graduate) {
             data.get("mobile_jwgl")
         } else {
             None
@@ -611,7 +634,7 @@ fn remove_owned_file(path: &Path, label: &str) -> CliResult<bool> {
 fn run_diagnose(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     let _request_timeout = matches.get_one::<f64>("request_timeout");
     let groups = requested_groups(matches)?;
-    let account = load_account(&context.config_dir)?;
+    let account = load_profile(&context.config_dir)?;
     let session = load_session(&context.cache_dir, account.as_ref());
     let has_cookies =
         session.accepted && cookie_status(session.data.get("cookies"), unix_now()).usable > 0;
@@ -760,4 +783,101 @@ fn base64url_decode(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    const PROFILE_PASSWORD: &str = "TEST-ONLY-PROFILE-PASSWORD-4a7c";
+    const PROFILE_COOKIE: &str = "TEST-ONLY-PROFILE-COOKIE-b8d2";
+    const PROFILE_TOKEN: &str = "TEST-ONLY-PROFILE-TOKEN-c9e3";
+
+    fn write_profile(directory: &Path, value: &Value) {
+        let text = serde_json::to_string_pretty(value).expect("serialize profile");
+        fs::write(directory.join(CREDENTIALS_FILENAME), text).expect("write profile");
+    }
+
+    fn load_isolated_profile(directory: &Path) -> CliResult<Option<LocalProfile>> {
+        load_account_with_env(directory, |_| None)
+    }
+
+    #[test]
+    fn profile_normalizes_username_role_and_password_presence() {
+        let directory = tempdir().expect("create profile directory");
+        write_profile(
+            directory.path(),
+            &serde_json::json!({
+                "username": " 2026000001 ",
+                "password": PROFILE_PASSWORD,
+                "role": "研究生",
+                "cookie": PROFILE_COOKIE,
+                "access_token": PROFILE_TOKEN,
+                "unrelated": {"nested": "ignored"}
+            }),
+        );
+
+        let profile = load_isolated_profile(directory.path())
+            .expect("load profile")
+            .expect("profile is present");
+        assert_eq!(profile.username(), "2026000001");
+        assert_eq!(profile.role(), Some(Role::Graduate));
+        assert!(profile.has_password());
+
+        let debug = format!("{profile:?}");
+        for secret in [PROFILE_PASSWORD, PROFILE_COOKIE, PROFILE_TOKEN] {
+            assert!(!debug.contains(secret), "Debug output leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn profile_keeps_passwordless_and_missing_or_invalid_role_explicit() {
+        let passwordless_dir = tempdir().expect("create passwordless directory");
+        write_profile(
+            passwordless_dir.path(),
+            &serde_json::json!({"username": " 2026000002 ", "role": "本科生"}),
+        );
+        let passwordless = load_isolated_profile(passwordless_dir.path())
+            .expect("load passwordless profile")
+            .expect("passwordless profile is present");
+        assert_eq!(passwordless.username(), "2026000002");
+        assert_eq!(passwordless.role(), Some(Role::Undergraduate));
+        assert!(!passwordless.has_password());
+
+        let missing_role_dir = tempdir().expect("create missing-role directory");
+        write_profile(
+            missing_role_dir.path(),
+            &serde_json::json!({"username": "2026000003", "password": PROFILE_PASSWORD}),
+        );
+        let missing_role = load_isolated_profile(missing_role_dir.path())
+            .expect("load missing-role profile")
+            .expect("missing-role profile is present");
+        assert_eq!(missing_role.role(), None);
+
+        let invalid_role_dir = tempdir().expect("create invalid-role directory");
+        write_profile(
+            invalid_role_dir.path(),
+            &serde_json::json!({
+                "username": "2026000004",
+                "password": PROFILE_PASSWORD,
+                "role": "staff"
+            }),
+        );
+        let invalid_role = load_isolated_profile(invalid_role_dir.path())
+            .expect("load invalid-role profile")
+            .expect("invalid-role profile is present");
+        assert_eq!(invalid_role.role(), None);
+    }
+
+    #[test]
+    fn profile_absent_file_is_none() {
+        let directory = tempdir().expect("create empty profile directory");
+        assert!(
+            load_isolated_profile(directory.path())
+                .expect("load profile")
+                .is_none()
+        );
+    }
 }
