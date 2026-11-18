@@ -7,9 +7,10 @@
 - `tests/test_homework_show.py`
 - `tests/test_verify.py`
 
-测试分三层：
+测试分三层（源内单元层按 read / submit 拆分）：
 
 - `tests/contract_homework.rs`：当前**可运行**的公开进程 CLI 契约用例，只使用共享 `Sandbox`（隔离家目录/配置/缓存）。覆盖解析器、无凭据鉴权边界、参数门禁，不访问上游。
+- `src/homework/read.rs` 的 `#[cfg(test)]` 单元用例：当前**可运行**的只读进程内缝，使用共享 `transport::testing::Scripted` 和合成 session。覆盖课程分页/去重/终止条件、undone 映射、空 undone、未授权和畸形响应；不读取真实凭据，不回退到网络，也尚未接上公开 CLI。
 - `src/homework/submit.rs` 的 `#[cfg(test)]` 单元用例：当前**可运行**的进程内缝，使用共享 `transport::testing::Scripted`、合成 session 和临时文件。覆盖提交门禁、零次/一次/未知 upload/submit 结果和确认回执分类；不读取真实凭据，不回退到网络。命令规格与本地校验保留在较小的 `src/homework.rs`。
 - `tests/homework_replay/cases.rs`：**草稿，未被 Cargo 自动发现，也尚不可运行**。它保留完整合成录制驱动的业务用例，等待库内部的注入式 transport/clock/session 测试缝接入。没有运行时环境变量回放，没有真实网络/凭据/浏览器。
 
@@ -43,6 +44,34 @@
 
 这些用例共用真实进程 `Sandbox`，不安装任何假上游，也无法断言业务数据成功路径。
 
+### 源内只读单元用例（`src/homework/read.rs`）
+
+这些用例直接调用只读 helper，只替换 transport 与 session，不启动第二个进程：
+
+| 用例 | 覆盖点 |
+|---|---|
+| `courses_first_page_keeps_all_eleven_unique_site_ids` | 合成首屏 11 行、site id 全部存在且唯一；短页后只请求一次 |
+| `courses_short_page_stops_without_a_second_request` | 2 行短页后立即停止，不猜测还有下一页 |
+| `courses_empty_page_stops_without_a_second_request` | 空页返回 `count=0` 和空数组，不报错、不请求第二页 |
+| `courses_concatenate_pages_and_deduplicate_repeated_ids` | 跨页保持页序，只去掉重复的非空 id；重复项不覆盖首条元数据 |
+| `courses_keep_every_empty_site_id` | 空 `siteId` 无法去重，全部保留 |
+| `courses_stop_when_a_full_page_adds_no_new_ids` | 整页都是重复 id 时停止，不无限翻页 |
+| `courses_stop_at_the_ten_page_safety_limit` | 10 页安全上限，最多 500 行，不请求第 11 页 |
+| `unauthorized_courses_and_undone_stop_after_one_request` | 401/403 都退鉴权 3，courses 和 undone 各只请求一次，不重试 |
+| `unexpected_course_payloads_are_parse_errors_without_retry` | 缺 `data`、非对象、坏 records、坏 total 都退 parse 5，只请求一次 |
+| `upstream_course_error_is_a_single_network_failure` | 上游 `code` 非 0/200 退网络 4，只请求一次，不回显原始 `msg` |
+| `undone_mapping_matches_the_python_fields` | 现有 undone fixture 的 activity/site/begin/end 映射、计数和 `submitted=false` |
+| `undone_mapping_keeps_python_fallback_rules_without_course_enrichment` | `id`/`assignmentTitle` 回退、`siteId=0` 视为缺失、`-1` 原样保留；不伪造课程或截止时间 |
+| `empty_undone_is_success_and_not_an_auth_error` | 空 `undoneList` 是成功结果，`siteNum=0`、`undoneNum=0`，不是鉴权失败 |
+| `unexpected_undone_payloads_are_parse_errors_without_retry` | 非对象 data、缺 `undoneList`、非对象记录都退 parse 5，只请求一次 |
+| `undone_without_user_id_fails_before_transport` | 合成 session 缺 `user_id` 时退鉴权 3，transport 零调用 |
+
+与 Python `cmd_courses` 对齐的分页规则：`size=50`、最多 10 页、按页序拼接、只对非空 `siteId` 去重、空页/短页/整页无新 id 时停止。`get_courses` 本身不按 `total` 终止，但 Python 解析器会拒绝畸形 total，这里同样校验。
+
+与 Python `get_undone` 对齐的映射规则：GET `/ykt-site/site/student/undone?userId=...`，`activityId`/`id` 与 `activityName`/`assignmentTitle` 依次回退，`siteId=0` 视为缺失，`is_submitted` 固定 false，`siteNum` / `undoneNum` 默认值分别为 0 / 列表长度。**课程富化暂不实现**：真实非空 undone 可能出现 `siteId=-1` 和空 `siteName`，Python 的 `_enrich_undone_courses` 需要再扫全部课程作业并按 activity id 回填；本批没有真实非空 undone 证据，也没有接上 `get_all_homework`，因此明确延期，不声称 parity，`-1` 与空名称保持原样。
+
+Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust 这里没有身份 lane 的续期适配器，因此只请求一次并退鉴权 3。重试/续期必须等真实 session 适配器接入后单独验证；当前“不循环”的行为已由测试固定。
+
 ### 源内单元用例（`src/homework/submit.rs`）
 
 这些用例直接调用提交 helper，只替换 transport 与 session，不启动第二个进程：
@@ -63,7 +92,7 @@
 
 回执判定只接受肯定证据：显式 `success: true`，或认可的 `code`（0/200）。空对象、缺失/非法指示、互相矛盾的 success/code、2xx 非 JSON、408、5xx、意外重定向以及没有确认响应的 transport failure 都退 6 且 `submitted=null`，并只指向只读 `verify`。明确 4xx（408 除外）、JSON 负回执和 401/403 仍走显式错误（HTTP/上游 5，鉴权 3），不伪装成 unknown。所有分支都不自动重发 submit；transport failure 只说明没有收到确认响应，不回显原始诊断。
 
-当前真实 CLI 在提交 helper 之前没有会话适配器，因此带凭据时仍以“session wiring 未实现”退 5，绝不发起 HTTP。凭据只从 `credentials.json` 读取（username + 非空密码），不读取账号环境变量，也不要求 role；`courses`、作业列表、`show`、`download`、`verify` 同样在通过凭据检查后以 unsupported 退 5。本批没有课程分页、列表、详情、下载或只读核验实现，`verify` 保持 pending。成功提交但未跑 `--no-verify` 时 helper 也返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`。
+当前真实 CLI 在提交 helper 之前没有会话适配器，因此带凭据时仍以“session wiring 未实现”退 5，绝不发起 HTTP。凭据只从 `credentials.json` 读取（username + 非空密码），不读取账号环境变量，也不要求 role；`courses`、作业列表、`show`、`download`、`verify` 同样在通过凭据检查后以 unsupported 退 5。本批新增了 `read.rs` 的课程分页和 undone 映射 helper 及其源内测试，但还没有公开 CLI 输出组装或真实 session，列表/详情/下载/只读核验仍未接线，`verify` 保持 pending。成功提交但未跑 `--no-verify` 时 helper 也返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`。
 
 结果里不序列化 detail 原始对象或 session 结构；接受的 `upstream.msg` 和错误文本在输出边界统一脱敏，`Session` 不实现 `Debug`。新增 fixture `homework_submit_echo_token.json` 让上游回显合成 token，供后续进程级 seam 复用；当前对应边界测试已在源内通过。
 
@@ -93,7 +122,7 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 
 ## 草稿覆盖矩阵
 
-以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。其中提交门禁、dry-run、确认一次写入、响应丢失四类已有上面源内单元用例覆盖 helper 层；草稿仍保留为后续完整进程级录制验收。
+以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。其中 `courses` 分页/去重/终止和空 undone 已由上面的 `read.rs` 源内 helper 用例覆盖；提交门禁、dry-run、确认一次写入、响应丢失四类已有 `submit.rs` 源内覆盖。草稿仍保留为后续完整进程级录制验收。
 
 ### courses
 
@@ -158,19 +187,22 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 - verify 草稿仍带公开 CLI 不存在的 `--course`；接线前要按详情目标课程重做参数与录制，不能为了草稿直接新增该参数。
 - 固定 5 秒重试等待未做墙钟断言；草稿只保留 `attempts` 与退出码边界。
 - 上传失败、submit-view 401 后的续期、真实校园网上游验收未运行。真实提交/上传不在本阶段执行，校园网验收需用户单独确认。
+- 真实非空 undone 的课程富化（`_enrich_undone_courses`）延期：需要真实样本证明 `siteId=-1`/空 `siteName` 的分布，并接入全课程作业扫描与预算语义；`read.rs` 当前只映射 undone 端点原始字段，不声称该富化 parity。
+- Python UCloud 401 invalidate+retry 一次的续期行为延期到 identity session 适配器；当前只读 helper 明确只请求一次并退鉴权 3。
+- 用户提供的真实只读基线（本 worktree 未重跑）显示课程首屏 11 行且 site id 唯一；自动化只用合成 fixture，真实校园网读取验收仍需用户单独确认。
 
 ## 下一批接线顺序
 
 1. 由 identity lane 提供真实 session 适配器，替换 `homework::submit::load_session` 的 unsupported 退出；提交 helper 已通过 `Context.transport` 注入，接线时不得新增环境变量回放。
 2. 先把源内提交用例接到 fixture/进程级 seam（含 `homework_submit_echo_token.json`），再为 empty/invalid/refusal 回执补录制，并补 `submit_confirmed_uploads_submits_once_and_verifies`、`submit_unverified_exits_six_without_resubmitting`、`submit_verification_error_exits_seven_without_resubmitting`。
-3. 按 `courses` 分页、列表/`--new`、详情/下载、只读 `verify` 的顺序接线；每类先实现只读请求，再引入写请求。
-4. 校园网真实提交/上传与双平台验收单独执行，需用户确认。
+3. `read.rs` 的课程分页/去重和 undone 映射已由源内测试覆盖；接上真实 session 后先组装现有 `count` / `courses` 和 `homework --undone` 输出，再按列表/`--new`、详情/下载、只读 `verify` 的顺序接线。每类先实现只读请求，再引入写请求。
+4. 真实非空 undone 富化、401 续期和校园网真实读取/提交验收单独执行，需用户确认。
 
 ## 当前验证状态
 
 - `cargo fmt --check`：通过。
-- `cargo test --locked --offline --lib`：13 个通过（2 个共享 CLI + 11 个 homework 提交 helper）。
-- `cargo test --locked --offline --test contract_homework`：11 个通过。
+- `cargo test --locked --offline --lib`：56 个通过（2 个共享 CLI + 11 个 homework 提交 helper + 15 个 homework 只读 helper + 28 个其它 lane 单元用例）。
+- `cargo test --locked --offline --test contract_homework`：14 个通过。
+- `cargo test --locked --offline`：全绿；56 单元 + 25 academics + 33 campus + 14 homework + 28 identity + 23 lifecycle 契约用例全部通过。
 - `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此 30 个草稿全部不可运行，也没有伪装通过。
-- 同一 worktree 的 `contract_lifecycle` 红跑仍有 12 个失败，均属于 `status` / `update` / `uninstall` 等其它 lane 的空实现；`homework` 入口、帮助树、移除别名相关用例已通过。该红跑不是本 lane 的验收门禁。
 - 未运行真实校园网、浏览器会话、上传或提交；没有新增环境变量回放开关。
