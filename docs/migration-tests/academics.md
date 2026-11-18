@@ -29,6 +29,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `cached_export_writes_an_anonymized_ics_with_real_dates` | `test_timetable.py::test_build_ics_emits_one_event_per_session`、`test_build_ics_is_crlf_and_folded` | `schedule export` 每个 occurrence 一个 VEVENT；真实日期、开始/结束时间、SUMMARY/LOCATION、CRLF、折叠宽度、末周课程也导出 |
 | `ics_folds_long_utf8_lines` | `test_timetable.py::test_build_ics_is_crlf_and_folded`、`test_grad.py::test_build_ics_is_crlf_and_folded` | 长中文 SUMMARY 按 UTF-8 八位字节折行，每行不超过 76 字节；按 RFC 5545 去折行后必须逐字节还原完整 SUMMARY，拒绝截断或省略 |
 | `export_succeeds_even_when_opening_the_folder_fails` | 合同“导出文件成功不因打开系统文件管理器失败变成导出失败” | Unix 下伪造 `open` 写 sentinel 后退出 9：证明 opener 确实被调用，同时 `schedule export` 仍成功且文件存在；真实 Windows reveal 仍未实测 |
+| `export_ignores_planted_temp_symlink_and_preexisting_temp_file` | 安全临时文件；合同“导出失败不覆盖旧文件” | `output.ics.tmp` 先放普通文件再换成指向 victim 的 symlink：两次导出都成功，普通临时文件内容不变、symlink 仍是链接且 victim 未变；证明实现不再用可预测临时路径 |
 | `passwordless_profile_cannot_read_a_matching_snapshot` | 合同“`logout` 清掉本地密码和会话，保留课表”；身份/快照归属 | 密码被清掉但 username/role 仍匹配时，query/calendar/export 全部 auth 拒绝；快照字节不变，不生成 ICS |
 | `environment_credentials_do_not_fill_a_passwordless_profile` | 旧凭据优先级的有意变更 | 配置缺密码时，即使合成 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 全部存在，也不能补足本地 profile；查询停在 auth，快照不变 |
 | `environment_credentials_do_not_override_saved_account_or_role` | 旧凭据优先级的有意变更 | 有效 JSON 的学号和 role 优先于冲突的账号环境变量；匹配的 graduate 快照仍可读取，role 输出保持 `graduate` |
@@ -63,16 +64,21 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `foreign_snapshot_is_never_used_even_when_refresh_fails` | 归属不符且刷新失败：返回错误，不把外来快照当兜底，旧文件不变 |
 | `foreign_snapshot_is_replaced_only_after_a_clean_refresh` | 归属不符但刷新成功：恰好 1 次取数，只有刷新成功后才替换缓存 |
 | `date_outside_the_selected_term_never_fetches_again` | 先用新鲜快照完成选择（0 次），再由 `ensure_date_in_term` 拒绝范围外 `--date`，来源仍为 0 次 |
-| `failed_incomplete_or_out_of_term_refresh_preserves_the_old_snapshot` | 刷新报错、缺时钟、或返回不覆盖当天的学期：都只取 1 次，旧快照字节不变，无临时文件 |
+| `failed_incomplete_or_out_of_term_refresh_preserves_the_old_snapshot` | 刷新报错、缺时钟、不覆盖当天、或“零课程 + 畸形/空教学周日历”：都只取 1 次，旧快照字节不变，不因 `term_bounds` 跳过坏日期而部分替换 |
 | `forced_update_fetches_even_for_a_fresh_snapshot_and_preserves_on_failure` | `update` 语义强制取数（即使快照新鲜）；成功后替换，失败后保留旧快照 |
+| `atomic_writes_leave_predictable_temp_files_untouched` | 普通 `timetable.json.tmp` / `output.ics.tmp` 预置内容在写入后仍逐字节不变；实际写入使用随机 `NamedTempFile` |
+| `atomic_writes_do_not_follow_planted_temp_symlinks` | 预置临时路径若是指向无关文件的 symlink：保存快照和导出都不跟随，victim 内容与链接目标都不变 |
+| `atomic_write_refuses_a_symlink_target_without_touching_it` | 目标本身是 symlink 时拒绝替换；返回 upstream 错误，链接和指向文件都不变 |
+| `concurrent_atomic_writes_leave_one_complete_file` | 多个并发写同一目标：最终内容是某一次完整 payload，不出现交叉/截断内容 |
 
 ## 实施状态（本地当前学期与完整导出）
 
 - `src/academics.rs` 已实现一个共享的本地优先选择/刷新边界：`schedule`、`schedule calendar`、`schedule export` 在读取前先验证 v2 归属与运行当天是否在学期闭区间内；缺失、过期、归属不符或损坏时最多自动取数一次。`schedule update` 复用同一边界并强制刷新。生产来源 `UnavailableSource` 明确返回“当前构建没有接通教务课表刷新；不会伪造课表数据”（退出 5），不触碰网络或浏览器。
-- 取数成功后才原子替换 `timetable.json`；刷新失败、数据不完整或不覆盖当天时保留旧文件，但拒绝把旧文件当作当前学期。进程用例与实现侧假来源用例共同覆盖 0 次命中、1 次刷新、归属不符、范围外 `--date` 和失败保留。
-- `schedule export` 先对全部场次做完整校验：日期必须来自教学周日期表，时间支持 `8:00`、`08:00`、`0800`、全角冒号等可识别形式并规范化；任一课程缺日期/时间或时钟非法时点名课程并整次失败。教师/教室缺失允许。校验通过后才写临时文件并替换目标，失败不会覆盖已有 `.ics`。
+- 取数成功后才替换 `timetable.json`；刷新失败、数据不完整或不覆盖当天时保留旧文件，但拒绝把旧文件当作当前学期。取数结果还会校验每个教学周恰好 7 个连续合法日期；`term_bounds` 不再独自承担完整性判断，因此“零课程 + 畸形/空日历”也不会被部分写回。
+- 缓存与 `.ics` 共用同一个原子写入助手：在目标同目录用 `NamedTempFile` 创建不可预测临时文件，写满、flush、`sync_all` 后才 `persist`。目标若是 symlink、非普通文件或与临时文件同一 inode 会拒绝；预置的可预测 `.tmp` 文件/链接不会被跟随或截断，写入失败保留旧目标。`tempfile` 从 dev-dependency 移到正式 dependency，未增加 crate，`Cargo.lock` 无变化。
+- `schedule export` 先对全部场次做完整校验：日期必须来自教学周日期表，时间支持 `8:00`、`08:00`、`0800`、全角冒号等可识别形式并规范化；任一课程缺日期/时间或时钟非法时点名课程并整次失败。教师/教室缺失允许。校验通过后才走上述原子写入，失败不会覆盖已有 `.ics`。
 - `scores` / `classrooms` / `exams` 仍只完成本地身份与数据源路由校验，之后返回 upstream pending（退出 5）；没有成功输出、网络、浏览器或真实校园数据。
-- 本清单的进程用例 29 个、实现侧刷新边界用例 9 个全部通过；没有用跳过或假断言绕过尚未接通的远端路径。`cargo fmt --check`、`cargo test --locked --offline --lib`、`cargo test --locked --offline --test contract_academics` 是交付检查项。
+- 本清单的进程用例 30 个、实现侧刷新边界/安全写入用例 13 个全部通过；没有用跳过或假断言绕过尚未接通的远端路径。`cargo fmt --check`、`cargo test --locked --offline --lib`、`cargo test --locked --offline --test contract_academics` 是交付检查项。
 - 本地凭据统一由 `identity::require_authenticated_profile` 读取 `credentials.json`：username 和非空密码是登录前提；`role` 只在需要选择/校验数据源的 `schedule`、`exams`、`scores`、`classrooms` 中要求。`BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 不再读取，也不再能补足或覆盖 JSON。
 - 当前学期策略：只看运行当天是否在快照日期闭区间内，不看 `--date`、不看 TTL、不按抓取时间淘汰；学期内不会因快照“旧”而自动刷新。跨学期时按上述边界自动刷新一次。
 
@@ -96,7 +102,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 5. **Chrome/CDP/临时 profile 生命周期**（`test_grad_browser.py` 全部、`test_cdp.py` 全部）
    - 需要可替换浏览器路径、可脚本化的 CDP 端点以及可替换临时目录。本轮明确不启动浏览器、不实现或测试安全控制绕过；这些应在实现阶段以单元测试或专门的本地假 Chrome 缝覆盖。
 6. **课表保存权限**（`test_timetable.py::test_save_and_load_round_trip` 中 `0600`）
-   - 当前刷新写缓存与导出写 `.ics` 都走同目录临时文件 + 替换，失败时保留旧文件；但还没有验证 Unix `0600` 权限或 Windows 覆盖已有目标的行为。需要成功的刷新注入缝和平台验收。
+   - 当前刷新写缓存与导出写 `.ics` 已统一走同目录 `NamedTempFile` + `sync_all` + `persist`，并拒绝 symlink 目标/同 inode 别名；失败保留旧目标。尚未验证 Unix `0600` 权限，也未在 Windows 实测覆盖已有目标的持久化行为；需要平台验收。
 7. **本周/今天/明天的本地日与时钟边界**
    - 旧 Python 用 `date.today()`（用户本地日）；当前 Rust 只用 `std::time`，没有本地时区 API，因此选择边界、today/tomorrow/week 暂用 UTC 日，DTSTAMP 按合同保持 UTC。选择函数已经显式接收 `today`，测试可以固定日期，但生产运行时仍是 UTC；这是明确的未决差异，不冒充已修复。
    - 具体依赖请求：由整合者批准并加入共享依赖 `time`（启用 `local-offset`）或 `jiff`，或提供可注入的共享 clock；在此之前不修改本线 Cargo。跨周（周日/周一）、学期首尾闭区间与学期外 fallback 仍需该 seam 或既有注入日期补足。

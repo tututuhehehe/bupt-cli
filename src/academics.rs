@@ -4,9 +4,11 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 
 const WEEKDAYS: [&str; 7] = [
     "星期一",
@@ -346,20 +348,7 @@ fn select_snapshot(
             "刷新结果不属于当前学号或校园身份，已保留上一份快照",
         ));
     }
-    if term_bounds(&fetched).is_none() {
-        return Err(refresh_failed(
-            "刷新结果缺少可用的学期日期，已保留上一份快照",
-        ));
-    }
-    if !snapshot_covers(&fetched, today) {
-        return Err(refresh_failed("刷新结果不覆盖运行当天，已保留上一份快照"));
-    }
-    if let Err(error) = export_sessions(&fetched) {
-        return Err(refresh_failed(format!(
-            "刷新结果无法生成完整日历，已保留上一份快照：{}",
-            error.message
-        )));
-    }
+    validate_refreshed_snapshot(&fetched, today)?;
     save_snapshot(&path, &fetched)?;
     Ok(Selected {
         snapshot: fetched,
@@ -432,32 +421,147 @@ fn save_snapshot(path: &Path, snapshot: &Snapshot) -> CliResult<()> {
     });
     let bytes = serde_json::to_vec_pretty(&payload)
         .map_err(|_| CliError::new(5, "upstream", "cannot serialize refreshed timetable", ""))?;
-    if let Some(parent) = path
+    write_atomically(path, &bytes, "timetable snapshot")
+}
+
+fn write_atomically(path: &Path, bytes: &[u8], label: &str) -> CliResult<()> {
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|_| {
-            CliError::new(5, "upstream", "cannot create timetable cache directory", "")
-        })?;
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| atomic_write_error(label, "create the parent directory", &error))?;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(CliError::new(
+                5,
+                "upstream",
+                format!("refusing to replace a symlink at the {label} path"),
+                "Remove the symlink manually; the link and its target were left untouched.",
+            ));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(CliError::new(
+                5,
+                "upstream",
+                format!("refusing to replace a non-regular {label}"),
+                "The existing path was left untouched.",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(atomic_write_error(label, "inspect the target", &error)),
     }
-    let temporary = path.with_extension("json.tmp");
-    if let Err(error) = fs::write(&temporary, bytes) {
-        let _ = fs::remove_file(&temporary);
+
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| atomic_write_error(label, "create a temporary file", &error))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|error| atomic_write_error(label, "write the temporary file", &error))?;
+    temporary
+        .as_file_mut()
+        .flush()
+        .map_err(|error| atomic_write_error(label, "flush the temporary file", &error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| atomic_write_error(label, "sync the temporary file", &error))?;
+
+    let aliases = same_existing_file(temporary.path(), path)
+        .map_err(|error| atomic_write_error(label, "compare source and target", &error))?;
+    if aliases {
         return Err(CliError::new(
             5,
             "upstream",
-            format!("cannot write refreshed timetable: {error}"),
-            "The previous snapshot was left untouched.",
+            format!("refusing to replace the {label}: source and target are the same file"),
+            "The existing file was left untouched.",
         ));
     }
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(CliError::new(
-            5,
-            "upstream",
-            format!("cannot replace refreshed timetable: {error}"),
-            "The previous snapshot was left untouched.",
+
+    temporary
+        .persist(path)
+        .map_err(|error| atomic_write_error(label, "replace the target", &error.error))?;
+    Ok(())
+}
+
+fn atomic_write_error(label: &str, action: &str, error: &std::io::Error) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        format!("cannot {action} for the {label}: {error}"),
+        "The previous file was left untouched.",
+    )
+}
+
+#[cfg(unix)]
+fn same_existing_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = fs::metadata(left)?;
+    let right = match fs::metadata(right) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_existing_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    let right = match fs::canonicalize(right) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(fs::canonicalize(left)? == right)
+}
+
+fn validate_refreshed_snapshot(snapshot: &Snapshot, today: Date) -> CliResult<()> {
+    if snapshot.calendar.is_empty() {
+        return Err(refresh_failed("刷新结果缺少教学周日历，已保留上一份快照"));
+    }
+    for (week, dates) in &snapshot.calendar {
+        if *week <= 0 {
+            return Err(refresh_failed(format!(
+                "刷新结果包含无效周次 {week}，已保留上一份快照"
+            )));
+        }
+        if dates.len() != WEEKDAYS.len() {
+            return Err(refresh_failed(format!(
+                "刷新结果第 {week} 周不是完整的七天日期，已保留上一份快照"
+            )));
+        }
+        let mut previous: Option<Date> = None;
+        for raw in dates {
+            let Some(date) = Date::parse(raw) else {
+                return Err(refresh_failed(format!(
+                    "刷新结果第 {week} 周包含无效日期 {raw:?}，已保留上一份快照"
+                )));
+            };
+            if let Some(previous) = previous
+                && date != previous.add_days(1)
+            {
+                return Err(refresh_failed(format!(
+                    "刷新结果第 {week} 周日期不连续，已保留上一份快照"
+                )));
+            }
+            previous = Some(date);
+        }
+    }
+    let Some((start, end)) = term_bounds(snapshot) else {
+        return Err(refresh_failed(
+            "刷新结果缺少可用的学期日期，已保留上一份快照",
         ));
+    };
+    if today < start || today > end {
+        return Err(refresh_failed("刷新结果不覆盖运行当天，已保留上一份快照"));
+    }
+    if let Err(error) = export_sessions(snapshot) {
+        return Err(refresh_failed(format!(
+            "刷新结果无法生成完整日历，已保留上一份快照：{}",
+            error.message
+        )));
     }
     Ok(())
 }
@@ -554,33 +658,7 @@ fn export_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome
 }
 
 fn write_export(path: &Path, content: &str) -> CliResult<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)
-            .map_err(|_| CliError::new(5, "upstream", "cannot create export directory", ""))?;
-    }
-    let temporary = path.with_extension("ics.tmp");
-    if let Err(error) = fs::write(&temporary, content) {
-        let _ = fs::remove_file(&temporary);
-        return Err(CliError::new(
-            5,
-            "upstream",
-            format!("cannot write iCalendar file: {error}"),
-            "The previous export file was left untouched.",
-        ));
-    }
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(CliError::new(
-            5,
-            "upstream",
-            format!("cannot replace iCalendar file: {error}"),
-            "The previous export file was left untouched.",
-        ));
-    }
-    Ok(())
+    write_atomically(path, content.as_bytes(), "iCalendar export")
 }
 
 fn default_export_path(snapshot: &Snapshot, home: &Path) -> PathBuf {
@@ -1477,11 +1555,31 @@ mod tests {
             "08:00",
             "08:45",
         ));
+        let malformed_calendar_without_courses = Ok({
+            let mut snapshot = fresh();
+            snapshot.courses.clear();
+            snapshot.calendar.get_mut(&1).expect("week one")[3] = "not-a-date".to_string();
+            snapshot
+        });
+        let empty_calendar_without_courses = Ok({
+            let mut snapshot = fresh();
+            snapshot.courses.clear();
+            snapshot.calendar.clear();
+            snapshot
+        });
 
         for (label, response) in [
             ("failed", failed),
             ("incomplete", incomplete),
             ("out-of-term", out_of_term),
+            (
+                "malformed-calendar-without-courses",
+                malformed_calendar_without_courses,
+            ),
+            (
+                "empty-calendar-without-courses",
+                empty_calendar_without_courses,
+            ),
         ] {
             let root = tempdir().unwrap();
             let config = root.path().join("config");
@@ -1545,6 +1643,132 @@ mod tests {
             read_bytes(&cache_file(&cache)),
             before,
             "a failed manual update must preserve the previous snapshot"
+        );
+    }
+
+    #[test]
+    fn atomic_writes_leave_predictable_temp_files_untouched() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let snapshot_path = cache_file(&cache);
+        let snapshot_temp = snapshot_path.with_extension("json.tmp");
+        fs::write(&snapshot_temp, b"PRESERVE CACHE TEMP").unwrap();
+
+        save_snapshot(&snapshot_path, &fresh()).unwrap();
+
+        assert_eq!(
+            fs::read(&snapshot_temp).unwrap(),
+            b"PRESERVE CACHE TEMP",
+            "the old predictable cache temp path must not be reused"
+        );
+        assert!(read_snapshot(&snapshot_path).is_some());
+
+        let export_path = root.path().join("export.ics");
+        let export_temp = export_path.with_extension("ics.tmp");
+        fs::write(&export_temp, b"PRESERVE EXPORT TEMP").unwrap();
+
+        write_export(&export_path, "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").unwrap();
+
+        assert_eq!(
+            fs::read(&export_temp).unwrap(),
+            b"PRESERVE EXPORT TEMP",
+            "the old predictable export temp path must not be reused"
+        );
+        assert!(
+            fs::read_to_string(&export_path)
+                .unwrap()
+                .contains("BEGIN:VCALENDAR")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_do_not_follow_planted_temp_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"UNRELATED VICTIM").unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let snapshot_path = cache_file(&cache);
+        let snapshot_temp = snapshot_path.with_extension("json.tmp");
+        symlink(&victim, &snapshot_temp).unwrap();
+
+        save_snapshot(&snapshot_path, &fresh()).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"UNRELATED VICTIM");
+        assert!(
+            fs::symlink_metadata(&snapshot_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&snapshot_temp).unwrap(), victim);
+
+        let export_path = root.path().join("export.ics");
+        let export_temp = export_path.with_extension("ics.tmp");
+        symlink(&victim, &export_temp).unwrap();
+
+        write_export(&export_path, "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"UNRELATED VICTIM");
+        assert!(
+            fs::symlink_metadata(&export_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&export_temp).unwrap(), victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_refuses_a_symlink_target_without_touching_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let target = root.path().join("cache").join("timetable.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"UNRELATED VICTIM").unwrap();
+        symlink(&victim, &target).unwrap();
+
+        let error = save_snapshot(&target, &fresh()).expect_err("symlink target must be refused");
+
+        assert_eq!(error.code, 5);
+        assert!(error.message.contains("symlink"));
+        assert_eq!(fs::read(&victim).unwrap(), b"UNRELATED VICTIM");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&target).unwrap(), victim);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_leave_one_complete_file() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("shared.txt");
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || {
+                let payload = format!("payload-{index}");
+                write_atomically(&target, payload.as_bytes(), "test file").unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let content = fs::read_to_string(&target).unwrap();
+        assert!(
+            (0..8).any(|index| content == format!("payload-{index}")),
+            "concurrent writers must leave one complete payload, got {content:?}"
         );
     }
 }

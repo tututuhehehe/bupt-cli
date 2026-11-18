@@ -677,6 +677,73 @@ fn export_succeeds_even_when_opening_the_folder_fails() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn export_ignores_planted_temp_symlink_and_preexisting_temp_file() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    write_credentials(&sandbox, USER, "graduate");
+    write_cache(&sandbox, &snapshot.entry);
+    let out = sandbox.root().join("secure-temp.ics");
+    let predictable_temp = out.with_extension("ics.tmp");
+
+    fs::write(&predictable_temp, b"PRESERVE REGULAR TEMP").expect("write old temp file");
+    assert_success(&run(
+        &sandbox,
+        &[
+            "schedule",
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+            "--no-open-folder",
+        ],
+    ));
+    assert_eq!(
+        fs::read(&predictable_temp).expect("read old temp file"),
+        b"PRESERVE REGULAR TEMP",
+        "the helper must not reuse or truncate the predictable temp path"
+    );
+
+    fs::remove_file(&predictable_temp).expect("remove old temp file");
+    let victim = sandbox.root().join("victim");
+    fs::write(&victim, b"UNRELATED VICTIM").expect("write unrelated victim");
+    symlink(&victim, &predictable_temp).expect("plant temp symlink");
+
+    assert_success(&run(
+        &sandbox,
+        &[
+            "schedule",
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+            "--no-open-folder",
+        ],
+    ));
+    assert_eq!(
+        fs::read(&victim).expect("read unrelated victim"),
+        b"UNRELATED VICTIM",
+        "the helper must not follow a planted temp symlink"
+    );
+    assert!(
+        fs::symlink_metadata(&predictable_temp)
+            .expect("stat planted symlink")
+            .file_type()
+            .is_symlink(),
+        "the planted symlink must remain a link"
+    );
+    assert_eq!(
+        fs::read_link(&predictable_temp).expect("read planted symlink"),
+        victim
+    );
+    assert!(
+        fs::read_to_string(&out)
+            .expect("read exported ICS")
+            .contains("BEGIN:VCALENDAR")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Unusable, foreign and unattributed snapshots are refused with a refresh hint.
 // ---------------------------------------------------------------------------
