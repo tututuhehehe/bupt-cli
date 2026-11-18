@@ -89,7 +89,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - 15 个 CAS/UCloud lib 单测使用 `Scripted` 和 `TEST-ONLY-` 合成值：单次密码 POST、service ticket 正向证据、显式重定向状态（301/302/303/307/308）、允许 302 后空/无关 200 无 ticket 的失败关闭、200 带 `Location` 不得当 ticket、307/308 拒绝、非 TLS/外部 host 拒绝、HTTP 4xx/5xx 与连接失败分层（含 429）、缺失 execution、惰性 token 与缓存复用、过期 token 不重用、UCloud 读取路径校验、ticket 重定向校验、token 响应成功条件。当前全库 lib 共 83 个测试；`contract_identity` 仍是 28 个进程测试。
 - 未实现：真实传输接线、生产账号/会话写入（离线测试路径只写 `credentials.json`）、自动续期/登录次数上限、在线 `diagnose`、Windows ACL、真实校园网验收。以上仍保留在下面的待实现场景中。
 
-**集成门槛（live wiring）**：当前手写 URL parser 和 cookie jar 只是合成测试原型，不能直接接真实 Rust 流量。上线前必须换成维护中的 URL/cookie 实现，至少覆盖 host-only cookie、expiration、default path、domain/path 校验、IDNA/端口/重定向规范化；替换并独立审查前不接生产 transport、不扩大 host 白名单、不增加依赖或网络流量。
+**真实接线门槛**：URL 与 Cookie 已改用 `url` 和 `cookie_store`。保留明确 HTTPS 主机和路径限制，拒绝显式端口和编码路径穿越；CAS Cookie 只从 CAS 接收、只发往 CAS。新增两个合成用例覆盖 Cookie 默认路径、过期、域隔离及 URL 规范化。该协议仍仅编译进测试；还需接入受限传输、会话持久化与业务命令后，再用独立状态实际运行 `login`、`courses`、`homework --undone`。匿名 CAS 登录页可达不算认证通过。
 
 ## 离线验证到登记（测试路径，本轮）
 

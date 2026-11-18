@@ -94,6 +94,12 @@ type Run = fn(&str, &ArgMatches, &mut Context<'_>) -> CliResult<Outcome>;
 
 type Lane = (fn() -> Vec<Command>, Run);
 
+/// The library lane is anonymous; every other lane must stay on `Offline` until
+/// its authenticated session adapter is reviewed.
+fn uses_public_library(name: &str) -> bool {
+    name == "library"
+}
+
 const LANES: &[Lane] = &[
     (crate::identity::commands, crate::identity::run),
     (crate::homework::commands, crate::homework::run),
@@ -186,7 +192,8 @@ fn run(
     args: &[OsString],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    transport: &mut dyn Transport,
+    offline: &mut dyn Transport,
+    public: Option<&mut dyn Transport>,
 ) -> u8 {
     let (command, routes) = command_tree();
     let pretty_on_error = args
@@ -222,6 +229,17 @@ fn run(
                 .get_one::<f64>("timeout")
                 .expect("timeout has a validated default"),
         );
+        let mut curl: Option<crate::transport::Curl> = None;
+        // Production passes `None`: build the bounded curl adapter only after
+        // `--timeout` is parsed. Tests inject a recording transport instead.
+        let transport: &mut dyn Transport = if uses_public_library(name) {
+            match public {
+                Some(transport) => transport,
+                None => curl.get_or_insert_with(|| crate::transport::Curl::new(timeout)),
+            }
+        } else {
+            offline
+        };
         let mut context = Context::from_environment(timeout, transport)?;
         let (_, handler) = routes
             .iter()
@@ -259,11 +277,13 @@ fn run(
 }
 
 pub fn main_entry() -> u8 {
+    let mut offline = Offline;
     run(
         &std::env::args_os().collect::<Vec<_>>(),
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
-        &mut Offline,
+        &mut offline,
+        None,
     )
 }
 
@@ -301,10 +321,56 @@ mod tests {
         let args = ["bupt", "--password=fake-secret"].map(OsString::from);
         let mut out = vec![];
         let mut err = vec![];
-        let mut transport = Scripted::default();
-        assert_eq!(run(&args, &mut out, &mut err, &mut transport), 2);
+        let mut offline = Scripted::default();
+        let mut public = Scripted::default();
+        assert_eq!(
+            run(&args, &mut out, &mut err, &mut offline, Some(&mut public)),
+            2
+        );
         assert!(out.is_empty());
         assert!(!String::from_utf8(err).unwrap().contains("fake-secret"));
-        assert!(transport.calls.is_empty());
+        assert!(offline.calls.is_empty());
+        assert!(public.calls.is_empty());
+    }
+
+    #[test]
+    fn library_search_uses_the_injected_public_transport() {
+        let args = ["bupt", "library", "search", "synthetic"].map(OsString::from);
+        let mut out = vec![];
+        let mut err = vec![];
+        let mut offline = Scripted::default();
+        let mut public = Scripted::default();
+        public.expected.push_back((
+            "POST",
+            "https://opac.bupt.edu.cn/search-full-result.json".into(),
+            Ok(Response {
+                status: 200,
+                headers: vec![],
+                body: br#"{"result":{"code":0},"total":0,"pageNo":1,"totalPage":0,"data":[]}"#
+                    .to_vec(),
+            }),
+        ));
+        assert_eq!(
+            run(&args, &mut out, &mut err, &mut offline, Some(&mut public)),
+            0
+        );
+        assert!(err.is_empty());
+        assert!(offline.calls.is_empty());
+        assert_eq!(public.calls.len(), 1);
+        let document: Value = serde_json::from_slice(&out).expect("parse CLI output");
+        assert_eq!(document["schema"], "bupt.v1");
+        assert_eq!(document["ok"], true);
+        assert_eq!(document["count"], 0);
+    }
+
+    #[test]
+    fn only_the_library_lane_uses_the_public_network() {
+        let public: Vec<String> = LANES
+            .iter()
+            .flat_map(|(commands, _)| commands())
+            .map(|command| command.get_name().to_string())
+            .filter(|name| uses_public_library(name))
+            .collect();
+        assert_eq!(public, ["library"]);
     }
 }
