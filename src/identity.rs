@@ -1,7 +1,6 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
-use std::env;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -177,13 +176,6 @@ fn run_status(context: &mut Context<'_>) -> CliResult<Outcome> {
 }
 
 fn load_account(config_dir: &Path) -> CliResult<Option<LocalProfile>> {
-    load_account_with_env(config_dir, |key| env::var(key).ok())
-}
-
-fn load_account_with_env(
-    config_dir: &Path,
-    env: impl Fn(&str) -> Option<String>,
-) -> CliResult<Option<LocalProfile>> {
     let path = config_dir.join(CREDENTIALS_FILENAME);
     let config = match fs::read(&path) {
         Ok(bytes) => {
@@ -192,7 +184,7 @@ fn load_account_with_env(
                     3,
                     "auth",
                     "cannot parse the local credentials file",
-                    "Fix credentials.json; it must contain a JSON object.",
+                    "Fix credentials.json and run `bupt login` again.",
                 )
             })?;
             match value {
@@ -213,43 +205,57 @@ fn load_account_with_env(
                 3,
                 "auth",
                 "cannot read the local credentials file",
-                "Check credentials.json permissions/content.",
+                "Check credentials.json permissions/content, then run `bupt login` again.",
             ));
         }
     };
 
-    let config_username = config.get("username").and_then(Value::as_str);
-    let username = env("BUPT_USERNAME")
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| config_username.map(str::to_owned))
-        .map(|value| value.trim().to_owned())
+    let username = config
+        .get("username")
+        .and_then(Value::as_str)
+        .map(str::trim)
         .filter(|value| !value.is_empty());
     let Some(username) = username else {
         return Ok(None);
     };
 
-    let config_role = config
+    let role = config
         .get("role")
         .and_then(Value::as_str)
-        .map(str::to_owned);
-    let role_text = env("BUPT_ROLE")
-        .filter(|value| !value.trim().is_empty())
-        .or(config_role);
-    let config_has_password = config
+        .and_then(Role::parse);
+    let has_password = config
         .get("password")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.is_empty());
-    let env_has_password = env("BUPT_PASSWORD").is_some_and(|value| !value.is_empty());
     Ok(Some(LocalProfile {
-        username,
-        role: role_text.as_deref().and_then(Role::parse),
-        has_password: config_has_password || env_has_password,
+        username: username.to_owned(),
+        role,
+        has_password,
     }))
 }
 
 /// Load local profile metadata without reading the session cache or writing state.
+///
+/// `credentials.json` is the sole source for the username, password presence and
+/// role. Account environment variables are intentionally ignored.
 pub(crate) fn load_profile(config_dir: &Path) -> CliResult<Option<LocalProfile>> {
     load_account(config_dir)
+}
+
+/// Load a profile that can open an authenticated command.
+///
+/// This only requires a username and a nonempty saved password. Role remains
+/// operation-specific and is deliberately not validated here.
+pub(crate) fn require_authenticated_profile(config_dir: &Path) -> CliResult<LocalProfile> {
+    match load_profile(config_dir)? {
+        Some(profile) if profile.has_password() => Ok(profile),
+        _ => Err(CliError::new(
+            3,
+            "auth",
+            "BUPT credentials are not configured",
+            "Run `bupt login` to save credentials.json.",
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -801,7 +807,7 @@ mod tests {
     }
 
     fn load_isolated_profile(directory: &Path) -> CliResult<Option<LocalProfile>> {
-        load_account_with_env(directory, |_| None)
+        load_profile(directory)
     }
 
     #[test]

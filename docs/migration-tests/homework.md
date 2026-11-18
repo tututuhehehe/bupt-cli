@@ -27,6 +27,9 @@
 | 用例 | 覆盖点 |
 |---|---|
 | `courses_reaches_the_auth_boundary_without_credentials` | `courses` 接受无参数形式并进入凭据层（auth，退出 3） |
+| `environment_only_credentials_are_ignored` | 只有合成 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE`、没有 `credentials.json` 时仍为 auth 3；账号环境变量不构成登录 |
+| `malformed_saved_credentials_are_an_auth_error` | 损坏的 `credentials.json` 报 auth 3，提示指向登录，不回显文件内容 |
+| `saved_credentials_do_not_require_a_role` | 有效 JSON 只有 username + password、没有 role 时仍能进入会话接线阶段（upstream 5）；homework 不要求 role |
 | `homework_defaults_to_the_list_command` | 无凭据时 `homework` 已进入会话层（auth，退出 3），不是“需要子命令” |
 | `explicit_homework_list_alias_is_rejected_as_usage` | `homework list` 在凭据/网络前退 2 |
 | `default_homework_accepts_the_list_flags` | 默认列表接受 `--undone` / `--limit` / `--course` / `--new`（继续到 auth 层） |
@@ -60,7 +63,7 @@
 
 回执判定只接受肯定证据：显式 `success: true`，或认可的 `code`（0/200）。空对象、缺失/非法指示、互相矛盾的 success/code、2xx 非 JSON、408、5xx、意外重定向以及没有确认响应的 transport failure 都退 6 且 `submitted=null`，并只指向只读 `verify`。明确 4xx（408 除外）、JSON 负回执和 401/403 仍走显式错误（HTTP/上游 5，鉴权 3），不伪装成 unknown。所有分支都不自动重发 submit；transport failure 只说明没有收到确认响应，不回显原始诊断。
 
-当前真实 CLI 在提交 helper 之前没有会话适配器，因此带凭据时仍以“session wiring 未实现”退 5，绝不发起 HTTP。`courses`、作业列表、`show`、`download`、`verify` 同样在通过凭据检查后以 unsupported 退 5；本批没有课程分页、列表、详情、下载或只读核验实现，`verify` 保持 pending。成功提交但未跑 `--no-verify` 时 helper 也返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`。
+当前真实 CLI 在提交 helper 之前没有会话适配器，因此带凭据时仍以“session wiring 未实现”退 5，绝不发起 HTTP。凭据只从 `credentials.json` 读取（username + 非空密码），不读取账号环境变量，也不要求 role；`courses`、作业列表、`show`、`download`、`verify` 同样在通过凭据检查后以 unsupported 退 5。本批没有课程分页、列表、详情、下载或只读核验实现，`verify` 保持 pending。成功提交但未跑 `--no-verify` 时 helper 也返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`。
 
 结果里不序列化 detail 原始对象或 session 结构；接受的 `upstream.msg` 和错误文本在输出边界统一脱敏，`Session` 不实现 `Debug`。新增 fixture `homework_submit_echo_token.json` 让上游回显合成 token，供后续进程级 seam 复用；当前对应边界测试已在源内通过。
 

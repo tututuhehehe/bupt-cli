@@ -166,7 +166,6 @@ fn redact(mut text: String, args: &[OsString]) -> String {
             values.push(value.into());
         }
     }
-    values.extend(std::env::var("BUPT_PASSWORD").ok());
     for value in values.into_iter().filter(|value| !value.is_empty()) {
         text = text.replace(&value, "[REDACTED]");
     }

@@ -417,7 +417,43 @@ fn changed_account_does_not_reuse_previous_owners_session() {
 }
 
 #[test]
-fn environment_account_override_does_not_reuse_configured_owners_session() {
+fn environment_only_account_is_not_a_profile() {
+    let sandbox = Sandbox::new();
+    seed_session(&sandbox, SESSION);
+    let config_before = snapshot_tree(&config_dir(&sandbox));
+    let cache_before = snapshot_tree(&cache_dir(&sandbox));
+
+    let inv = run_with_env(
+        &sandbox,
+        &["status"],
+        &[
+            ("BUPT_USERNAME", USER),
+            ("BUPT_PASSWORD", PRIMARY_PASSWORD),
+            ("BUPT_ROLE", "graduate"),
+        ],
+    );
+    let status = success(&inv);
+
+    assert_eq!(status["exists"], json!(false));
+    assert_eq!(status["username"], Value::Null);
+    assert_eq!(status["cache_username_mismatch"], json!(false));
+    assert_eq!(status["cookie_count"], json!(0));
+    assert_eq!(status["locally_valid"], json!(false));
+    assert!(
+        status["cache_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("no configured account")),
+        "environment-only credentials must not become a local profile: {status}"
+    );
+    assert!(!status.to_string().contains(USER));
+    assert_no_fixture_secrets(&inv);
+
+    assert_eq!(snapshot_tree(&config_dir(&sandbox)), config_before);
+    assert_eq!(snapshot_tree(&cache_dir(&sandbox)), cache_before);
+}
+
+#[test]
+fn saved_credentials_ignore_conflicting_account_environment() {
     let sandbox = Sandbox::new();
     seed_credentials(&sandbox, CREDENTIALS);
     seed_session(&sandbox, SESSION);
@@ -428,15 +464,17 @@ fn environment_account_override_does_not_reuse_configured_owners_session() {
         &[
             ("BUPT_USERNAME", OTHER_USER),
             ("BUPT_PASSWORD", OTHER_PASSWORD),
+            ("BUPT_ROLE", "undergraduate"),
         ],
     );
     let status = success(&inv);
 
-    assert_eq!(status["exists"], json!(false));
-    assert_eq!(status["cache_username_mismatch"], json!(true));
-    assert_eq!(status["cookie_count"], json!(0));
-    assert_eq!(status["locally_valid"], json!(false));
-    assert_stale_owner_hidden(&status, OTHER_USER, USER);
+    assert_eq!(status["exists"], json!(true));
+    assert_eq!(status["username"], json!(USER));
+    assert_eq!(status["cache_username_mismatch"], json!(false));
+    assert_eq!(status["cookie_count"], json!(1));
+    assert_eq!(status["locally_valid"], json!(true));
+    assert_stale_owner_hidden(&status, USER, OTHER_USER);
     assert_no_fixture_secrets(&inv);
 }
 

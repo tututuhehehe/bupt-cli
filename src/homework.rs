@@ -1,9 +1,8 @@
 mod submit;
 
 use crate::cli::{CliError, CliResult, Context, Outcome};
+use crate::identity;
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use serde_json::{Map, Value};
-use std::fs;
 
 pub(crate) fn commands() -> Vec<Command> {
     vec![
@@ -145,60 +144,5 @@ pub(super) fn unsupported(operation: &str) -> CliError {
 }
 
 pub(super) fn require_credentials(context: &Context<'_>) -> CliResult<()> {
-    let config = read_credentials_config(context)?;
-    let username = env_value("BUPT_USERNAME")
-        .or_else(|| config_text(&config, "username"))
-        .filter(|value| !value.trim().is_empty());
-    let password = env_value("BUPT_PASSWORD")
-        .or_else(|| config_text(&config, "password"))
-        .filter(|value| !value.is_empty());
-    if username.is_some() && password.is_some() {
-        return Ok(());
-    }
-    Err(CliError::new(
-        3,
-        "auth",
-        "BUPT credentials are not configured",
-        "Run `bupt login`, or set BUPT_USERNAME and BUPT_PASSWORD.",
-    ))
-}
-
-fn read_credentials_config(context: &Context<'_>) -> CliResult<Map<String, Value>> {
-    let path = context.config_dir.join("credentials.json");
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(_) => {
-            return Err(CliError::new(
-                3,
-                "auth",
-                format!("cannot read credentials file {}", path.display()),
-                "Fix the file permissions or content, then retry.",
-            ));
-        }
-    };
-    match serde_json::from_slice::<Value>(&bytes) {
-        Ok(Value::Object(object)) => Ok(object),
-        _ => Err(CliError::new(
-            3,
-            "auth",
-            format!(
-                "credentials file {} must contain a JSON object",
-                path.display()
-            ),
-            "Fix the file content, then retry.",
-        )),
-    }
-}
-
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn config_text(config: &Map<String, Value>, key: &str) -> Option<String> {
-    match config.get(key) {
-        Some(Value::String(value)) => Some(value.clone()),
-        Some(Value::Number(value)) => Some(value.to_string()),
-        _ => None,
-    }
+    identity::require_authenticated_profile(&context.config_dir).map(|_| ())
 }

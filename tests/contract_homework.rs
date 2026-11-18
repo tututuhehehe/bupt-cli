@@ -42,6 +42,64 @@ fn courses_reaches_the_auth_boundary_without_credentials() {
 }
 
 #[test]
+fn environment_only_credentials_are_ignored() {
+    let sandbox = Sandbox::new();
+    let password = "TEST-ONLY-HOMEWORK-ENV-PASSWORD-5e8a";
+    let invocation = Invocation(
+        sandbox
+            .command()
+            .env("BUPT_USERNAME", "2026000099")
+            .env("BUPT_PASSWORD", password)
+            .env("BUPT_ROLE", "undergraduate")
+            .args(["courses"])
+            .output()
+            .expect("run with synthetic environment credentials"),
+    );
+    let error = assert_error(&invocation, 3, "auth");
+    assert!(
+        error["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("login")),
+        "auth hint should point at login: {error}"
+    );
+    assert!(!String::from_utf8_lossy(&invocation.0.stderr).contains(password));
+}
+
+#[test]
+fn malformed_saved_credentials_are_an_auth_error() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.root().join("config/credentials.json"),
+        "{not valid synthetic JSON",
+    )
+    .expect("write synthetic malformed credentials");
+
+    let invocation = sandbox.run(&["courses"]);
+    let error = assert_error(&invocation, 3, "auth");
+    assert!(
+        error["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("login")),
+        "malformed credentials should keep the auth hint: {error}"
+    );
+    assert!(!String::from_utf8_lossy(&invocation.0.stderr).contains("not valid synthetic JSON"));
+}
+
+#[test]
+fn saved_credentials_do_not_require_a_role() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.root().join("config/credentials.json"),
+        r#"{"username":"2026000097","password":"TEST-ONLY-HOMEWORK-PASSWORD-3c4d"}"#,
+    )
+    .expect("write synthetic roleless credentials");
+
+    let invocation = sandbox.run(&["courses"]);
+    assert_error(&invocation, 5, "upstream");
+    assert!(!sandbox.root().join("cache/session.json").exists());
+}
+
+#[test]
 fn homework_defaults_to_the_list_command() {
     let sandbox = Sandbox::new();
     assert_error(&sandbox.run(&["homework"]), 3, "auth");
