@@ -901,3 +901,234 @@ fn unsupported_role_is_rejected_before_backend_selection() {
         );
     }
 }
+
+#[test]
+fn passwordless_profile_cannot_read_a_matching_snapshot() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    fs::write(
+        config_path(&sandbox),
+        serde_json::to_vec_pretty(&json!({
+            "username": USER,
+            "role": "graduate"
+        }))
+        .expect("serialize passwordless synthetic profile"),
+    )
+    .expect("write passwordless synthetic profile");
+    let (cache, before) = write_cache(&sandbox, &snapshot.entry);
+    let out = sandbox.root().join("passwordless.ics");
+    let date = snapshot.class_date.iso();
+
+    for args in snapshot_read_commands(&date, &out) {
+        let invocation = run_owned(&sandbox, &args);
+        assert_eq!(
+            invocation.code(),
+            3,
+            "passwordless profile must fail auth; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&invocation.0.stdout),
+            String::from_utf8_lossy(&invocation.0.stderr)
+        );
+        assert!(invocation.0.stdout.is_empty());
+        let payload = invocation.stderr_json();
+        assert_schema(&payload);
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["error"]["type"], json!("auth"));
+        assert_eq!(
+            fs::read(&cache).expect("read snapshot after auth refusal"),
+            before
+        );
+        assert!(!cache.with_extension("json.tmp").exists());
+    }
+    assert!(
+        !out.exists(),
+        "passwordless profile must not create an export file"
+    );
+}
+
+#[test]
+fn explicit_environment_credentials_still_satisfy_the_local_profile() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    fs::write(
+        config_path(&sandbox),
+        serde_json::to_vec_pretty(&json!({
+            "username": USER,
+            "role": "graduate"
+        }))
+        .expect("serialize passwordless synthetic profile"),
+    )
+    .expect("write passwordless synthetic profile");
+    write_cache(&sandbox, &snapshot.entry);
+    let date = snapshot.class_date.iso();
+
+    let invocation = Invocation(
+        network_guarded_command(&sandbox)
+            .env("BUPT_USERNAME", USER)
+            .env("BUPT_PASSWORD", PASSWORD)
+            .env("BUPT_ROLE", "graduate")
+            .args(["schedule", "--date", &date])
+            .output()
+            .expect("run with explicit synthetic environment credentials"),
+    );
+    let payload = assert_success(&invocation);
+    assert_eq!(payload["from_cache"], json!(true));
+    assert_eq!(payload["count"], json!(1));
+}
+
+#[test]
+fn date_arguments_require_ascii_yyyy_mm_dd_and_valid_year() {
+    let sandbox = Sandbox::new();
+    let cases = [
+        "+026-01-01",
+        "0000-01-01",
+        "2026-1-01",
+        "2026-01-1",
+        "2026-01-+1",
+        "２０２６-01-01",
+        "2026-02-30",
+        "2023-02-29",
+    ];
+    for date in cases {
+        assert_usage(run(&sandbox, &["schedule", "--date", date]));
+    }
+    assert!(
+        fs::read_dir(sandbox.root().join("cache"))
+            .expect("read cache dir")
+            .next()
+            .is_none(),
+        "invalid dates must be rejected before cache access"
+    );
+}
+
+#[test]
+fn valid_leap_day_is_accepted_by_the_local_query() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    write_credentials(&sandbox, USER, "graduate");
+    let (cache, before) = write_cache(&sandbox, &snapshot.entry);
+
+    let payload = assert_success(&run(&sandbox, &["schedule", "--date", "2024-02-29"]));
+    assert_eq!(payload["range"], json!(["2024-02-29", "2024-02-29"]));
+    assert_eq!(payload["count"], json!(0));
+    assert_eq!(payload["classes"], json!([]));
+    assert_eq!(fs::read(&cache).expect("read unchanged snapshot"), before);
+}
+
+#[test]
+fn export_omits_events_with_invalid_clock_times() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    let mut entry = snapshot.entry.clone();
+    entry["courses"] = json!([
+        {
+            "name": "有效合成课程",
+            "weekday_index": 2,
+            "weeks": [2],
+            "period_start": 1,
+            "period_end": 2,
+            "time_start": "08:00",
+            "time_end": "09:35",
+            "teachers": [],
+            "rooms": [],
+            "campus": ""
+        },
+        {
+            "name": "坏开始时钟课程",
+            "weekday_index": 2,
+            "weeks": [2],
+            "period_start": 1,
+            "period_end": 1,
+            "time_start": "25:00",
+            "time_end": "09:35",
+            "teachers": [],
+            "rooms": [],
+            "campus": ""
+        },
+        {
+            "name": "坏结束时钟课程",
+            "weekday_index": 2,
+            "weeks": [2],
+            "period_start": 1,
+            "period_end": 1,
+            "time_start": "08:00",
+            "time_end": "09:60",
+            "teachers": [],
+            "rooms": [],
+            "campus": ""
+        }
+    ]);
+    write_credentials(&sandbox, USER, "graduate");
+    write_cache(&sandbox, &entry);
+    let out = sandbox.root().join("clocks.ics");
+
+    let payload = assert_success(&run(
+        &sandbox,
+        &[
+            "schedule",
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+            "--no-open-folder",
+        ],
+    ));
+    assert_eq!(payload["events"], json!(1));
+    let ics = fs::read_to_string(&out).expect("read clock-filtered ICS");
+    assert!(ics.contains("有效合成课程"));
+    assert!(!ics.contains("坏开始时钟课程"));
+    assert!(!ics.contains("坏结束时钟课程"));
+    assert!(!ics.contains("T250000"));
+    assert!(!ics.contains("T096000"));
+}
+
+#[test]
+fn export_counts_real_events_and_escapes_injected_line_breaks() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    let mut entry = snapshot.entry.clone();
+    entry["courses"] = json!([{
+        "name": "BEGIN:VEVENT\r\n伪造课程\nEND:VEVENT",
+        "weekday_index": 2,
+        "weeks": [2],
+        "period_start": 1,
+        "period_end": 2,
+        "time_start": "08:00",
+        "time_end": "09:35",
+        "teachers": [],
+        "rooms": ["BEGIN:VEVENT"],
+        "campus": ""
+    }]);
+    write_credentials(&sandbox, USER, "graduate");
+    write_cache(&sandbox, &entry);
+    let out = sandbox.root().join("literals.ics");
+
+    let payload = assert_success(&run(
+        &sandbox,
+        &[
+            "schedule",
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+            "--no-open-folder",
+        ],
+    ));
+    assert_eq!(payload["events"], json!(1));
+    let ics = fs::read_to_string(&out).expect("read escaped ICS");
+    assert_eq!(
+        ics.split("\r\n")
+            .filter(|line| *line == "BEGIN:VEVENT")
+            .count(),
+        1,
+        "literal BEGIN:VEVENT text must not create another event line: {ics:?}"
+    );
+    assert_eq!(
+        ics.split("\r\n")
+            .filter(|line| *line == "END:VEVENT")
+            .count(),
+        1,
+        "literal END:VEVENT text must not close the event early: {ics:?}"
+    );
+    let unfolded = ics.replace("\r\n ", "");
+    assert!(unfolded.contains("SUMMARY:BEGIN:VEVENT\\n伪造课程\\nEND:VEVENT"));
+    assert!(unfolded.contains("LOCATION:BEGIN:VEVENT"));
+    assert!(!ics.lines().any(|line| line == "伪造课程"));
+}
