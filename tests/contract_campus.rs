@@ -99,8 +99,9 @@ fn assert_no_session_file(sandbox: &Sandbox) {
 }
 
 // ---------------------------------------------------------------------------
-// Library OPAC: anonymous input validation. Upstream parsing is deferred until
-// the integrator agrees on an offline response seam (see migration notes).
+// Library OPAC: anonymous input validation. Response parsing is covered by the
+// in-process Scripted transport tests in src/campus.rs; process-level success
+// output still needs an integrator-agreed transport seam (see migration notes).
 // ---------------------------------------------------------------------------
 
 #[test]
