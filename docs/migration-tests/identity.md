@@ -43,39 +43,38 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - `locally_valid` 要求至少一个可用的 CAS Cookie：非空 domain、非空 name、字符串 value，且未明确过期。过期或格式不完整的 Cookie 只增加 `cookie_count`，不能单独让状态变成可用；缺失/不可解析的过期时间仍按未知处理。
 - `diagnose --only cas` 在没有可用 CAS Cookie 时返回本地 skipped 报告；其他需要联网的组返回 pending，不写会话。
 - `logout` 分别 unlink 自己拥有的 `credentials.json` 和 `session.json`，不重写打开的文件；`config.json` 和 `timetable.json` 保持原样。符号链接和非普通文件会被拒绝并报 auth 错误。
-- 本 lane 的 27 个进程测试全部通过；另有 3 个 `identity` lib 单测覆盖共享 profile API；待实现场景没有以永远通过或伪造断言的形式保留。
+- 本 lane 的 28 个进程测试全部通过；另有 3 个 `identity` lib 单测覆盖共享 profile API；待实现场景没有以永远通过或伪造断言的形式保留。
 
 ## 共享本地 profile API（本轮）
 
-`src/identity.rs` 新增 crate-internal、只读的 `load_profile(config_dir)`，返回 `Option<LocalProfile>`：
+`src/identity.rs` 提供 crate-internal、只读的 `load_profile(config_dir)`，返回 `Option<LocalProfile>`：
 
-- `LocalProfile::username() -> &str`：沿用现有 `load_account` 的规范化/trim 与 `BUPT_USERNAME` 优先级。
-- `LocalProfile::role() -> Option<Role>`：沿用现有 `Role::parse`，只返回类型化的 `Graduate`/`Undergraduate`；缺失和非法角色都是 `None`。
-- `LocalProfile::has_password() -> bool`：只报告是否检测到非空密码，不保存或返回密码内容。
+- `LocalProfile::username() -> &str`：只读取 `credentials.json` 的 `username` 字符串，trim 后非空才返回。
+- `LocalProfile::role() -> Option<Role>`：只用同一文件的 `role` 字符串做类型化解析；缺失和非法角色都是 `None`。
+- `LocalProfile::has_password() -> bool`：只报告 `credentials.json` 中是否有非空密码字符串，不保存或返回密码内容。
+- `require_authenticated_profile(config_dir)`：在 `load_profile` 之上要求 username 和非空密码；缺失、不可读或不可解析统一返回 auth 退出码 `3`，不检查 role。
 
-`LocalProfile` 不包含 password/cookie/token 字段，`Debug` 也只显示 username/role/has_password。API 只读 `credentials.json` 与环境变量，不读取会话、不联网、不写文件。`status` 和 `diagnose` 已改用同一入口，因此现有公开语义不变；其他 lane 的读取器本轮未迁移。
+`LocalProfile` 不包含 password/cookie/token 字段，`Debug` 也只显示 username/role/has_password。这个 API 只读 `credentials.json`，不读取账号环境变量、会话或网络，也不写文件。
 
-本轮新增 3 个 lib 单测：profile 规范化/类型化角色/密码存在性及 Debug 脱敏、无密码和缺失/非法角色、缺失 profile 文件。
+本轮同时迁移了调用方：`status`/`diagnose` 继续使用 `load_profile`；`academics`、`homework`、`campus` 的受保护命令改用共享鉴权入口。`academics` 只在需要选择本科/研究生数据源的操作里继续要求合法 role，`homework`/`campus` 不要求 role；匿名 `library` 路径仍不读取凭据。
 
-## 现有本地凭据读取器审计（待整合）
+新增 3 个 lib 单测：profile 规范化/类型化角色/密码存在性及 Debug 脱敏、无密码和缺失/非法角色、缺失 profile 文件。进程级用例另验证环境变量不能补充或覆盖 JSON 账号、密码存在性和 role。
 
-以下只是审计记录，没有修改其他 lane，也没有统一公开优先级：
+## 凭据读取统一（本轮）
 
-| 读取器 | username / 环境优先级 | role | 密码存在性 | 错误边界 |
-| --- | --- | --- | --- | --- |
-| `identity::load_profile`（本轮） | `BUPT_USERNAME` 先经 trim 过滤，再回退配置字符串；最终 trim | env/config 解析为 `Option<Role>`；缺失和非法都为 `None` | env 或配置的密码字符串任一非空 | 配置不存在且无有效 env -> `None`；读取/解析失败 -> auth；有 username 但无密码仍返回 profile |
-| `academics::load_account` | env 和配置都 trim；逐项回退 | 规范化别名；未知角色保留为小写字符串，缺失为 `""`；`validate_role` 区分缺失/非法 | `require_password` 为真时要求密码；env 优先于配置 | 读取/解析失败 -> auth；无 username 或必需密码缺失 -> auth |
-| `homework::require_credentials` | env 只过滤空串、不 trim；配置可用字符串或数字；username 再按 trim 非空过滤 | 不读取 role | env 或配置的 username/password 都必须存在 | 读取/解析失败 -> auth；没有 profile -> auth |
-| `campus::has_local_profile` | env username trim；配置 username trim；env 与配置按字段组合 | 不读取 role | env 或配置的有效 username/password 同时存在 | 读取/解析失败按“无 profile”返回 `false` |
+| 调用方 | 读取入口 | role 语义 | 缺失/异常 |
+| --- | --- | --- | --- |
+| `identity` `status` / `diagnose` | `load_profile` | 可为 `None`；`status` 仍可显示学号但不激活缓存 | 文件缺失 -> `None`；读取/解析失败 -> auth |
+| `academics` `schedule` / `exams` / `scores` / `classrooms` | `require_authenticated_profile` | 这些操作需要 role 选择/校验数据源；缺失或非法 role -> usage | 无 username、无密码、读取/解析失败 -> auth |
+| `homework` `courses` / `homework` | `require_authenticated_profile` | 不读取 role | 无 username、无密码、读取/解析失败 -> auth |
+| `campus` 受保护命令 | `require_authenticated_profile` | 不读取 role | 无 username、无密码、读取/解析失败 -> auth |
 
-已知冲突，交由整合者决定，不在本轮改动：
+统一后的边界：
 
-1. **缺失 vs 非法角色**：identity API 两者都返回 `None`；academics 分别保留 `""` 与未知字符串，并给出不同 usage 文案。
-2. **环境变量 vs 保存配置**：identity/academics 都按字段 env 优先，但密码“存在性”的处理不同；homework 的 env 不做 trim，空白 env 会阻止配置回退，且配置还接受数字；campus 的 password env 仅按非空判断（空白也算存在），只有 username trim；campus 还只返回 bool，并把读取失败当成没有 profile。
-3. **无密码 profile**：identity 仍可命名账号但禁止激活缓存；homework/campus 视为未配置；academics 是否报错取决于 `require_password`。
-4. **配置异常**：identity/homework 报 auth，campus 静默返回 `false`；academics 读取失败报 auth。
-
-接入 caller 时必须先由 supervisor 确认统一语义；本轮不改变 `status`/`diagnose` 的现有优先级。
+1. `credentials.json` 是 username、密码存在性和 role 的唯一持久化来源；`BUPT_USERNAME`、`BUPT_PASSWORD`、`BUPT_ROLE` 不再读取，也不作为提示或回退。
+2. 匿名命令不读取凭据；参数校验仍先于凭据读取。
+3. role 缺失或非法只在确实需要 role 的 `academics` 操作中报 usage；其他使用方不因 role 阻止仅需登录的命令。
+4. `status` 的只读语义和 session 归属规则不变；无密码 profile 仍然只显示学号，不激活缓存。
 
 ## 用例映射
 
@@ -86,7 +85,8 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 | `login_jwgl_flag_is_removed_and_does_not_touch_state` | 合同对 Python `login --jwgl` 的移除 | `login --jwgl` 作为已移除参数在验证/写凭据前以 usage 拒绝；旧凭据和会话不被替换，尝试密码不泄露。 |
 | `invalid_login_arguments_keep_last_registered_credentials_and_session` | `commands.py::cmd_login` 先 `save_credentials` 再验证的旧顺序 | **非法参数**不得覆盖上一次有效登记和会话。这里只覆盖联网前的角色校验失败，不冒充延迟 CAS 拒绝；后者见待实现场景。 |
 | `changed_account_does_not_reuse_previous_owners_session` | `test_session_cache_username_mismatch` | 学号变化时不把旧会话当成本账号的会话；旧所有者账号和 Cookie 材料不进入报告；配置中的当前合成学号可以正常显示。 |
-| `environment_account_override_does_not_reuse_configured_owners_session` | `test_credentials_env_overrides_config` | `BUPT_USERNAME`/`BUPT_PASSWORD` 覆盖配置文件时，会话归属按最终账号判断；旧所有者材料隐藏，当前环境账号可以显示。 |
+| `saved_credentials_ignore_conflicting_account_environment` | `test_credentials_env_overrides_config` 的反向合同变化 | JSON 里的 username/password/role 全部优先；冲突的账号、密码和 role 环境变量不能替换本地 profile，也不能让匹配缓存失效。 |
+| `environment_only_account_is_not_a_profile` | Python 环境变量优先行为的有意变更 | 只有账号环境变量、没有 `credentials.json` 时，`status` 不把环境变量当 profile，也不激活缓存；只读且不泄露合成账号/密码。 |
 | `same_username_different_role_does_not_reuse_v2_cache` | 合同“身份切换不复用另一所有者的状态” | 同一学号、不同角色（本科生凭据 + 研究生 v2 会话）不满足归属元组；CAS、UCloud、移动教务状态都不得复用。 |
 | `legacy_username_only_cache_reuses_cas_ucloud_but_not_mobile` | 合同“只复用归属可验证且兼容的旧会话”；Python 旧缓存没有角色字段 | v1 学号匹配但缺少角色时，只复用 CAS/UCloud；即使缓存里有移动教务 token，也不能在没有角色归属时复用。 |
 | `v2_undergraduate_cache_reuses_verified_mobile_token` | v2 归属元组；`probe.py` 的移动教务缓存 token 规则 | 本科生 v2 会话带角色和可用移动教务 token 时可以显示该 token 存在且未过期；`status` 不写回、不改登录计数。 |
@@ -118,6 +118,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - Python `login` 在验证前保存新凭据；合同要求失败时保留上一次有效登记和会话。当前实现还在 pending 前，后续接线必须保持这个顺序。
 - Python `logout` 只删 `session.json`，不清密码；合同要求同时忘掉本地凭据和会话，但保留课表和设置。Rust 直接 unlink 两个自有文件，不重写或截断；符号链接/非普通文件拒绝。
 - Python `status.user` 原样返回缓存对象；Rust 只允许 `user_id`、`user_name`、`real_name`，且只接受字符串/整数 ID 和字符串名称，嵌套值不输出。Python `mobile_jwgl.last_error` 原样返回；Rust 映射为安全诊断，不输出缓存自由文本。
+- Python 的凭据读取允许环境变量覆盖 `credentials.json`；Rust 合同改为只读 JSON，账号环境变量不再补充或覆盖任何字段。相关进程用例验证 env-only 被忽略、冲突 env 不改变本地账号和 role。
 - Python 只要缓存有 Cookie 且学号相同就可能复用；Rust 要求 profile 含密码、v2 归属元组 `(username, role)`，并要求至少一个未明确过期且 name/value 完整的 CAS Cookie。v1 只复用身份无关的 CAS/UCloud 状态，不复用无法确认角色的移动教务状态。
 - 当前 Rust `login` 只实现非交互参数解析；Python 在缺参数时提示输入。最终登录仍必须恢复交互式提示；本轮只把它记录为里程碑，不把非交互行为当作最终合同。
 - 成功/错误输出统一带 `schema: "bupt.v1"`；这是迁移合同的新增外壳。

@@ -32,6 +32,9 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `electricity_reports_unreadable_config_without_json_hint` | 路径是目录时是 usage，且消息/hint 不含 JSON；不断言权限或 IO 文案 | `test_unreadable_config_is_usage_error_not_json_hint` |
 | `notices_requires_credentials_without_creating_session` | 无凭据时 notices 返回 auth 3，提示登录；不创建会话文件（不等于证明无请求） | `commands.py:cmd_notices_list` |
 | `card_requires_credentials_without_creating_session` | 无凭据时 card 返回 auth 3，提示登录；不创建会话文件（不等于证明无请求） | `commands.py:cmd_card` |
+| `environment_only_credentials_are_ignored` | 只有合成账号环境变量、没有 `credentials.json` 时 card 仍为 auth 3；`BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 不再是登录来源 | 合同“已登记凭据只从 credentials.json 读取” |
+| `malformed_saved_credentials_are_an_auth_error` | 损坏的 `credentials.json` 报 auth 3 并提示登录，不回显文件内容，不创建会话 | `credentials.py` 的 auth 错误分类；合同凭据边界 |
+| `saved_credentials_do_not_require_a_role` | 有效 JSON 只有 username + password、没有 role 时 card 仍进入 session adapter pending（upstream 5）；campus 不要求 role | 合同“role 只在需要身份路由时要求” |
 | `notices_rejects_unknown_types_before_auth` | 未知/混合类型在凭据前 usage，hint 含 `notice` 类别 token；尾随逗号按旧版忽略，不在此列 | `commands.py:_notice_types` |
 | `notices_accepts_case_insensitive_types_before_auth` | 类型大小写不敏感，合法类型继续到凭据层 | `_notice_types`、`NoticeType` |
 | `notices_rejects_invalid_count_as_usage_error` | `--count` 负数/非整数/小数在凭据前 usage | `test_invalid_numeric_arguments_are_usage_errors` |
@@ -72,7 +75,7 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 - `library search|hold|ebook` 的参数规格：`--page`、`--page-size`、`--location`、`--with-ebook`、位置参数与空白校验。
 - 匿名 OPAC 请求和响应解析：书目字段、HTML 高亮/实体清理、馆藏状态列与偏移回退、电子资源扁平列表和 `\x1e` 清理；`--with-ebook` 的旁路查询失败只记 `null`。
 - `electricity` / `electricity buildings` 的参数规格、楼名与校区别名、`config.json` 的 `dorm` 解析，以及 flag > env > config > built-in placeholder 的优先级。
-- `notices` / `notices show` / `card` 的本地参数校验与类型筛选；`notices show` 的空白 URL 在读取 profile 前以 usage 2 拒绝。无本地 profile 时授权命令返回 auth 3，有 profile 时停在 session adapter pending，不伪造成功。
+- `notices` / `notices show` / `card` 的本地参数校验与类型筛选；`notices show` 的空白 URL 在读取 profile 前以 usage 2 拒绝。受保护命令统一使用 `identity::require_authenticated_profile`，只从临时目录的 `credentials.json` 读取 username 和非空密码，不读取账号环境变量，也不要求 role；无本地 profile 或凭据损坏时返回 auth 3，有 profile 时停在 session adapter pending，不伪造成功。匿名 `library` 路径不读取凭据。
 
 ### 本轮新增的内部 fixture 测试
 

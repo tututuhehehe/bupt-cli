@@ -506,6 +506,58 @@ fn card_requires_credentials_without_creating_session() {
 }
 
 #[test]
+fn environment_only_credentials_are_ignored() {
+    let sandbox = Sandbox::new();
+    let password = "TEST-ONLY-CAMPUS-ENV-PASSWORD-7a9b";
+    let payload = assert_error(
+        run_with_env(
+            &sandbox,
+            &["card"],
+            &[
+                ("BUPT_USERNAME", "2026000098"),
+                ("BUPT_PASSWORD", password),
+                ("BUPT_ROLE", "graduate"),
+            ],
+        ),
+        3,
+        "auth",
+    );
+    assert!(
+        error_hint(&payload).contains("login"),
+        "environment credentials must not replace credentials.json; stderr={payload}"
+    );
+    assert!(!payload.to_string().contains(password));
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
+fn malformed_saved_credentials_are_an_auth_error() {
+    let sandbox = Sandbox::new();
+    write_malformed_credentials(&sandbox);
+
+    let payload = assert_error(sandbox.run(&["card"]), 3, "auth");
+    assert!(
+        error_hint(&payload).contains("login"),
+        "malformed credentials should keep the auth hint; stderr={payload}"
+    );
+    assert!(!payload.to_string().contains("not valid json"));
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
+fn saved_credentials_do_not_require_a_role() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        credentials_path(&sandbox),
+        r#"{"username":"2026000096","password":"TEST-ONLY-CAMPUS-PASSWORD-2b3c"}"#,
+    )
+    .expect("write synthetic roleless credentials");
+
+    assert_error(sandbox.run(&["card"]), 5, "upstream");
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
 fn notices_rejects_unknown_types_before_auth() {
     let sandbox = Sandbox::new();
     write_malformed_credentials(&sandbox);

@@ -1,4 +1,5 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
+use crate::identity::{self, LocalProfile, Role};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -172,9 +173,9 @@ fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
 }
 
 fn run_exams(ctx: &Context<'_>) -> CliResult<Outcome> {
-    let account = load_account(ctx, true)?;
-    validate_role(&account)?;
-    let label = if account.role == "graduate" {
+    let account = identity::require_authenticated_profile(&ctx.config_dir)?;
+    let role = required_role(&account)?;
+    let label = if role == Role::Graduate {
         "研究生考试数据源"
     } else {
         "本科考试数据源"
@@ -183,24 +184,22 @@ fn run_exams(ctx: &Context<'_>) -> CliResult<Outcome> {
 }
 
 fn run_scores(ctx: &Context<'_>) -> CliResult<Outcome> {
-    let account = load_account(ctx, true)?;
-    validate_role(&account)?;
-    require_undergraduate(&account, "scores")?;
+    let account = identity::require_authenticated_profile(&ctx.config_dir)?;
+    require_undergraduate(required_role(&account)?, "scores")?;
     Err(pending_remote("本科成绩数据源"))
 }
 
 fn run_classrooms(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
-    let account = load_account(ctx, true)?;
-    validate_role(&account)?;
-    require_undergraduate(&account, "classrooms")?;
+    let account = identity::require_authenticated_profile(&ctx.config_dir)?;
+    require_undergraduate(required_role(&account)?, "classrooms")?;
     let _campus = matches
         .get_one::<String>("campus")
         .expect("campus has a validated default");
     Err(pending_remote("本科空教室数据源"))
 }
 
-fn require_undergraduate(account: &Account, command: &str) -> CliResult<()> {
-    if account.role == "graduate" {
+fn require_undergraduate(role: Role, command: &str) -> CliResult<()> {
+    if role == Role::Graduate {
         return Err(CliError::new(
             2,
             "usage",
@@ -232,80 +231,16 @@ fn outcome(data: Value) -> Outcome {
 // Local account and snapshot ownership.
 // ---------------------------------------------------------------------------
 
-struct Account {
-    username: String,
-    role: String,
+fn required_role(account: &LocalProfile) -> CliResult<Role> {
+    account
+        .role()
+        .ok_or_else(|| role_error("账号身份未登记或不受支持"))
 }
 
-fn load_account(ctx: &Context<'_>, require_password: bool) -> CliResult<Account> {
-    let path = ctx.config_dir.join("credentials.json");
-    let mut config = Map::new();
-    if path.exists() {
-        let raw = fs::read(&path).map_err(|_| credential_error(&path))?;
-        let value: Value = serde_json::from_slice(&raw).map_err(|_| credential_error(&path))?;
-        config = value
-            .as_object()
-            .cloned()
-            .ok_or_else(|| credential_error(&path))?;
-    }
-
-    let env = |key: &str| {
-        std::env::var(key)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    };
-    let from_config = |key: &str| {
-        config
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    };
-
-    let username = env("BUPT_USERNAME")
-        .or_else(|| from_config("username"))
-        .unwrap_or_default();
-    let password = env("BUPT_PASSWORD")
-        .or_else(|| from_config("password"))
-        .unwrap_or_default();
-    let role = env("BUPT_ROLE")
-        .or_else(|| from_config("role"))
-        .map(|role| normalize_role(&role))
-        .unwrap_or_default();
-
-    if username.is_empty() || (require_password && password.is_empty()) {
-        return Err(credential_error(&path));
-    }
-    Ok(Account { username, role })
-}
-
-fn credential_error(path: &Path) -> CliError {
-    CliError::new(
-        3,
-        "auth",
-        "BUPT credentials are not configured",
-        format!(
-            "设置 BUPT_USERNAME/BUPT_PASSWORD，或检查 {}",
-            path.display()
-        ),
-    )
-}
-
-fn normalize_role(role: &str) -> String {
-    match role.trim().to_lowercase().as_str() {
-        "graduate" | "研究生" | "硕士" | "博士" | "grad" | "postgrad" => "graduate".into(),
-        "undergraduate" | "本科生" | "本科" | "undergrad" | "ug" => "undergraduate".into(),
-        other => other.to_string(),
-    }
-}
-
-fn validate_role(account: &Account) -> CliResult<()> {
-    match account.role.as_str() {
-        "graduate" | "undergraduate" => Ok(()),
-        "" => Err(role_error("账号身份未登记")),
-        other => Err(role_error(format!("账号身份 `{other}` 不受支持"))),
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::Graduate => "graduate",
+        Role::Undergraduate => "undergraduate",
     }
 }
 
@@ -326,8 +261,9 @@ struct Snapshot {
 }
 
 fn owned_snapshot(ctx: &Context<'_>) -> CliResult<Snapshot> {
-    let account = load_account(ctx, true)?;
-    validate_role(&account)?;
+    let account = identity::require_authenticated_profile(&ctx.config_dir)?;
+    let account_role = required_role(&account)?;
+    let expected_role = role_label(account_role);
     let path = ctx.cache_dir.join("timetable.json");
     let raw = fs::read(&path)
         .map_err(|_| refresh_required("课表快照不存在或无法读取，不能确认它属于当前账号"))?;
@@ -341,11 +277,11 @@ fn owned_snapshot(ctx: &Context<'_>) -> CliResult<Snapshot> {
         return Err(refresh_required("课表快照版本不受支持，无法确认旧快照归属"));
     }
     let username = object.get("username").and_then(Value::as_str).unwrap_or("");
-    if username != account.username {
+    if username != account.username() {
         return Err(refresh_required("课表快照属于另一个学号，不能用于当前账号"));
     }
     let role = object.get("role").and_then(Value::as_str).unwrap_or("");
-    if role != account.role {
+    if role != expected_role {
         return Err(refresh_required(
             "课表快照属于另一种校园身份，不能用于当前账号",
         ));

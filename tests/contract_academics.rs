@@ -946,7 +946,7 @@ fn passwordless_profile_cannot_read_a_matching_snapshot() {
 }
 
 #[test]
-fn explicit_environment_credentials_still_satisfy_the_local_profile() {
+fn environment_credentials_do_not_fill_a_passwordless_profile() {
     let sandbox = Sandbox::new();
     let snapshot = synthetic_snapshot(USER, "graduate");
     fs::write(
@@ -958,7 +958,7 @@ fn explicit_environment_credentials_still_satisfy_the_local_profile() {
         .expect("serialize passwordless synthetic profile"),
     )
     .expect("write passwordless synthetic profile");
-    write_cache(&sandbox, &snapshot.entry);
+    let (cache, before) = write_cache(&sandbox, &snapshot.entry);
     let date = snapshot.class_date.iso();
 
     let invocation = Invocation(
@@ -970,7 +970,43 @@ fn explicit_environment_credentials_still_satisfy_the_local_profile() {
             .output()
             .expect("run with explicit synthetic environment credentials"),
     );
+    assert_eq!(
+        invocation.code(),
+        3,
+        "environment passwords must not activate credentials.json; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&invocation.0.stdout),
+        String::from_utf8_lossy(&invocation.0.stderr)
+    );
+    assert!(invocation.0.stdout.is_empty());
+    let payload = invocation.stderr_json();
+    assert_schema(&payload);
+    assert_eq!(payload["ok"], json!(false));
+    assert_eq!(payload["error"]["type"], json!("auth"));
+    assert_eq!(
+        fs::read(&cache).expect("read cache after auth refusal"),
+        before
+    );
+}
+
+#[test]
+fn environment_credentials_do_not_override_saved_account_or_role() {
+    let sandbox = Sandbox::new();
+    let snapshot = synthetic_snapshot(USER, "graduate");
+    write_credentials(&sandbox, USER, "graduate");
+    write_cache(&sandbox, &snapshot.entry);
+    let date = snapshot.class_date.iso();
+
+    let invocation = Invocation(
+        network_guarded_command(&sandbox)
+            .env("BUPT_USERNAME", OTHER_USER)
+            .env("BUPT_PASSWORD", PASSWORD)
+            .env("BUPT_ROLE", "undergraduate")
+            .args(["schedule", "--date", &date])
+            .output()
+            .expect("run with conflicting synthetic environment credentials"),
+    );
     let payload = assert_success(&invocation);
+    assert_eq!(payload["role"], json!("graduate"));
     assert_eq!(payload["from_cache"], json!(true));
     assert_eq!(payload["count"], json!(1));
 }

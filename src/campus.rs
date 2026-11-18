@@ -1,8 +1,6 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
+use crate::identity;
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use serde_json::Value;
-use std::fs;
-use std::path::PathBuf;
 
 mod dorm;
 mod library;
@@ -279,50 +277,9 @@ fn run_card(context: &mut Context<'_>) -> CliResult<Outcome> {
     Err(session_unavailable(context, "card"))
 }
 
-fn has_local_profile(context: &Context<'_>) -> bool {
-    let mut username = std::env::var("BUPT_USERNAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let mut password = std::env::var("BUPT_PASSWORD")
-        .ok()
-        .filter(|value| !value.is_empty());
-    if username.is_some() && password.is_some() {
-        return true;
-    }
-
-    let path: PathBuf = context.config_dir.join("credentials.json");
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&text) else {
-        return false;
-    };
-    if username.is_none() {
-        username = object
-            .get("username")
-            .and_then(Value::as_str)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-    }
-    if password.is_none() {
-        password = object
-            .get("password")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-    }
-    username.is_some() && password.is_some()
-}
-
 fn session_unavailable(context: &Context<'_>, service: &str) -> CliError {
-    if !has_local_profile(context) {
-        return CliError::new(
-            3,
-            "auth",
-            "BUPT credentials are not configured",
-            "run `bupt login` (credentials come from BUPT_USERNAME/BUPT_PASSWORD or credentials.json)",
-        );
+    if let Err(error) = identity::require_authenticated_profile(&context.config_dir) {
+        return error;
     }
     CliError::new(
         5,

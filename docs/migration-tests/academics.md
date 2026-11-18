@@ -14,6 +14,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 2. **缓存位置**：沿用旧行为，fixture 写到 `BUPT_CLI_CACHE_DIR/timetable.json`；凭据写到 `BUPT_CLI_CONFIG_DIR/credentials.json`。
 3. **网络隔离边界**：共享 `Sandbox` 只隔离 HOME/config/cache。把 `HTTP(S)_PROXY`/`ALL_PROXY` 指向关闭的本地端口是 best-effort，只对遵守这些环境变量的 HTTP 客户端生效；它不覆盖浏览器/非 HTTP 流量，也不能证明“没有发起网络请求”。真正的 no-calls 断言必须放在后续注入 transport/browser 的场景里（见下）。
 4. **动态日期**：快照的教学周围绕 UTC 当天生成（前后各数周），避免测试在学期结束后因“过期”而误判；断言的具体日期由同一套日期算法算出。
+5. **凭据来源**：只用临时目录里的 `credentials.json`；账号环境变量不读取、不覆盖 JSON。role 只用于需要身份路由的教务操作。
 
 ## 用例映射
 
@@ -29,7 +30,8 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `ics_folds_long_utf8_lines` | `test_timetable.py::test_build_ics_is_crlf_and_folded`、`test_grad.py::test_build_ics_is_crlf_and_folded` | 长中文 SUMMARY 按 UTF-8 八位字节折行，每行不超过 76 字节；按 RFC 5545 去折行后必须逐字节还原完整 SUMMARY，拒绝截断或省略 |
 | `export_succeeds_even_when_opening_the_folder_fails` | 合同“导出文件成功不因打开系统文件管理器失败变成导出失败” | Unix 下伪造 `open` 写 sentinel 后退出 9：证明 opener 确实被调用，同时 `schedule export` 仍成功且文件存在；真实 Windows reveal 仍未实测 |
 | `passwordless_profile_cannot_read_a_matching_snapshot` | 合同“`logout` 清掉本地密码和会话，保留课表”；身份/快照归属 | 密码被清掉但 username/role 仍匹配时，query/calendar/export 全部 auth 拒绝；快照字节不变，不生成 ICS |
-| `explicit_environment_credentials_still_satisfy_the_local_profile` | 旧凭据优先级 | 配置缺密码时，显式合成 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 仍能读取匹配快照 |
+| `environment_credentials_do_not_fill_a_passwordless_profile` | 旧凭据优先级的有意变更 | 配置缺密码时，即使合成 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 全部存在，也不能补足本地 profile；查询停在 auth，快照不变 |
+| `environment_credentials_do_not_override_saved_account_or_role` | 旧凭据优先级的有意变更 | 有效 JSON 的学号和 role 优先于冲突的账号环境变量；匹配的 graduate 快照仍可读取，role 输出保持 `graduate` |
 | `date_arguments_require_ascii_yyyy_mm_dd_and_valid_year` | 合同“非法参数在读写业务状态前拒绝” | 带符号年份/分量、0000 年、非 ASCII 数字、非补零月日、非法闰日全部 usage；不触碰缓存 |
 | `valid_leap_day_is_accepted_by_the_local_query` | `--date` 合法日期边界 | 2024-02-29 被接受并返回空结果；快照不变 |
 | `export_omits_events_with_invalid_clock_times` | 合同“不伪造考试/课表事实”；安全 ICS | 25:00、09:60 等非法时钟在插值前被拒绝，不生成对应事件，事件计数只算真实输出 |
@@ -47,9 +49,9 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 ## 实施状态（本地第一批）
 
 - `src/academics.rs` 已实现本地部分：v2 快照归属校验、可用当前 profile 校验（密码被 logout 清掉的配置不能单独读取课表/导出）、`schedule` 单日/周/原始查询、`schedule calendar`、`schedule export`（含严格日期/HH:MM 校验、ICS 折行、CRLF/换行转义和 opener 失败隔离），以及 `scores` / `classrooms` / `exams` 的本地身份与数据源路由校验。
-- 本清单 24 个进程用例全部通过；没有用跳过或假断言绕过尚未接通的远端路径。
+- 本清单 25 个进程用例全部通过；没有用跳过或假断言绕过尚未接通的远端路径。
 - `schedule update`、本科生 `scores` / `classrooms` / `exams` 和研究生 `exams` 在通过本地校验后返回 upstream pending（退出 5），不访问 transport、校园网或浏览器。对应的成功输出场景仍在下面的暂缓清单中，尚未编译成用例，因此当前也不会以红测出现。
-- 当前本地 credentials 读取是 academics 的临时实现；identity 的共享 loader 接线后应替换，避免两套密码/身份规则漂移。显式 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 仍可补足密码已清掉的配置文件。
+- 本地凭据统一由 `identity::require_authenticated_profile` 读取 `credentials.json`：username 和非空密码是登录前提；`role` 只在需要选择/校验数据源的 `schedule`、`exams`、`scores`、`classrooms` 中要求。`BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 不再读取，也不再能补足或覆盖 JSON。
 - 当前过期策略：归属明确且版本兼容的 v2 快照即使已离开教学周，仍会按本地快照返回；不会自动刷新。合同没有明确“过期是提示刷新还是继续读快照”，这里先选择严格离线、显式刷新，需整合者确认后再补跨学期用例。
 
 ## 暂不能黑盒验证的场景与最小测试缝
