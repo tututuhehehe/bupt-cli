@@ -1,6 +1,6 @@
 # bupt 工作约定
 
-- **迁移**：改 Rust 命令、共享接口、样例或验收测试之前，读 [迁移合同](docs/rust-migration.md)。旧 Python 只作行为基准；对照合同判断哪些差异是预期变化。
+- **迁移**：改 Rust 命令、共享接口或验收测试时读 [迁移合同](docs/rust-migration.md)；派发或审查实现时读 [实施与验收](docs/rust-implementation.md)。
 - **术语**：改登录、身份路由或课表时，读 [术语表](GLOSSARY.md)。
 - 命令默认 JSON，带 `schema`。`--pretty` 只改变排版；`help` 和 `help <command>` 为文本。不设 `--json`，这是本项目的例外。
 - 分功能 worktree；每次只改任务指定的文件。涉及共享合同冲突或新增公开行为，交由整合者决定。
