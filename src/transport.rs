@@ -32,6 +32,10 @@ impl Transport for Offline {
     }
 }
 
+// Kept private until verified login and session dispatch are wired together.
+#[cfg(test)]
+mod cas_wire;
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
