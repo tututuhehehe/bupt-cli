@@ -211,6 +211,14 @@ impl OwnedCasSession {
         self.cas.has_usable_cookies()
     }
 
+    pub(crate) fn portal_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        service: &url::Url,
+    ) -> CliResult<String> {
+        self.cas.portal_ticket(transport, service)
+    }
+
     pub(crate) fn cached_ucloud_credentials(&self) -> Option<(String, String)> {
         self.cas.cached_ucloud_credentials()
     }

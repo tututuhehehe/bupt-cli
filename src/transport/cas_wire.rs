@@ -25,6 +25,7 @@ enum Route {
     UcloudAttachment,
     ElectricityLanding,
     ElectricityRead(&'static [&'static str]),
+    PortalRead { card: bool },
     PublicProbe,
     MobileProbe,
     MobileLogin,
@@ -159,6 +160,14 @@ fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<V
             return Err(rejected());
         }
     }
+    if matches!(route, Route::PortalRead { card: true })
+        && request.headers.iter().any(|(key, value)| {
+            (key.eq_ignore_ascii_case("referer") && value != super::portal_scope::CARD_REFERER)
+                || (key.eq_ignore_ascii_case("x-requested-with") && value != "XMLHttpRequest")
+        })
+    {
+        return Err(rejected());
+    }
     if requires_body {
         option(&mut options, "header", "Expect:");
         option(&mut options, "data-raw", body);
@@ -187,6 +196,11 @@ fn route(request: &Request) -> Option<Route> {
         return None;
     }
     match (host, request.method, path) {
+        ("my.bupt.edu.cn", "GET", path) if super::portal_scope::portal_url(raw, true).is_some() => {
+            Some(Route::PortalRead {
+                card: path == super::portal_scope::CARD,
+            })
+        }
         ("auth.bupt.edu.cn", "POST", "/authserver/login") if parsed.query().is_none() => {
             Some(Route::CasForm)
         }
@@ -278,7 +292,8 @@ fn probe_route(request: &Request) -> Option<Route> {
             Route::CasForm
             | Route::UcloudLanding
             | Route::UcloudAttachment
-            | Route::MobileLogin => None,
+            | Route::MobileLogin
+            | Route::PortalRead { .. } => None,
             Route::CasRead
                 if !matches!(
                     request.url.as_str(),
@@ -372,6 +387,9 @@ fn allowed_header(route: Route, name: &str) -> bool {
             ),
             Route::CasForm => matches!(name, "cookie" | "content-type"),
             Route::UcloudLanding | Route::UcloudAttachment | Route::PublicProbe => false,
+            Route::PortalRead { card } => {
+                name == "cookie" || (card && matches!(name, "referer" | "x-requested-with"))
+            }
             Route::MobileProbe => matches!(name, "token" | "accept"),
             Route::MobileLogin => matches!(name, "accept" | "content-type"),
             Route::UcloudToken => matches!(name, "authorization" | "content-type"),

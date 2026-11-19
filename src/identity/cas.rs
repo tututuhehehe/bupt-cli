@@ -276,6 +276,30 @@ impl CasLogin {
         request_cas_service_ticket(transport, &mut self.cookies, service)
     }
 
+    /// Get one ticket for an advertised, separately validated portal service.
+    /// The response is consumed only by the portal driver, never logged.
+    pub(super) fn portal_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        service: &Url,
+    ) -> CliResult<String> {
+        use crate::transport::portal_scope;
+        if portal_scope::portal_url(service.as_str(), false).is_none() || !self.has_usable_cookies()
+        {
+            return Err(auth_error("no usable CAS session for the portal"));
+        }
+        let request = portal_scope::cas_url(service);
+        let response = send_get(transport, &mut self.cookies, &request)?;
+        match response.status {
+            301 | 302 | 303 | 307 | 308 => header(&response.headers, "location")
+                .filter(|location| portal_scope::matches_ticket(location, service))
+                .map(str::to_owned)
+                .ok_or_else(|| parse_error("CAS returned an unexpected portal ticket destination")),
+            401 | 403 | 200..=299 => Err(auth_error("CAS did not issue a portal service ticket")),
+            status => Err(upstream_http_error("CAS portal ticket request", status)),
+        }
+    }
+
     /// Exchange an already obtained ticket. State stays in memory; callers that
     /// need durability must persist separately.
     pub(super) fn exchange_ucloud_ticket(

@@ -82,7 +82,7 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 - `electricity` 余额的 Python 请求链：静态楼栋 `partmentId`/`areaId`/默认楼层 → `/floor` 精确楼层名匹配 → `/drom` 房间名/房号评分 → `/search` → CLI 字段。楼层推断、沙河 `层` 后缀、房间规范化/精确>后缀>包含、非对象项、缺 `dromNum` 都有离线用例。
 - `notices` / `notices show` / `card` 的本地参数校验、profile 检查和命令编排；`notices show` 的空白/外部 URL 在读取 profile 前以 usage 2 拒绝。受保护命令统一使用 `identity::require_authenticated_profile`，只从临时目录的 `credentials.json` 读取 username 和非空密码，不读取账号环境变量，也不要求 role；无本地 profile 或凭据损坏时返回 auth 3。
 - `SessionDriver` 在联网前调用 `ensure(Service::Portal|Electricity)`，每个请求带 `Route` 标签；`send` 只执行一次交换，`renew` 只在确认 auth 3 后调用一次。门户列表 auth 后重启整个列表；电费只重试失败的 `/post`。这与 Python 的 invalidate-and-retry 行为一致。`Route::accepts` 固定方法、完整 URL/主机、请求头集合和空/非空 body，驱动不得把 `Cookie`/`Authorization` 放进 `Request`。
-- 默认 `run` 使用 `PendingSession`，在本地参数和 profile 检查后返回 upstream 5；因此当前正式二进制仍不会发门户/电费请求。父会话层可调用 `run_with_session` 接入真实 `ensure`/`send`/`renew`。
+- 正式 `run` 为电费和门户分别建立本次调用的会话驱动；`run_with_session` 留给测试注入。两者先验证已绑定的本地身份，校园网真实响应仍待实测。
 
 `SessionDriver` 收到的 route 模板（`Route::accepts` 逐项校验）：
 
@@ -237,8 +237,8 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
    - `ensure(&mut self, service: Service)`：按 `Service::Portal` / `Service::Electricity` 读取/验证本地会话，完成对应的门户或电费会话 prime/CAS 握手；校园模块只从 `credentials.json` 检查 username + 非空密码，不要求 role。
    - `send(&mut self, route: Route, request: Request)`：先复核 `route.accepts(&request)`，再附加 Cookie/token 并执行一次 HTTP 交换；HTTP 状态（含 401/403/3xx）要作为 `Response` 返回给校园层分类，只有传输失败才返回 network 4。不得在 `Request` 里加凭据，不得隐式重试或跟随重定向。
    - `renew(&mut self, service: Service)`：只在校园层已确认 auth 3 后，按该 service 失效并刷新一次会话；不得把凭据发到未批准目的地。
-2. **CLI 接入点**：父层调用 `campus::run_with_session`（或把 `campus::run` 的 `PendingSession` 换成真实驱动）。当前 `cli.rs` 的 `uses_campus_transport` 仍未把 `electricity` / `notices` / `card` 路由到带 Cookie 的传输，所以正式二进制仍是 `Offline` 语义；本批未改父文件。
-3. **scheme/WebVPN 决策**：`Route` 当前按 Python 固定门户 `http://my.bupt.edu.cn` 和电费 `https://app.bupt.edu.cn` 的精确形状校验。若父层要改用 HTTPS/WebVPN 或代理，必须先修改并评审 route 模板，不能由驱动静默改写 URL；本轮不猜测。
+2. **CLI 接入点**：`electricity`、`notices` 和 `card` 已路由到受限生产传输。合成测试 `card_reuses_bound_cas_cookies_only_at_cas_and_honors_portal_cookie_scope` 回放了 CAS 登录、门户票据交换与饭卡读取，未访问校园网。无绑定会话在发请求前失败。
+3. **门户 HTTPS 边界**：Python 的固定 HTTP URL 只作输入/兼容输出，生产请求使用相同主机上的 HTTPS 和限定读路径。CAS 的服务参数和票据返回地址须匹配，不向 HTTP 回调发送票据；真实 HTTPS 和回调形态仍待校园网确认，不声称已有 WebVPN 支持。
 4. **cookie/redirect 实际边界**：真实 401/403 后的会话失效、3xx 是否跟随、Cookie 域/路径、WebVPN 地址仍未实测；校园层只按确认的 `e/m` 标记或 401/403 进入 auth 3，3xx 不猜成登录页。若未来跟随重定向，必须在每一跳重新校验 `Route` 目标并重新确认 Cookie 域。
 5. **进程级成功输出**：共享 CLI 负责 `schema: "bupt.v1"` 和 `--pretty`；本批内部命令测试验证的是 `Outcome` 数据对象，尚未通过正式二进制回放门户/电费成功响应。进程合同测试仍只覆盖本地参数、无 profile 的 auth 层和文件副作用。
 6. **library 上游错误分层**：传输错误、HTTP 非 2xx、`result.code != 0`、hold 404/500、JSON 形状错误。本轮仍按 Python 旧版全部归为 usage 2；是否改为 network/upstream 分层仍未决定。
@@ -248,9 +248,9 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 - `notices show` 已在 `src/campus/portal.rs` 内校验目标：只接受 `http`/`https`、主机恰为 `my.bupt.edu.cn`、无显式非默认端口、无 userinfo 的绝对 URL；校验先于 profile 检查和该模块的任何请求，请求使用规范化后的解析结果。
 - `Route::accepts` 在任何 `SessionDriver::send` 前固定方法、完整 URL/主机、请求头集合和空/非空 body；`ScopedTransport` 在驱动前再次拒绝不匹配请求。门户列表/卡/详情和电费四个 endpoint 都有对应 route。
 - 校园模块不把 Cookie、Authorization 或 token 放进 `Request`；卡控件只设置 Python 要求的 `Referer` 与 `X-Requested-With`，电费只设置 `Referer`、`X-Requested-With`、`Content-Type`。驱动应在自己的传输层附加会话材料，而不是修改请求头。
-- 重定向仍不跟随；驱动若要跟随，必须在每一跳复核目标仍匹配原 `Route`，且不得把 Cookie 带到其他主机/端口/userinfo。
+- curl 不自动跟随。门户驱动逐跳验证 HTTPS 主机和路径，只在 HTTPS CAS 请求上使用 CAS Cookie；门户应用 Cookie 只留在本次调用的门户 Cookie 容器中。电费仍拒绝未经确认的重定向。
 - 不得把校园凭据、Cookie 或 token 发送到任意 `--url` 指向的地址。
-- 已知 Python 门户入口使用 `http://my.bupt.edu.cn`（校内主机），电费使用 `https://app.bupt.edu.cn`。若父层决定改用 HTTPS/WebVPN，必须先评审并更新 route；本轮不发送任何真实 cookie 或密码，也不猜测该决定。
+- 已知 Python 门户入口使用 `http://my.bupt.edu.cn`，电费使用 `https://app.bupt.edu.cn`。若实际校园门户不提供可用 HTTPS 入口，当前实现不会回退到明文凭据或票据传输；真实兼容性待测。
 - electricity 不跟随或解释重定向；3xx 交由响应体解析，登录页不会被猜成 auth，只有确认的 `e/m` 标记或 401/403 才进入 auth。
 - 确认 auth 后只允许一次 `renew`；门户列表从第一个类型重启，电费只重试失败的单次 `/post`。第二次 auth 直接返回 3。
 

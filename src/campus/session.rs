@@ -8,8 +8,8 @@
 //! silently. No credential material is ever put into a [`Request`] by this
 //! module.
 //!
-//! The electricity driver uses the fixed HTTPS landing and query routes.
-//! The portal driver remains pending a verified secure session entry point.
+//! The electricity driver uses the fixed HTTPS landing and query routes;
+//! the portal driver is in the sibling `portal_session` module.
 
 use super::electricity;
 use super::portal::{self, NoticeType};
@@ -106,7 +106,7 @@ impl Route {
         }
     }
 
-    fn is_electricity(self) -> bool {
+    pub(super) fn is_electricity(self) -> bool {
         matches!(
             self.0,
             RouteKind::ElectricityBuildings
@@ -167,33 +167,6 @@ pub(crate) trait SessionDriver {
     fn ensure(&mut self, service: Service) -> CliResult<()>;
     fn send(&mut self, route: Route, request: Request) -> CliResult<Response>;
     fn renew(&mut self, service: Service) -> CliResult<()>;
-}
-
-fn pending() -> CliError {
-    CliError::new(
-        5,
-        "upstream",
-        "campus session driver is not connected in this migration build",
-        "",
-    )
-}
-
-/// Default driver used by the public command dispatcher until the parent
-/// session layer attaches a real implementation.
-pub(super) struct PendingSession;
-
-impl SessionDriver for PendingSession {
-    fn ensure(&mut self, _: Service) -> CliResult<()> {
-        Err(pending())
-    }
-
-    fn send(&mut self, _: Route, _: Request) -> CliResult<Response> {
-        Err(pending())
-    }
-
-    fn renew(&mut self, _: Service) -> CliResult<()> {
-        Err(pending())
-    }
 }
 
 /// Per-invocation app cookies; never load or persist a portal session here.

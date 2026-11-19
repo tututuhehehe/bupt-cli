@@ -411,6 +411,7 @@ fn transport_failure() -> CliError {
 }
 
 mod cas_wire;
+pub(crate) mod portal_scope;
 
 /// Public release metadata and, for installs only, fixed release archives.
 /// Redirects are returned to the lifecycle handler, never followed by curl.

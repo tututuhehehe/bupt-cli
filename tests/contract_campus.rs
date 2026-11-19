@@ -546,7 +546,7 @@ fn malformed_saved_credentials_are_an_auth_error() {
 }
 
 #[test]
-fn saved_credentials_do_not_require_a_role() {
+fn card_requires_a_bound_session_before_network() {
     let sandbox = Sandbox::new();
     fs::write(
         credentials_path(&sandbox),
@@ -554,7 +554,12 @@ fn saved_credentials_do_not_require_a_role() {
     )
     .expect("write synthetic roleless credentials");
 
-    assert_error(sandbox.run(&["card"]), 5, "upstream");
+    let (code, layer) = if cfg!(unix) {
+        (3, "auth")
+    } else {
+        (5, "upstream")
+    };
+    assert_error(sandbox.run(&["card"]), code, layer);
     assert_no_session_file(&sandbox);
 }
 

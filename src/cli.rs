@@ -102,7 +102,15 @@ fn uses_public_library(name: &str) -> bool {
 fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
     matches!(
         name,
-        "login" | "courses" | "electricity" | "schedule" | "exams" | "scores" | "classrooms"
+        "login"
+            | "courses"
+            | "electricity"
+            | "schedule"
+            | "exams"
+            | "scores"
+            | "classrooms"
+            | "notices"
+            | "card"
     ) || (name == "homework"
         && match arguments.subcommand_name() {
             Some("show" | "verify" | "download") => true,
@@ -445,7 +453,8 @@ mod tests {
             (&["bupt", "exams"][..], true),
             (&["bupt", "scores"][..], true),
             (&["bupt", "classrooms"][..], true),
-            (&["bupt", "notices"][..], false),
+            (&["bupt", "notices"][..], true),
+            (&["bupt", "card"][..], true),
             (&["bupt", "status"][..], false),
             (&["bupt", "diagnose"][..], false),
             (&["bupt", "library", "search", "example"][..], false),

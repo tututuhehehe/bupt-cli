@@ -7,6 +7,7 @@ mod dorm;
 mod electricity;
 mod library;
 mod portal;
+mod portal_session;
 mod session;
 
 #[allow(unused_imports)] // part of the parent-facing session seam
@@ -109,17 +110,24 @@ pub(crate) fn run(
         let mut session = session::ElectricitySession::new(context);
         return run_electricity(matches, &config_dir, &mut session);
     }
-    let mut session = session::PendingSession;
-    run_with_session(name, matches, context, &mut session)
+    if matches!(name, "notices" | "card") {
+        let config_dir = context.config_dir.clone();
+        let mut session = portal_session::PortalSession::new(context);
+        return if name == "notices" {
+            run_notices(matches, &config_dir, &mut session)
+        } else {
+            run_card(&config_dir, &mut session)
+        };
+    }
+    match name {
+        "library" => run_library(matches, context),
+        _ => Err(CliError::usage("unknown campus command")),
+    }
 }
 
-/// Command dispatcher for a parent-supplied authenticated session driver.
-///
-/// Kept separate from [`run`] so the parent CLI/session layer can attach its
-/// credential, cookie, and renewal implementation without changing any campus
-/// request or parser. Portal commands still use the pending driver until the
-/// secure session entry point is verified.
-pub(crate) fn run_with_session(
+/// Exercise the command handlers with a scripted session in tests.
+#[cfg(test)]
+fn run_with_session(
     name: &str,
     matches: &ArgMatches,
     context: &mut Context<'_>,
@@ -128,8 +136,8 @@ pub(crate) fn run_with_session(
     match name {
         "library" => run_library(matches, context),
         "electricity" => run_electricity(matches, &context.config_dir, session),
-        "notices" => run_notices(matches, context, session),
-        "card" => run_card(context, session),
+        "notices" => run_notices(matches, &context.config_dir, session),
+        "card" => run_card(&context.config_dir, session),
         _ => Err(CliError::usage("unknown campus command")),
     }
 }
@@ -265,7 +273,7 @@ fn run_electricity(
 
 fn run_notices(
     matches: &ArgMatches,
-    context: &mut Context<'_>,
+    config_dir: &Path,
     session: &mut dyn SessionDriver,
 ) -> CliResult<Outcome> {
     if let Some(("show", arguments)) = matches.subcommand() {
@@ -278,7 +286,7 @@ fn run_notices(
         let max_chars = *arguments
             .get_one::<usize>("max-chars")
             .expect("max-chars has a default");
-        require_session(&context.config_dir, session, Service::Portal)?;
+        require_session(config_dir, session, Service::Portal)?;
         return Ok(outcome(portal::fetch_notice_detail_with_session(
             session, &url, max_chars,
         )?));
@@ -288,7 +296,7 @@ fn run_notices(
     let count = *matches
         .get_one::<u64>("count")
         .expect("count has a default");
-    require_session(&context.config_dir, session, Service::Portal)?;
+    require_session(config_dir, session, Service::Portal)?;
     Ok(outcome(portal::fetch_notices_with_session(
         session,
         types.as_deref(),
@@ -296,8 +304,8 @@ fn run_notices(
     )?))
 }
 
-fn run_card(context: &mut Context<'_>, session: &mut dyn SessionDriver) -> CliResult<Outcome> {
-    require_session(&context.config_dir, session, Service::Portal)?;
+fn run_card(config_dir: &Path, session: &mut dyn SessionDriver) -> CliResult<Outcome> {
+    require_session(config_dir, session, Service::Portal)?;
     Ok(outcome(portal::fetch_card_with_session(session)?))
 }
 
@@ -764,17 +772,22 @@ mod tests {
     }
 
     #[test]
-    fn default_pending_driver_keeps_the_local_auth_then_upstream_layering() {
+    fn card_requires_a_bound_session_before_network() {
         let dirs = TestDirs::new("pending");
         let mut transport = Scripted::default();
         let error = {
             let mut context = context(&dirs, &mut transport);
             match run("card", &matches("card", &[]), &mut context) {
-                Ok(_) => panic!("pending driver must not succeed"),
+                Ok(_) => panic!("a profile without a bound session must not succeed"),
                 Err(error) => error,
             }
         };
-        assert_eq!((error.code, error.kind), (5, "upstream"));
+        let expected = if cfg!(unix) {
+            (3, "auth")
+        } else {
+            (5, "upstream")
+        };
+        assert_eq!((error.code, error.kind), expected);
         assert!(transport.calls.is_empty());
 
         fs::remove_file(dirs.config_dir().join("credentials.json"))
