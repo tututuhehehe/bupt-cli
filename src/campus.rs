@@ -318,7 +318,6 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
 
     const CREDENTIALS: &str =
         r#"{"username":"2026000090","password":"TEST-ONLY-CAMPUS-PASSWORD-6f2a"}"#;

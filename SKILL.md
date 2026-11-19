@@ -9,7 +9,7 @@ description: >-
 
 Run `bupt <command>`. Output is one JSON document with `schema: "bupt.v1"` and `ok` on stdout; errors are one JSON document on stderr with `error.type` (`usage`=2, `auth`=3, `network`=4, `upstream`=5) and the matching exit code. `--pretty` only reformats. Run `bupt help <command>` for full flags.
 
-Credentials come only from `~/.bupt-cli/credentials.json` (created by interactive `bupt login`; `BUPT_USERNAME`-style env vars are ignored on purpose). Sessions are cached and reused; only an explicit auth error means the user must re-run `bupt login`.
+Credentials come only from `~/.bupt-cli/credentials.json`, created by `bupt login --role graduate|undergraduate` (the id and password prompt interactively when not passed as flags; `BUPT_USERNAME`-style env vars are ignored on purpose). Sessions are cached and reused; only an explicit auth error means the user must re-run `bupt login`.
 
 ## Common commands
 - `bupt courses`: UCloud course sites.

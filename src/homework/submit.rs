@@ -1,10 +1,10 @@
-//! In-process submit scaffold for the homework lane.
+//! The gated submission path for the homework lane.
 //!
-//! This module is intentionally not wired to a production session. The
-//! multipart renderer and fixed boundary below exist only to exercise the
-//! transport journal with synthetic inputs. Before a real transport is
-//! connected, replace them with a vetted multipart encoder and bounded or
-//! streamed file reads; do not treat this renderer as production encoding.
+//! `run` validates the payload and gates on `--i-confirm-submit`; only a
+//! confirmed invocation reaches `execute_submit`, which uploads each planned
+//! file (bounded by the pre-flight caps, staged to a 0600 temporary file by
+//! the campus wire layer) and submits exactly once. Any ambiguous outcome is
+//! reported as unverified and never retried automatically.
 
 use super::detail;
 use super::load_read_session;
@@ -20,6 +20,11 @@ const UCLOUD_API: &str = "https://apiucloud.bupt.edu.cn";
 const UPLOAD_PATH: &str = "/blade-source/resource/upload/biz";
 const SUBMIT_PATH: &str = "/ykt-site/work/submit";
 use crate::transport::HOMEWORK_MULTIPART_BOUNDARY as MULTIPART_BOUNDARY;
+
+/// Pre-flight mirrors of the campus wire caps: a local-input overflow is a
+/// usage error here, never an upstream failure after a full read.
+const MAX_UPLOAD_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TEXT_CHARS: usize = 100_000;
 
 pub(super) fn command() -> Command {
     Command::new("submit")
@@ -119,6 +124,16 @@ impl SubmitRequest {
                 "Pass --file PATH and/or --text CONTENT (or --resource-id).",
             ));
         }
+        // The same caps the campus wire layer enforces; refusing here keeps a
+        // local-input problem a usage error instead of an upstream failure.
+        if text.chars().count() > MAX_TEXT_CHARS {
+            return Err(CliError::new(
+                2,
+                "usage",
+                format!("--text exceeds the {} character limit", MAX_TEXT_CHARS),
+                "Shorten the text or attach it as a file.",
+            ));
+        }
         let mut resolved = Vec::with_capacity(files.len());
         for path in files {
             if !path.is_file() {
@@ -127,6 +142,21 @@ impl SubmitRequest {
                     "usage",
                     format!("file not found: {}", path.display()),
                     "Pass an existing file path.",
+                ));
+            }
+            // Refuse the same caps the campus wire layer enforces, before any
+            // session or transport use: a local overflow stays a usage error.
+            let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            if size > MAX_UPLOAD_FILE_BYTES {
+                return Err(CliError::new(
+                    2,
+                    "usage",
+                    format!(
+                        "file exceeds the upload limit: {} ({} MiB)",
+                        path.display(),
+                        MAX_UPLOAD_FILE_BYTES / (1024 * 1024)
+                    ),
+                    "Split the file or upload it outside bupt.",
                 ));
             }
             resolved.push(fs::canonicalize(&path).unwrap_or(path));
@@ -227,8 +257,8 @@ enum ResultCode {
     Invalid,
 }
 
-/// Only preview reaches this function in production. Tests use `Scripted`
-/// to verify the preview reads and the synthetic upload/submit journal.
+/// The production submission flow. Tests use `Scripted` to verify both the
+/// preview reads and the synthetic upload/submit journal.
 fn execute_submit(
     request: &SubmitRequest,
     session: &Session,
@@ -384,10 +414,23 @@ fn planned_files(request: &SubmitRequest) -> CliResult<Vec<PlannedFile>> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".into());
         let mime_type = mime_type(&name);
+        let size = metadata.len();
+        if size > MAX_UPLOAD_FILE_BYTES {
+            return Err(CliError::new(
+                2,
+                "usage",
+                format!(
+                    "file exceeds the upload limit: {} ({} MiB)",
+                    path.display(),
+                    MAX_UPLOAD_FILE_BYTES / (1024 * 1024)
+                ),
+                "Split the file or upload it outside bupt.",
+            ));
+        }
         planned.push(PlannedFile {
             path: path.clone(),
             name,
-            size: metadata.len(),
+            size,
             mime_type,
         });
     }
@@ -399,14 +442,15 @@ fn upload_file(
     session: &Session,
     file: &PlannedFile,
 ) -> CliResult<UploadedFile> {
-    // SCAFFOLD ONLY: this reads the whole file. Production must enforce a
-    // bound or stream the body, then use a vetted multipart encoder.
+    // The pre-flight cap bounds this read; the binary body is staged to a
+    // 0600 temporary file by the campus wire layer, never into argv or the
+    // curl configuration text.
     let bytes = fs::read(&file.path).map_err(|_| {
         CliError::new(
-            5,
-            "upstream",
+            2,
+            "usage",
             format!("cannot read upload file {}", file.path.display()),
-            "",
+            "Check the file exists and is readable.",
         )
     })?;
     let mut headers = auth_headers(&session.access_token);
@@ -687,8 +731,8 @@ fn auth_headers(access_token: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// SCAFFOLD ONLY: fixed boundary and a full in-memory body. Production must
-/// replace this with a vetted encoder and bounded/streamed file reads.
+/// One fixed-boundary multipart body. The wire layer re-checks the exact
+/// boundary openings, closing marker, and header set before staging it.
 fn multipart_body(user_id: &str, file: &PlannedFile, bytes: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(
@@ -953,6 +997,56 @@ mod tests {
         assert!(!diagnostic.to_ascii_lowercase().contains("show"));
         assert!(!diagnostic.contains("synthetic-access-token"));
         assert_single_write_journal(transport);
+    }
+
+    #[test]
+    fn oversized_upload_and_text_are_usage_errors_before_any_request() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let huge = directory.path().join("huge.bin");
+        let payload = vec![0u8; (MAX_UPLOAD_FILE_BYTES + 1) as usize];
+        fs::write(&huge, payload).expect("write the oversized fixture");
+
+        // The oversized file is refused before any read of the remote detail,
+        // so the transport journal stays empty and the error is a usage error.
+        // from_matches is the production entry: the cap fires before any
+        // session, transport, or remote detail read.
+        let matches = command()
+            .try_get_matches_from([
+                "submit",
+                "1000000000000000004",
+                "--file",
+                huge.to_string_lossy().as_ref(),
+                "--i-confirm-submit",
+            ])
+            .expect("parse submit arguments");
+        let error = match SubmitRequest::from_matches(&matches) {
+            Ok(_) => panic!("an oversized upload must be refused locally"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, 2);
+        assert!(error.kind == "usage");
+        assert!(error.message.contains("upload limit"));
+
+        let mut oversized_text = String::new();
+        for _ in 0..=MAX_TEXT_CHARS {
+            oversized_text.push('长');
+        }
+        let matches = command()
+            .try_get_matches_from([
+                "submit",
+                "1000000000000000004",
+                "--text",
+                oversized_text.as_str(),
+                "--i-confirm-submit",
+            ])
+            .expect("parse submit arguments");
+        let error = match SubmitRequest::from_matches(&matches) {
+            Ok(_) => panic!("an oversized text must be refused locally"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, 2);
+        assert!(error.kind == "usage");
+        assert!(error.message.contains("--text"));
     }
 
     #[test]

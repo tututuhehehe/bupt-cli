@@ -231,15 +231,15 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 
 验证记录见文末「验证记录」；本轮没有运行真实校园网、浏览器、登录或公共图书馆请求，也没有新增环境变量回放或公开 CLI 参数。
 
-## 仍需父会话层接通的场景
+## 生产接入状态（原「仍需父会话层接通」）
 
-以下不是校园模块内部缺失，而是父持有的 `src/cli.rs` / `src/transport.rs` / `src/identity` 接口尚未提供真实 `SessionDriver`。没有写成 `#[ignore]` 或永远通过的假测试：
+父会话的 `SessionDriver` 三个实现点已全部落地并由 `src/campus/session.rs` / `src/campus/portal_session.rs` 提供：
 
-1. **父会话驱动实现**：实现 `campus::SessionDriver`：
-   - `ensure(&mut self, service: Service)`：按 `Service::Portal` / `Service::Electricity` 读取/验证本地会话，完成对应的门户或电费会话 prime/CAS 握手；校园模块只从 `credentials.json` 检查 username + 非空密码，不要求 role。
-   - `send(&mut self, route: Route, request: Request)`：先复核 `route.accepts(&request)`，再附加 Cookie/token 并执行一次 HTTP 交换；HTTP 状态（含 401/403/3xx）要作为 `Response` 返回给校园层分类，只有传输失败才返回 network 4。不得在 `Request` 里加凭据，不得隐式重试或跟随重定向。
-   - `renew(&mut self, service: Service)`：只在校园层已确认 auth 3 后，按该 service 失效并刷新一次会话；不得把凭据发到未批准目的地。
-2. **CLI 接入点**：`electricity`、`notices` 和 `card` 已路由到受限生产传输。合成测试 `card_reuses_bound_cas_cookies_only_at_cas_and_honors_portal_cookie_scope` 回放了 CAS 登录、门户票据交换与饭卡读取，未访问校园网。无绑定会话在发请求前失败。
+- `ensure`：`Service::Portal` 只做本地绑定校验；`Service::Electricity` 完成实测验证的 HTTPS 登录链（固定入口 → `/uc/wap/login` → `/a_bupt/api/sso/cas` → CAS → 同站 HTTPS 票据回调），电费只从 `credentials.json` 检查 username + 非空密码，不要求 role。
+- `send`：每条请求先复核 `route.accepts(&request)`，再附加 Cookie 并执行一次交换；HTTP 状态（含 401/403/3xx）作为 `Response` 返回校园层分类，只有传输失败才退 network 4；不隐式重试、不跟随重定向。
+- `renew`：只在校园层确认 auth 3 后失效并重建一次会话；不会把凭据发往未批准目的地。
+
+`electricity`、`notices`、`card` 与 `library` 已全部路由到受限生产传输；电费楼栋在 macOS 实测通过（西土城 12 栋），门户 HTTPS 回调仍受环境限制（见「校园网实测」）。
 3. **门户 HTTPS 边界**：Python 的固定 HTTP URL 只作输入/兼容输出，生产请求使用相同主机上的 HTTPS 和限定读路径。CAS 的服务参数和票据返回地址须匹配，不向 HTTP 回调发送票据；真实 HTTPS 和回调形态仍待校园网确认，不声称已有 WebVPN 支持。
 4. **cookie/redirect 实际边界**：真实 401/403 后的会话失效、3xx 是否跟随、Cookie 域/路径、WebVPN 地址仍未实测；校园层只按确认的 `e/m` 标记或 401/403 进入 auth 3，3xx 不猜成登录页。若未来跟随重定向，必须在每一跳重新校验 `Route` 目标并重新确认 Cookie 域。
 5. **进程级成功输出**：共享 CLI 负责 `schema: "bupt.v1"` 和 `--pretty`；本批内部命令测试验证的是 `Outcome` 数据对象，尚未通过正式二进制回放门户/电费成功响应。进程合同测试仍只覆盖本地参数、无 profile 的 auth 层和文件副作用。
@@ -297,7 +297,7 @@ cargo test --locked --offline
 - `cargo fmt --check`：通过。
 - `cargo clippy --locked --offline --all-targets`：通过编译；`src/campus.rs`、`src/campus/session.rs`、`src/campus/electricity.rs` 与 `src/campus/portal.rs` 无 clippy 告警，其余告警是本线外既有项。
 - `cargo test --locked --offline --lib`：210 passed（此前 192；新增 18 个 `campus` 测试：11 个命令编排/驱动 + 6 个电费查询链 + 1 个楼栋元数据）。
-- `cargo test --locked --offline --test contract_campus`：34 passed，进程用例保持原分类（无凭据 auth 3、未知类型/URL usage 2、有 profile 停在 pending upstream 5）。
+- `cargo test --locked --offline --test contract_campus`：34 passed，进程用例保持原分类（无凭据 auth 3、未知类型/URL usage 2）。生产传输已接入，带凭据的会话驱动行为由 `Scripted` 会话测试与 macOS 实测覆盖。
 - `cargo test --locked --offline`：341 passed，0 failed；lib 210 + academics 30 + campus 34 + homework 16 + identity 28 + lifecycle 23。
 - 未新增 Cargo 依赖、公开 CLI 参数、环境变量回放或会话文件；未读取真实 profile/session，未访问校园网或 GitHub，未提交真实 cookie/密码。
 - 上述未接通场景没有对应的红测，也没有用 `#[ignore]`/`#[should_panic]` 隐藏。

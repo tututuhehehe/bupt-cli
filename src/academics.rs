@@ -152,6 +152,9 @@ fn run_schedule(matches: &ArgMatches, ctx: &mut Context<'_>) -> CliResult<Outcom
         (today, today, today.iso())
     } else if matches.get_flag("tomorrow") {
         let day = today.add_days(1);
+        // Past the term end this is an out-of-range day, not "no classes";
+        // report the range exactly like --date does.
+        ensure_date_in_term(snapshot, day)?;
         (day, day, day.iso())
     } else if let Some(week) = matches.get_one::<u32>("week") {
         let dates = snapshot
@@ -970,6 +973,19 @@ fn export_sessions(snapshot: &Snapshot) -> CliResult<Vec<Session>> {
                     ),
                 ));
             };
+            // A hand-edited or glitched snapshot could carry reversed clocks;
+            // that must not become a silent "successfully" exported event.
+            if time_end < time_start {
+                return Err(export_error(
+                    &label,
+                    format!(
+                        "第 {week} 周（{}）的结束时间早于开始时间（{} > {}）",
+                        date.iso(),
+                        time_start,
+                        time_end
+                    ),
+                ));
+            }
             sessions.push(Session {
                 date,
                 week,
@@ -1782,6 +1798,59 @@ mod tests {
         assert!(error.message.contains("2026-10-15"));
         assert!(error.message.contains("2026-09-21"));
         assert!(error.message.contains("2026-09-27"));
+    }
+
+    #[test]
+    fn export_rejects_reversed_clocks_and_keeps_ordered_clocks() {
+        let base = fresh();
+        // Ordered clocks export normally.
+        let ordered = export_sessions(&base).expect("ordered clocks export");
+        assert!(!ordered.is_empty());
+
+        // Reversed clocks are an upstream defect, not a valid event.
+        let mut reversed = fresh();
+        reversed.courses[0]["time_start"] = json!("20:00");
+        reversed.courses[0]["time_end"] = json!("08:45");
+        let error = match export_sessions(&reversed) {
+            Ok(_) => panic!("reversed clocks must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, 5);
+        assert!(error.message.contains("结束时间早于开始时间"));
+    }
+
+    #[test]
+    fn tomorrow_past_the_term_end_reports_the_range_like_date() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        // A term whose last day is today: --tomorrow is out of range.
+        let last = today();
+        let first = last.add_days(-6);
+        let dates: Vec<_> = (0..7).map(|offset| first.add_days(offset).iso()).collect();
+        let snapshot = snapshot(
+            USER,
+            Role::Undergraduate,
+            first,
+            "当前学期课程",
+            "08:00",
+            "08:45",
+        );
+        let mut snapshot = snapshot;
+        snapshot.calendar.insert(1, dates.clone());
+        save_snapshot(&cache_file(&cache), &snapshot).unwrap();
+        let mut source = FakeSource::with(vec![]);
+
+        let selected =
+            select_snapshot(&config, &cache, last, false, &mut source).expect("fresh snapshot");
+        let day = last.add_days(1);
+        let error = ensure_date_in_term(&selected.snapshot, day)
+            .expect_err("--tomorrow past the term must report the range");
+
+        assert_eq!(source.calls, 0, "an out-of-range --tomorrow must not fetch");
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains(&day.iso()));
     }
 
     #[test]

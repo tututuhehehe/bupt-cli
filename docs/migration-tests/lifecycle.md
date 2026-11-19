@@ -66,7 +66,7 @@
 - `--check` / `--repo OWNER/REPO` 保留；`--repo` 只接受严格的 `OWNER/REPO`，URL、空值、额外路径段在联网和写状态前以 usage（退出 2）拒绝。
 - `--check` 通过注入的 `Transport` 发起一次 `GET https://github.com/OWNER/REPO/releases/latest`，带 `User-Agent: bupt-cli`；不跟随重定向，不访问 `api.github.com`，不下载 asset。
 - 只有 301/302/303/307/308 且 `Location` 是同一仓库的 `https://github.com/OWNER/REPO/releases/tag/<tag>` 才接受；主机、仓库或路径不符、query/fragment、额外路径段、缺失 Location 都以 upstream（退出 5）失败关闭。`<tag> == latest` 保留 Python 的“无版本号”成功结果。
-- 成功字段沿用 Python：`current`、`repo`、`latest`（去掉前导 `v`）、`update_available`、`note`。`current` 取编译时的 `CARGO_PKG_VERSION`（当前迁移包为 `0.0.0`），不硬编码 Python 的 `__version__`。无 release（404 且无有效 Location）是成功结果（`update_available=false`），不是错误。`--check` 在 debug/源码/未设置发布标记的构建中 note 说明“当前不是独立发行二进制，未自动安装”，不沿用 Python 会承诺安装的文案。
+- 成功字段沿用 Python：`current`、`repo`、`latest`（去掉前导 `v`）、`update_available`、`note`。`current` 取编译时的 `CARGO_PKG_VERSION`（当前为 `0.6.0`，以 Cargo.toml 为准），不硬编码 Python 的 `__version__`。无 release（404 且无有效 Location）是成功结果（`update_available=false`），不是错误。`--check` 在 debug/源码/未设置发布标记的构建中 note 说明“当前不是独立发行二进制，未自动安装”，不沿用 Python 会承诺安装的文案。
 - 版本比较只取前三个数字段，并按 Python 的短元组规则比较，`1.10.0 > 1.9.0`；相等或更旧的 tag 不报告升级。
 - 错误分层：传输失败=4 network；401/403=3 auth；其他 HTTP 状态和畸形/外来重定向=5 upstream。检查不写 config/cache/暂存文件。
 - 默认 `update`（无 `--check`）先执行同一 release 检查。无 release、无版本号、已是最新版本都成功返回且不写文件；有新版本才进入安装路径。正式 CLI 已接入独立的 GitHub 传输；只有获准的发布构建才会下载并替换。

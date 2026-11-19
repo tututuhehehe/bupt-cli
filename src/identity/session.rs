@@ -1,10 +1,10 @@
 //! Native identity storage and lazy read-path token access.
 //!
 //! This module is the production bridge between the reviewed CAS protocol and
-//! the local account/cache files. It is always driven by an injected
-//! `Transport`; the CLI still chooses `Offline` until the parent wires the
-//! bounded transport. No function here reads credentials from the process
-//! environment; `credentials.json` is the sole persisted account source.
+//! the local account/cache files, always driven by the CLI-selected transport
+//! (the campus curl adapter in production, `Scripted` in tests). No function
+//! here reads credentials from the process environment; `credentials.json`
+//! is the sole persisted account source.
 
 use super::*;
 use crate::transport::Transport;
@@ -82,6 +82,13 @@ pub(super) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(St
     };
 
     if !reused {
+        // A simultaneous new login must not be replaced by a token tied to
+        // old state, so reload and revalidate before the write, exactly like
+        // the mobile token path.
+        let latest_account = load_native_account(&context.config_dir)?;
+        validate_binding(&latest_account, &data)?;
+        data = load_native_session(&context.cache_dir)?;
+        validate_binding(&latest_account, &data)?;
         let cookies = cas_session.cookies_json()?;
         data.insert("cookies".to_owned(), cookies);
         data.insert("ucloud".to_owned(), token_json.clone());
@@ -986,7 +993,6 @@ mod tests {
     use cookie_store::CookieStore;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
     use tempfile::{TempDir, tempdir};
     use url::Url;
 
@@ -1036,7 +1042,7 @@ mod tests {
             self.root.path().join("cache")
         }
 
-        fn context<'a>(&self, transport: &'a mut Scripted) -> Context<'a> {
+        fn context<'a>(&self, transport: &'a mut dyn Transport) -> Context<'a> {
             Context {
                 home_dir: self.root.path().join("home"),
                 config_dir: self.config_dir(),
@@ -1772,6 +1778,62 @@ mod tests {
         assert!(!updated.to_string().contains(OLD_ACCESS_TOKEN));
         assert!(!updated.to_string().contains(TICKET));
         assert_eq!(updated["ucloud"]["user_id"], USER_ID);
+    }
+
+    #[test]
+    fn a_refresh_does_not_clobber_a_simultaneous_new_login() {
+        struct RacingTransport {
+            scripted: Scripted,
+            session_path: PathBuf,
+            raced: bool,
+        }
+        impl Transport for RacingTransport {
+            fn send(&mut self, request: crate::transport::Request) -> CliResult<Response> {
+                // The token POST is the multi-second network exchange during
+                // which a concurrent `bupt login` lands a fresh session.
+                if !self.raced && request.url == TOKEN_URL {
+                    self.raced = true;
+                    let mut session = read_json(&self.session_path);
+                    session[SESSION_REVISION_KEY] = serde_json::json!(NEW_REVISION);
+                    write_private(&self.session_path, &session);
+                }
+                self.scripted.send(request)
+            }
+        }
+
+        let sandbox = Sandbox::new();
+        seed_native_state(&sandbox, OLD_PASSWORD, OLD_REVISION);
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let mut session = read_json(&session_path);
+        session["ucloud"]["access_token"] = serde_json::json!(OLD_ACCESS_TOKEN);
+        session["ucloud"]["expires_at"] = serde_json::json!(1.0);
+        write_private(&session_path, &session);
+
+        let mut transport = RacingTransport {
+            scripted: successful_token_script(),
+            session_path: session_path.clone(),
+            raced: false,
+        };
+        let error = {
+            let mut context = sandbox.context(&mut transport);
+            require_ucloud_session(&mut context)
+                .err()
+                .expect("a token tied to old state must not be persisted")
+        };
+        assert_eq!(error.code, 3);
+        assert_eq!(error.kind, "auth");
+        // The newer session survives untouched: its revision stays and the
+        // refreshed token never lands on disk.
+        let final_session = read_json(&session_path);
+        assert_eq!(
+            final_session[SESSION_REVISION_KEY],
+            serde_json::json!(NEW_REVISION)
+        );
+        assert_eq!(
+            final_session["ucloud"]["access_token"],
+            serde_json::json!(OLD_ACCESS_TOKEN)
+        );
+        assert!(!final_session.to_string().contains(ACCESS_TOKEN));
     }
 
     #[test]

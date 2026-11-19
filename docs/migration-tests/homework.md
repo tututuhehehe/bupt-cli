@@ -128,7 +128,7 @@ Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust �
 - 重定向最多跟随 5 次；`Location` 可以是相对路径，但解析后的每一跳都要重新满足上述绝对 HTTPS allowlist，否则退 upstream 5。下载请求和重定向都不带 `Blade-Auth`、`Authorization`、`Cookie` 或 tenant header，只带兼容 UA。错误信息不包含签名 URL。
 - 每个文件先写入目标目录内的 `NamedTempFile`，完整写入并 flush 后才 `persist_noclobber`（无 `--force`）或 `persist`（`--force`）。下载失败、校验失败或持久化失败不会留下半份文件；`--force` 下载失败也不会覆盖旧文件。已存在且无 `--force` 的附件计入 `skipped.reason="exists"`（`path` 为目标路径），无 URL 计入 `"no_url"`（`path: null`，与 Python 一致）。
 - 输出沿用 Python：`assignment_id`、`title`、`dir`、`saved[{title,resource_id,path,size,url}]`、`skipped[{title,path,reason}]`、`count_saved`、`count_skipped`。`path`/`dir` 是 canonicalize 后的绝对路径。
-- **生产适配仍由父会话/整合者负责**：`cli.rs::uses_campus_transport` 目前仍不把 `download` 子命令选到 `CampusCurl`；`transport/cas_wire.rs` 也未允许 `fileucloud.bupt.edu.cn`。本批只在进程内用 `Scripted` 验证 handler。生产需要新增窄路由：GET `https://fileucloud.bupt.edu.cn/...`（任意路径/签名 query，无 auth/cookie，需把 `Location` 暴露给 handler）以及 GET `https://apiucloud.bupt.edu.cn/blade-source/resource/download?resourceId=...`（若上游 preview 返回同域下载地址）；重定向仍由 handler 逐跳校验，不能配置 curl 自动跟随。
+- 生产路由已接入：`cli.rs::uses_campus_transport` 把 `download` 子命令选到 `CampusCurl`，`transport/cas_wire.rs` 允许 GET `fileucloud.bupt.edu.cn`（任意路径/签名 query，无 auth/cookie，保留 `Location`）与 GET `apiucloud.bupt.edu.cn/blade-source/resource/download`。curl 不自动跟随重定向；handler 在每一跳重新校验 allowlist。真实校园网下载验收已单独完成（见「校园网实测」记录）。
 
 ### submit 路由形状（已接生产传输，写路径需确认）
 
@@ -228,9 +228,9 @@ Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust �
 
 结果里不序列化 detail 原始对象或 session 结构；接受的 `upstream.msg` 和错误文本在输出边界统一脱敏，`Session` 不实现 `Debug`。新增 fixture `homework_submit_echo_token.json` 让上游回显合成 token，供后续进程级 seam 复用；当前对应边界测试已在源内通过。
 
-### Scaffold 边界
+### 提交边界（已接生产传输）
 
-`src/homework/submit.rs` 的 multipart renderer 和固定 boundary 只用于隔离的 transport journal 测试。`upload_file` 目前整文件读入内存；在连接真实 transport 前必须替换为经过审查的 multipart encoder，并加上有界/流式读取。本批没有连接它；`submit` 公开 CLI 仍在确认门禁后返回 unsupported，upload/submit 路由也没有加入 transport allowlist。
+`src/homework/submit.rs` 的 multipart renderer 与固定 boundary 就是生产编码器：上传体由 wire 层逐项校验（固定 boundary、三次 opening、closing 标记、四请求头集合），再以 0600 临时文件经 `--data-binary @path` 交给 curl。预检上限（文件 8 MiB、正文 100 000 字符）在 `from_matches` 阶段以 usage 拒绝。确认门禁、不自动重发、提交后只读 `verify` 全部保留；`diagnose` 拒绝写路由。真实提交验收需用户指定目标作业后单独执行。
 
 ## 草稿：合成录制与注入式测试缝
 
@@ -320,16 +320,17 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 - 固定 5 秒重试等待只通过注入 sleep 验证“重试一次”的次数；没有墙钟等待断言。
 - 上传失败、submit-view 401 后的续期、真实校园网上游验收未运行。真实提交/上传不在本阶段执行，校园网验收需用户单独确认。
 - 真实非空 undone 的课程富化（`_enrich_undone_courses`）仍延期：`get_all_homework` 已实现，但尚未把全部课程作业按 activity id 回填到 `siteId=-1`/空 `siteName` 的 undone 行；需要真实样本和预算语义后再声称 parity。
-- `download` 的生产适配仍延期到父会话：handler 已实现并通过 `Scripted` 验证，但 `cli.rs` 尚未把 `download` 子命令选到 `CampusCurl`，`cas_wire` 也未允许 `fileucloud.bupt.edu.cn` 或 `/blade-source/resource/download`。在父会话完成窄路由前，公开二进制仍不会把下载请求发到真实 CDN。
+- `download` 的生产路由已接入并通过真实校园网验收；仍延期的是更大附件（>8 MiB）与更多文件类型的样本。
 - `--new` 的 `_enrich_undone_courses` 前置步骤仍沿用“undone 不富化”的既有延期；即 `--undone --new` 只按 undone 行自带的 `siteId`/`siteName` 和 activity id 工作，不先扫全部课程作业回填。
 - Python UCloud 401 invalidate+retry 一次的续期行为延期到 identity session 适配器；当前只读 helper 明确只请求一次并退鉴权 3。
 - 用户提供的真实只读基线（本 worktree 未重跑）显示课程首屏 11 行且 site id 唯一；自动化只用合成 fixture，真实校园网读取验收仍需用户单独确认。
 
-## 下一批接线顺序
+## 剩余待办
 
-1. 父会话/整合者放开 `download` 的生产路由：`cli.rs::uses_campus_transport` 选择 `download` 子命令到 `CampusCurl`；`transport/cas_wire.rs` 增加 GET `fileucloud.bupt.edu.cn`（任意路径/签名 query，无 auth/cookie，保留 `Location`）和 GET `apiucloud.bupt.edu.cn/blade-source/resource/download`。不要让 curl 自动跟随重定向；handler 会在每一跳重新校验 allowlist。
-2. 把提交 helper 接到 fixture/进程级 seam（含 `homework_submit_echo_token.json`），按上面的 upload/submit 路由形状做窄适配，并保留确认、不自动重发和提交后只读 `verify` 的约束。
-3. 真实非空 undone 富化、401 续期、真实校园网读取/下载/提交和双平台验收单独执行，需用户确认。
+1. 真实提交验收：上传与提交的生产路由已接线，等待用户指定一个可重交/练习性作业后执行一次，并做只读核验。
+2. 真实非空 undone 的课程富化（`_enrich_undone_courses`）仍延期：需要真实样本和预算语义后再声称 parity。
+3. UCloud 401 invalidate+retry 的续期行为仍延期到 identity session 适配器；当前只读 helper 明确只请求一次并退鉴权 3。
+4. Windows 实机验收单独执行，需用户确认。
 
 ## 当前验证状态
 
@@ -338,4 +339,4 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 - `cargo test --locked --offline --test contract_homework`：16 个通过。
 - `cargo test --locked --offline`：全绿；208 单元 + 30 academics + 34 campus + 16 homework + 28 identity + 23 lifecycle 契约用例全部通过。
 - `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此 30 个草稿全部不可运行，也没有伪装通过。
-- 本批仍是 synthetic-only slice：`--new` 与 `download` handler 只在进程内用合成 session/`Scripted` 验证；`download` 生产 CDN 路由和 `submit` 写入仍未接；未运行真实校园网、浏览器会话、真实下载、上传或提交，也没有新增环境变量回放开关。
+- 生产状态：`download`、`submit`（含上传）与全部读命令均已在 macOS 实测通过真实校园网；真实提交的最终验收等待用户指定目标作业。自动化仍只用合成 fixture 与 `Scripted`，不依赖真实凭据或校园网响应。

@@ -2,7 +2,7 @@
 
 [English](README.en.md) | **简体中文** | [使用说明](使用说明.md)
 
-北京邮电大学校园服务的非官方命令行客户端，**原生 Rust 单文件二进制**，面向人和 agent 使用：每次调用输出一行 JSON（`schema: "bupt.v1"`），所有状态集中在 `~/.bupt-cli/`（权限 `0600`）。
+北京邮电大学校园服务的非官方命令行客户端，**原生 Rust 单文件二进制**，面向人和 agent 使用：每次调用输出一行 JSON（`schema: "bupt.v1"`），所有状态集中在 `~/.bupt-cli/`（目录 `0700`，文件 `0600`）。
 
 **MIT 开源。** 源码里不含任何账号、密码或会话，首次使用跑一次 `bupt login` 配置你自己的。
 
@@ -63,10 +63,9 @@ bupt --version        # 期望输出 bupt 0.6.0
 ## 配置账号
 
 ```zsh
-$ bupt login
+$ bupt login --role graduate
 学号：2026xxxxxx
 密码（输入时不显示）：
-身份（1=研究生 2=本科生）：1
 ```
 
 - 凭据只存 `~/.bupt-cli/credentials.json`（权限 `0600`）。**不再支持 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 环境变量**——环境里只有这些变量时命令会明确报 auth。
@@ -85,6 +84,13 @@ bupt electricity buildings --area shahe        # 或 xitucheng
 
 楼/房间/楼层独立解析，优先级：**命令行参数 > 环境变量（`BUPT_DORM_BUILDING/ROOM/FLOOR`）> `~/.bupt-cli/config.json` > 占位符**。传 `--building` 必须同时传 `--room`。
 
+其他可用环境变量：
+
+| 变量 | 含义 |
+|---|---|
+| `BUPT_CLI_CONFIG_DIR` / `BUPT_CLI_CACHE_DIR` | 覆盖配置/缓存目录（默认 `~/.bupt-cli`） |
+| `BUPT_CLI_REPO` | `update` 的默认 GitHub 仓库（`OWNER/REPO`，可用 `--repo` 覆盖） |
+
 ## 命令一览
 
 所有命令向 stdout 输出紧凑 JSON，任意位置加 `--pretty` 缩进。错误走 stderr：`{"schema":"bupt.v1","ok":false,"error":{"type":"...","message":"...","hint":"..."}}`，退出码分层：
@@ -101,7 +107,7 @@ bupt electricity buildings --area shahe        # 或 xitucheng
 
 | 命令 | 说明 |
 |---|---|
-| `bupt login [--user ID] [--password PASS] --role graduate\|undergraduate` | 注册并验证账号；`--role` 必填（交互模式除外） |
+| `bupt login --role graduate\|undergraduate [--user ID] [--password PASS]` | 注册并验证账号；`--role` 必填，学号/密码缺省时交互式询问 |
 | `bupt status` | 本地账号与会话状态（脱敏，不联网） |
 | `bupt logout` | 删除凭据与会话，保留课表与设置 |
 | `bupt diagnose [--only public,cas,ucloud]` | 服务可用性矩阵；不提交密码、不写会话 |
@@ -120,7 +126,7 @@ bupt electricity buildings --area shahe        # 或 xitucheng
 | `bupt scores` / `bupt classrooms [--campus 01\|04]` | 本科成绩 / 空教室 |
 | `bupt library search KEYWORD [--page N] [--page-size N] [--location CAMPUS] [--with-ebook]` | 匿名书目检索 |
 | `bupt library hold RECCTRLID` / `bupt library ebook RECCTRLID` | 馆藏位置 / 电子资源链接 |
-| `bupt electricity [--building B] --room R [--floor F] [--threshold N]` | 宿舍电费余额 |
+| `bupt electricity [--building B] [--room R] [--floor F] [--threshold N]` | 宿舍电费余额；传 `--building` 必须同时传 `--room` |
 | `bupt electricity buildings [--area shahe\|xitucheng]` | 宿舍楼列表 |
 | `bupt notices [--type notice,news,rules,ways] [--count N]` / `bupt notices show URL` | 门户通知（需校园网络路由） |
 | `bupt card` | 饭卡余额 |
@@ -131,7 +137,7 @@ bupt electricity buildings --area shahe        # 或 xitucheng
 
 ## 隐私与安全设计
 
-- 凭据与会话文件全部 `0600`，写入走「临时文件 + 原子改名」，拒绝 symlink 与过宽权限
+- 凭据与会话文件全部 `0600`（所在目录 `0700`），写入走「临时文件 + 原子改名」，拒绝 symlink 与过宽权限
 - 所有请求走系统 `curl`（参数经 stdin 配置，命令行不出现密码/票据/Cookie）
 - 校外跳转逐个校验：CAS/教务/门户/电费各自只接受已验证的 HTTPS 主机；站点宣告的 HTTP 一律升级，绝不降级
 - 研究生教务**不启动浏览器**、不执行站点脚本、不读取浏览器配置

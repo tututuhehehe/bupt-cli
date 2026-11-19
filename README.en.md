@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.md) | [使用说明](使用说明.md)
 
-An unofficial, native-Rust single-file command line client for Beijing University of Posts and Telecommunications campus services, built for humans and agents: every invocation prints one JSON document (`schema: "bupt.v1"`), and all state lives under `~/.bupt-cli/` (mode `0600`).
+An unofficial, native-Rust single-file command line client for Beijing University of Posts and Telecommunications campus services, built for humans and agents: every invocation prints one JSON document (`schema: "bupt.v1"`), and all state lives under `~/.bupt-cli/` (directory `0700`, files `0600`).
 
 **MIT licensed.** The source ships no accounts, passwords, or sessions; run `bupt login` once to configure your own.
 
@@ -61,10 +61,9 @@ The binary only shells out to the system `curl` — **no Python, no browser, and
 ## Configure an account
 
 ```zsh
-$ bupt login
+$ bupt login --role graduate
 学号 (student id)：2026xxxxxx
 密码 (password, hidden)：
-身份 (1=graduate 2=undergraduate)：1
 ```
 
 - Credentials live only in `~/.bupt-cli/credentials.json` (`0600`). The `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` environment fallbacks are **gone**; having only those in the environment is an explicit auth error.
@@ -88,7 +87,7 @@ Every command prints compact JSON to stdout (`--pretty` to indent). Errors go to
 
 | Command | Purpose |
 |---|---|
-| `bupt login [--user ID] [--password PASS] --role graduate\|undergraduate` | register and verify the account |
+| `bupt login --role graduate\|undergraduate [--user ID] [--password PASS]` | register and verify the account; `--role` is required, id/password prompt interactively |
 | `bupt status` / `bupt logout` | sanitized local state / forget credentials and sessions |
 | `bupt diagnose [--only public,cas,ucloud]` | availability matrix; submits no passwords, writes no state |
 | `bupt courses` | UCloud course sites |
@@ -102,7 +101,7 @@ Every command prints compact JSON to stdout (`--pretty` to indent). Errors go to
 | `bupt exams` | exam schedule, routed by role; empty results never masquerade as parse failures |
 | `bupt scores` / `bupt classrooms [--campus 01\|04]` | undergraduate scores / free classrooms |
 | `bupt library search KEYWORD` / `hold ID` / `ebook ID` | anonymous library lookups |
-| `bupt electricity --building B --room R` / `buildings [--area …]` | dorm balance / building list |
+| `bupt electricity [--building B] [--room R]` / `buildings [--area …]` | dorm balance / building list; `--building` requires `--room` |
 | `bupt notices [--type …] [--count N]` / `notices show URL` / `card` | portal notices and campus-card balance |
 | `bupt update --check [--repo OWNER/REPO]` | read-only release check |
 | `bupt uninstall [--keep-data] [--dry-run]` | conservative uninstall with guardrails |
@@ -111,7 +110,7 @@ Retired aliases: `probe`→`diagnose`, `homework list`→`homework`, `schedule e
 
 ## Privacy and safety
 
-- Credential and session files are `0600`, written via temp-file + atomic rename; symlinks and loose permissions are refused
+- Credential and session files are `0600` (parent directory `0700`), written via temp-file + atomic rename; symlinks and loose permissions are refused
 - All HTTPS goes through the system `curl` with the request passed via stdin config — passwords, tickets, and cookies never appear in argv
 - Redirects are validated hop by hop; advertised HTTP destinations are upgraded to HTTPS and never followed in the clear
 - Graduate academics run browserless: no site challenge scripts are executed

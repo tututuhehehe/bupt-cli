@@ -183,7 +183,6 @@ fn scope_error() -> CliError {
 mod tests {
     use super::*;
     use crate::transport::testing::Scripted;
-    use std::time::Duration;
 
     #[test]
     fn card_reuses_bound_cas_cookies_only_at_cas_and_honors_portal_cookie_scope() {

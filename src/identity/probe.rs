@@ -20,8 +20,6 @@ const UCLOUD_BASIC_AUTH: &str = "Basic c3dvcmQ6c3dvcmRfc2VjcmV0";
 const PORTAL_NOTICE_URL: &str =
     "http://my.bupt.edu.cn/list.jsp?totalpage=30&PAGENUM=0&urltype=tree.TreeTempUrl&wbtreeid=1154";
 const PORTAL_CARD_URL: &str = "http://my.bupt.edu.cn/system/resource/app/cuser/getwxtsA.jsp";
-const PORTAL_CARD_REFERER: &str =
-    "http://my.bupt.edu.cn/xs_index.jsp?urltype=tree.TreeTempUrl&wbtreeid=1541";
 const JWGL_DOM_SCHEDULE: &str = "https://jwgl.bupt.edu.cn/jsxsd/framework/xsMain_bjyddx.jsp";
 const JWGL_DOM_PERSON: &str = "https://jwgl.bupt.edu.cn/jsxsd/framework/xsdPerson.jsp";
 const JWXT_LOGIN: &str = "https://jwxt.bupt.edu.cn/caslogin.jsp";
@@ -31,7 +29,6 @@ const ELECTRICITY_API: &str = "https://app.bupt.edu.cn/buptdf/wap/default";
 const MOBILE_JWGL_BASE: &str = "https://jwglweixin.bupt.edu.cn";
 const MOBILE_JWGL_LOGIN: &str = "https://jwglweixin.bupt.edu.cn/bjyddx/login";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
 const MOBILE_PATHS: &[(&str, &str, &str)] = &[
     ("curriculum", "GET", "/bjyddx/student/curriculum"),
     ("schedule modes", "GET", "/bjyddx/Get_sjkbms"),
@@ -508,127 +505,26 @@ impl ProbeRun<'_> {
         }
     }
 
-    fn run_portal(&mut self, transport: &mut dyn Transport) {
+    fn run_portal(&mut self, _transport: &mut dyn Transport) {
         if !self.wants("portal") {
             return;
         }
-        if !self.cached_cas_cookies {
-            for (name, url) in [
-                ("portal notice list", PORTAL_NOTICE_URL),
-                ("portal campus-card widget", PORTAL_CARD_URL),
-            ] {
-                self.add(
-                    "portal", name, "GET", url, "skipped", None, None, NO_SESSION, "", "",
-                );
-            }
-            return;
-        }
-        self.authenticated_portal(transport, "portal notice list", PORTAL_NOTICE_URL, &[]);
-        self.authenticated_portal(
-            transport,
-            "portal campus-card widget",
-            PORTAL_CARD_URL,
-            &[
-                ("Referer", PORTAL_CARD_REFERER),
-                ("X-Requested-With", "XMLHttpRequest"),
-            ],
-        );
-    }
-
-    fn authenticated_portal(
-        &mut self,
-        transport: &mut dyn Transport,
-        name: &str,
-        url: &str,
-        extra: &[(&str, &str)],
-    ) {
-        let cookie = self
-            .session
-            .as_ref()
-            .and_then(|session| session.cookie_header_for(url));
-        let Some(cookie) = cookie else {
+        // The diagnostic transport never sends CAS cookies over the
+        // plaintext portal URLs: the wire layer correctly refuses those
+        // requests, so report both authenticated rows as skipped instead of
+        // fabricating a transport failure.
+        let reason = if self.cached_cas_cookies {
+            "portal cookies are never sent by the diagnostic transport"
+        } else {
+            NO_SESSION
+        };
+        for (name, url) in [
+            ("portal notice list", PORTAL_NOTICE_URL),
+            ("portal campus-card widget", PORTAL_CARD_URL),
+        ] {
             self.add(
-                "portal",
-                name,
-                "GET",
-                url,
-                "skipped",
-                None,
-                None,
-                "no usable CAS cookies for this endpoint; run `bupt login`",
-                "",
-                "",
+                "portal", name, "GET", url, "skipped", None, None, reason, "", "",
             );
-            return;
-        };
-        let mut headers = base_headers();
-        headers.push(("Cookie".into(), cookie));
-        for (name, value) in extra {
-            headers.push(((*name).into(), (*value).into()));
-        }
-        let request = Request {
-            method: "GET",
-            url: url.to_owned(),
-            headers,
-            body: Vec::new(),
-        };
-        let (result, latency) = timed_send(transport, request);
-        match result {
-            Err(error) => self.add(
-                "portal",
-                name,
-                "GET",
-                url,
-                "fail",
-                None,
-                Some(latency),
-                "",
-                &transport_error(&error),
-                "",
-            ),
-            Ok(response) => {
-                let login_page = is_login_page(&response);
-                if login_page || matches!(response.status, 401 | 403) {
-                    self.add(
-                        "portal",
-                        name,
-                        "GET",
-                        url,
-                        "fail",
-                        Some(response.status),
-                        Some(latency),
-                        &format!("HTTP {}", response.status),
-                        "auth: portal returned a login page or rejected the session",
-                        "",
-                    );
-                } else if response.status == 200 {
-                    self.add(
-                        "portal",
-                        name,
-                        "GET",
-                        url,
-                        "ok",
-                        Some(response.status),
-                        Some(latency),
-                        "HTTP 200",
-                        "",
-                        "",
-                    );
-                } else {
-                    self.add(
-                        "portal",
-                        name,
-                        "GET",
-                        url,
-                        "fail",
-                        Some(response.status),
-                        Some(latency),
-                        &format!("HTTP {}", response.status),
-                        &status_error(response.status),
-                        "",
-                    );
-                }
-            }
         }
     }
 
@@ -652,7 +548,7 @@ impl ProbeRun<'_> {
         let request = Request {
             method: "GET",
             url: ELECTRICITY_LANDING.to_owned(),
-            headers: headers_with_cookie(landing_cookie),
+            headers: headers_with_cookie(landing_cookie.clone()),
             body: Vec::new(),
         };
         let (result, latency) = timed_send(transport, request);
@@ -691,14 +587,9 @@ impl ProbeRun<'_> {
             }
         }
 
-        let Some(cookie) = self
-            .session
-            .as_ref()
-            .and_then(|session| session.cookie_header_for(ELECTRICITY_LANDING))
-        else {
-            self.skip_electricity("no usable CAS cookies for this endpoint; run `bupt login`");
-            return;
-        };
+        // The persisted jar cannot change during this run, so reuse the
+        // landing cookie instead of fetching the same value again.
+        let cookie = landing_cookie;
         let mut partment_id = String::new();
         let Some(part) = self.electricity_post(
             transport,
@@ -1722,36 +1613,6 @@ fn mobile_api_ok(payload: &Value) -> bool {
     payload.get("code").and_then(number_or_string).as_deref() == Some("1")
 }
 
-fn is_login_page(response: &Response) -> bool {
-    let location = response
-        .headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("location"))
-        .map(|(_, value)| value.to_ascii_lowercase())
-        .unwrap_or_default();
-    if location.contains("authserver/login")
-        || location.contains("caslogin.jsp")
-        || location.contains("/sso/")
-    {
-        return true;
-    }
-    let body = String::from_utf8_lossy(&response.body);
-    let text = body
-        .get(..body.len().min(30_000))
-        .unwrap_or(&body)
-        .to_ascii_lowercase();
-    [
-        "authserver/login",
-        "clogin.jsp",
-        "name=\"execution\"",
-        "name='execution'",
-        "logintoxk",
-        "统一身份认证",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1760,7 +1621,6 @@ mod tests {
     use serde_json::{Value, json};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
     use tempfile::{TempDir, tempdir};
 
     const USER: &str = "2026000001";
@@ -2158,7 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn portal_and_electricity_use_only_their_owned_cookie_headers() {
+    fn portal_rows_skip_instead_of_sending_cookies_over_plaintext() {
         let sandbox = Sandbox::new();
         seed_native(&sandbox, None);
         let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
@@ -2167,45 +2027,43 @@ mod tests {
         write_private(&session_path, &session);
         let session_before = bytes(&session_path);
 
+        // The portal group runs one anonymous reachability GET; the two
+        // authenticated rows are skipped with an explicit reason, so no
+        // session cookie ever travels over the plaintext portal URLs.
         let mut transport = Scripted::default();
         enqueue(
             &mut transport,
             "GET",
             PORTAL_NOTICE_URL,
-            response(200, &[], "portal notice"),
-        );
-        enqueue(
-            &mut transport,
-            "GET",
-            PORTAL_NOTICE_URL,
-            response(200, &[], "portal notice"),
-        );
-        enqueue(
-            &mut transport,
-            "GET",
-            PORTAL_CARD_URL,
-            response(200, &[], "portal card"),
+            response(302, &[], ""),
         );
         let report = {
             let mut context = sandbox.context(&mut transport);
             super::run(&matches("portal"), &mut context).expect("diagnose succeeds")
         };
-        assert_eq!(transport.calls.len(), 3);
+        assert_eq!(transport.calls.len(), 1);
         assert!(
             transport.calls[0]
                 .headers
                 .iter()
                 .all(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
         );
-        for call in &transport.calls[1..] {
-            assert!(call.headers.iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case("cookie")
-                    && value.contains("PORTAL=TEST-ONLY-PROBE-PORTAL")
-                    && !value.contains("CASTGC=")
-            }));
-            assert!(!String::from_utf8_lossy(&call.body).contains(PASSWORD));
+        let rows = report.data["endpoints"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let name = row["name"].as_str().unwrap();
+            if name == "portal notice list (unauthed)" {
+                assert_eq!(row["status"], "ok");
+            } else {
+                assert_eq!(row["status"], "skipped");
+                assert_eq!(
+                    row["evidence"],
+                    "portal cookies are never sent by the diagnostic transport"
+                );
+            }
         }
-        assert_eq!(report.data["summary"]["ok"], 3);
+        assert_eq!(report.data["summary"]["skipped"], 2);
+        assert_eq!(report.data["summary"]["ok"], 1);
         assert_eq!(bytes(&session_path), session_before);
 
         let mut transport = Scripted::default();

@@ -37,7 +37,7 @@ pub(crate) fn sign_in(raw: &str) -> Option<SignIn> {
             3 if p.iter().any(|(k, v)| {
                 k == "ticket"
                     && v.starts_with("ST-")
-                    && (4..=2048).contains(&v.len())
+                    && (4..2048).contains(&v.len())
                     && v.bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
             }) =>

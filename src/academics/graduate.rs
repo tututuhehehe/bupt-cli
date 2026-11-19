@@ -365,8 +365,8 @@ fn merge_periods(raw: Vec<GridCourse>) -> Vec<Course> {
         course.period_end = entry.period;
         course.time_start = entry.time_start;
         course.time_end = entry.time_end;
-        // `weekday_names` is only used as a sanity check for header order; the
-        // stable public field is the zero-based weekday index.
+        // `WEEKDAYS` is only a header-order sanity check; the stable public
+        // field is the zero-based weekday index.
         positions.insert(key, merged.len());
         merged.push(course);
     }

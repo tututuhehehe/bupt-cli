@@ -24,7 +24,6 @@ mod cas;
 // transport factory and the final command wiring.
 mod mobile;
 mod probe;
-#[allow(dead_code)]
 mod session;
 
 pub(crate) use cas::CasService;
@@ -345,7 +344,6 @@ pub(crate) fn require_authenticated_profile(config_dir: &Path) -> CliResult<Loca
 /// This never submits the account password and never falls back to a password
 /// login. A fresh cached UCloud token is reused; otherwise the persisted CAS
 /// cookies are used lazily for exactly one service-ticket/token exchange.
-#[allow(dead_code)]
 pub(crate) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(String, String)> {
     session::require_ucloud_session(context)
 }
@@ -356,7 +354,6 @@ pub(crate) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(St
 /// This is crate-internal because only the academics service consumes it. The
 /// token is persisted atomically in the existing native session; no password or
 /// token is returned in any error or output object.
-#[allow(dead_code)]
 pub(crate) fn require_mobile_jwgl_token(context: &mut Context<'_>) -> CliResult<String> {
     session::require_mobile_jwgl_token(context)
 }

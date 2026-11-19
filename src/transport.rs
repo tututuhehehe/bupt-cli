@@ -23,10 +23,12 @@ const MAX_HEADER_BYTES: usize = 1024;
 const MAX_TIMEOUT_SECONDS: u64 = 120;
 const CONNECT_TIMEOUT_SECONDS: u64 = 10;
 
-/// Exchange exactly one request. Retry, authentication, and redirect decisions
-/// belong to the service calling this trait, not the network adapter.
+/// The fixed multipart boundary of the homework upload body; the campus wire
+/// layer stages and validates the body against exactly this boundary.
 pub(crate) const HOMEWORK_MULTIPART_BOUNDARY: &str = "----bupt-cli-boundary";
 
+/// Exchange exactly one request. Retry, authentication, and redirect decisions
+/// belong to the service calling this trait, not the network adapter.
 pub(crate) trait Transport {
     fn send(&mut self, request: Request) -> CliResult<Response>;
 }

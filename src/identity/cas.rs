@@ -1,9 +1,8 @@
 //! Transport-injected CAS and UCloud protocol slice.
 //!
 //! URL validation and cookie storage use maintained `url` and `cookie_store`
-//! implementations. The production session layer drives this module through an
-//! injected transport; the CLI still keeps `Offline` until the parent wires the
-//! bounded transport.
+//! implementations. The production session layer drives this module through
+//! the CLI-selected transport (campus curl in production, `Scripted` in tests).
 //!
 //! A successful `cas_login` is the only way to obtain a `CasLogin`, and it must
 //! include a service ticket issued by the ordinary CAS verification request.
@@ -23,8 +22,6 @@ use url::Url;
 const CAS_LOGIN_URL: &str = "https://auth.bupt.edu.cn/authserver/login";
 const CAS_HOST: &str = "auth.bupt.edu.cn";
 const UCLOUD_HOST: &str = "ucloud.bupt.edu.cn";
-const UCLOUD_API: &str = "https://apiucloud.bupt.edu.cn";
-const UCLOUD_API_HOST: &str = "apiucloud.bupt.edu.cn";
 const UCLOUD_TOKEN_URL: &str = "https://apiucloud.bupt.edu.cn/ykt-basics/oauth/token";
 const UCLOUD_BASIC_AUTH: &str = "Basic c3dvcmQ6c3dvcmRfc2VjcmV0";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -169,30 +166,6 @@ impl CasCookie {
     #[cfg(test)]
     pub(crate) fn expires_at(&self) -> Option<i64> {
         self.expires_at
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn fixture(
-        name: &str,
-        value: &str,
-        domain: &str,
-        host_only: bool,
-        path: &str,
-        secure: bool,
-        http_only: bool,
-        expires_at: Option<i64>,
-    ) -> Self {
-        Self {
-            name: name.to_owned(),
-            value: value.to_owned(),
-            domain: domain.to_owned(),
-            host_only,
-            path: path.to_owned(),
-            secure,
-            http_only,
-            expires_at,
-        }
     }
 }
 
@@ -391,38 +364,9 @@ impl CasLogin {
         }
         Ok(self.ucloud.as_ref().expect("UCloud token was just set"))
     }
-
-    /// Perform one authenticated UCloud read with the lazily obtained token.
-    /// The path is a fixed API path supplied by a future service adapter; it is
-    /// not CLI input in this migration slice.
-    #[allow(dead_code)]
-    pub(super) fn ucloud_read(
-        &mut self,
-        transport: &mut dyn Transport,
-        path: &str,
-    ) -> CliResult<Value> {
-        let url = ucloud_read_url(path)?;
-        let access_token = self.ucloud_token(transport)?.access_token.clone();
-        let response = send_without_cookies(
-            transport,
-            Request {
-                method: "GET",
-                url,
-                headers: ucloud_headers(access_token),
-                body: Vec::new(),
-            },
-        )?;
-        ensure_http_ok(&response, "UCloud authenticated read")?;
-        parse_json_object(&response.body, "UCloud authenticated read")
-    }
 }
 
 impl UCloudToken {
-    #[allow(dead_code)]
-    pub(super) fn access_token(&self) -> &str {
-        &self.access_token
-    }
-
     /// The pair a read adapter needs, in `(access_token, user_id)` order.
     pub(super) fn identity_pair(&self) -> Option<(String, String)> {
         let user_id = self.user_id_string()?;
@@ -808,32 +752,6 @@ fn ticket_from_location_for(service: CasService, location: &str) -> CliResult<St
         })
         .ok_or_else(|| auth_error(format!("CAS issued an invalid {} ticket", service.label())))?;
     Ok(ticket)
-}
-
-fn ucloud_read_url(path: &str) -> CliResult<String> {
-    if !path.starts_with('/')
-        || path.starts_with("//")
-        || path.contains('#')
-        || path.contains('\\')
-        || path.chars().any(|ch| ch.is_control() || ch.is_whitespace())
-        || path.split('/').any(|segment| matches!(segment, "." | ".."))
-    {
-        return Err(parse_error("invalid UCloud read path"));
-    }
-    let url = format!("{UCLOUD_API}{path}");
-    let parsed = parse_https_url(&url).ok_or_else(|| parse_error("invalid UCloud read URL"))?;
-    if parsed.host_str() != Some(UCLOUD_API_HOST) {
-        return Err(parse_error("invalid UCloud read host"));
-    }
-    Ok(parsed.into())
-}
-
-fn ucloud_headers(access_token: String) -> Vec<(String, String)> {
-    vec![
-        ("Blade-Auth".into(), access_token),
-        ("Tenant-Id".into(), "000000".into()),
-        ("Authorization".into(), UCLOUD_BASIC_AUTH.into()),
-    ]
 }
 
 fn ensure_http_ok(response: &Response, operation: &str) -> CliResult<()> {
@@ -1956,7 +1874,10 @@ mod tests {
             !debug.contains("TEST-ONLY-REFRESH"),
             "token Debug must redact refresh tokens"
         );
-        assert_eq!(token.access_token(), ACCESS_SECRET);
+        assert_eq!(
+            token.identity_pair().map(|pair| pair.0),
+            Some(ACCESS_SECRET.to_owned())
+        );
         let metadata = token.as_session_json();
         assert_eq!(metadata["user_id"], json!("42"));
         assert_eq!(metadata["user_name"], json!(USERNAME));
@@ -1990,68 +1911,11 @@ mod tests {
         let again = login
             .ucloud_token(&mut transport)
             .expect("cached token is reused");
-        assert_eq!(again.access_token(), ACCESS_SECRET);
+        assert_eq!(
+            again.identity_pair().map(|pair| pair.0),
+            Some(ACCESS_SECRET.to_owned())
+        );
         assert_eq!(transport.calls.len(), 5, "cached token must not refetch");
-
-        enqueue(
-            &mut transport,
-            "GET",
-            "https://apiucloud.bupt.edu.cn/ykt-site/work/submit-view?assignmentId=1000000000000000001",
-            200,
-            &[],
-            "{\"code\":200,\"data\":{\"submitted\":false}}",
-        );
-        let read = login
-            .ucloud_read(
-                &mut transport,
-                "/ykt-site/work/submit-view?assignmentId=1000000000000000001",
-            )
-            .expect("authenticated read succeeds");
-        assert_eq!(read["data"]["submitted"], json!(false));
-        assert_eq!(transport.calls.len(), 6);
-        let read = &transport.calls[5];
-        assert_eq!(
-            request_header(read, "blade-auth"),
-            Some(ACCESS_SECRET),
-            "the read must use the fetched token"
-        );
-        assert_eq!(request_header(read, "tenant-id"), Some("000000"));
-        assert!(
-            request_header(read, "cookie").is_none(),
-            "the UCloud API must authenticate with Blade-Auth, not CAS cookies"
-        );
-    }
-
-    #[test]
-    fn ucloud_read_rejects_relative_or_foreign_paths() {
-        for path in [
-            "",
-            "ykt-site/work",
-            "//evil.example/ykt-site/work",
-            "/../ykt-site/work",
-            "/ykt-site/../work",
-            "/ykt-site/work#fragment",
-            "/ykt-site/work\\callback",
-            "/ykt-site/work path",
-        ] {
-            let error = ucloud_read_url(path).expect_err("path must be rejected");
-            assert_eq!(error.code, 5, "unexpected class for {path:?}");
-            assert_eq!(error.kind, "upstream");
-            assert_no_secret(&error);
-        }
-
-        let mut transport = successful_cas_script();
-        let mut login = cas_login(&mut transport, USERNAME, PASSWORD).expect("CAS login succeeds");
-        let error = login
-            .ucloud_read(&mut transport, "/../ykt-site/work")
-            .expect_err("invalid path must fail before token lookup");
-        assert_upstream_error(error);
-        assert_eq!(
-            transport.calls.len(),
-            4,
-            "an invalid read path must not trigger a UCloud token request"
-        );
-        assert_no_token_request(&transport);
     }
 
     #[test]
@@ -2092,7 +1956,10 @@ mod tests {
         let token = login
             .ucloud_token(&mut transport)
             .expect("expired token is exchanged again");
-        assert_eq!(token.access_token(), ACCESS_SECRET);
+        assert_eq!(
+            token.identity_pair().map(|pair| pair.0),
+            Some(ACCESS_SECRET.to_owned())
+        );
         assert_eq!(
             transport.calls.len(),
             7,

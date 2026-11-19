@@ -51,11 +51,15 @@ run_smoke uninstall --dry-run
 echo "    冒烟通过"
 
 echo "==> 打包 $ASSET.zip"
+# Remove any previous artifact first: a failed or interrupted zip must never
+# leave an old bundle looking like a fresh product.
+rm -f "dist/$ASSET.zip" "dist/$ASSET.zip.sha256"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 install -m 700 "$BIN" "$STAGE/bupt"
 (cd dist && zip -q -X "$ASSET.zip" "$ASSET/bupt")
-shasum -a 256 "dist/$ASSET.zip" | tee "dist/$ASSET.zip.sha256"
+shasum -a 256 "dist/$ASSET.zip" > "dist/$ASSET.zip.sha256"
+cat "dist/$ASSET.zip.sha256"
 
 [ "${1:-}" = "--keep" ] || rm -rf "$STAGE"
 echo "==> 完成：dist/$ASSET.zip（$(du -h "dist/$ASSET.zip" | cut -f1)）"

@@ -1600,7 +1600,6 @@ mod tests {
     use super::*;
     use crate::transport::{Offline, Response, Transport, testing::Scripted};
     use std::fs;
-    use std::time::Duration;
 
     fn write(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {

@@ -659,7 +659,6 @@ mod tests {
     use crate::transport::testing::Scripted;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
 
     fn fixture(name: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))

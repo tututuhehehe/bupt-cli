@@ -78,18 +78,6 @@ fn upgrade_https(url: &Url) -> Option<Url> {
     (url.scheme() == "https").then_some(url)
 }
 
-fn single_ticket(url: &Url) -> bool {
-    url.query_pairs().count() == 1
-        && url.query_pairs().any(|(key, value)| {
-            key == "ticket"
-                && value.starts_with("ST-")
-                && (4..2048).contains(&value.len())
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        })
-}
-
 fn install_saved(cookie: &CasCookie, url: &Url, store: &mut CookieStore) {
     let raw = format!(
         "{}={}; Path={}; Secure{}",
@@ -214,9 +202,9 @@ impl<'a, 't> HttpsPageSource<'a, 't> {
     fn sign_in(&mut self) -> CliResult<()> {
         let mut cas = Url::parse(CAS_URL).expect("static CAS URL");
         cas.query_pairs_mut().append_pair("service", TLS_SERVICE);
-        let first = self.ticketed_callback(cas, TLS_SERVICE)?;
+        let first = self.ticketed_callback(cas)?;
         let second_cas = self.legacy_cas(first)?;
-        let second = self.ticketed_callback(second_cas, LEGACY_SERVICE)?;
+        let second = self.ticketed_callback(second_cas)?;
         let mut current = second;
         for path in ["/Gstudent/Default.aspx", "/Gstudent/DefaultN.aspx"] {
             current = self.landing(current, path)?;
@@ -235,8 +223,9 @@ impl<'a, 't> HttpsPageSource<'a, 't> {
     }
 
     /// Exchange one CAS URL and follow its single redirect to the graduate
-    /// callback, or validate a same-host CAS service URL.
-    fn ticketed_callback(&mut self, cas: Url, _service: &str) -> CliResult<Url> {
+    /// callback. The ticket shape is validated by the shared `graduate_scope`
+    /// predicate the wire layer also uses, so the two cannot drift apart.
+    fn ticketed_callback(&mut self, cas: Url) -> CliResult<Url> {
         let response = self.exchange(&cas)?;
         let location = Self::location(&response)?.ok_or_else(|| {
             auth_error(
@@ -246,10 +235,10 @@ impl<'a, 't> HttpsPageSource<'a, 't> {
         })?;
         let url = signed_url(&location, APP)
             .ok_or_else(|| scope_error("教务票据回调必须是校内教务主机的绝对 HTTPS 地址。"))?;
-        if url.path() != "/ULogin.aspx" || !single_ticket(&url) {
-            return Err(scope_error("教务回调必须携带且仅携带一张 CAS 票据。"));
-        }
-        upgrade_https(&url).ok_or_else(|| scope_error("教务回调无法升级为 HTTPS。"))
+        let upgraded =
+            upgrade_https(&url).ok_or_else(|| scope_error("教务回调无法升级为 HTTPS。"))?;
+        crate::transport::graduate_scope::ticketed_callback(upgraded.as_str())
+            .ok_or_else(|| scope_error("教务回调必须携带且仅携带一张 CAS 票据。"))
     }
 
     fn legacy_cas(&mut self, callback: Url) -> CliResult<Url> {
@@ -481,9 +470,9 @@ mod tests {
         assert!(signed_url("https://yjxt.bupt.edu.cn:8443/ULogin.aspx", APP).is_none());
         assert!(signed_url("https://yjxt.bupt.edu.cn/ULogin.aspx#x", APP).is_none());
         let ticketed = upgrade_https(&http).unwrap();
-        assert!(single_ticket(&ticketed));
+        assert!(crate::transport::graduate_scope::ticketed_callback(ticketed.as_str()).is_some());
         let clean = signed_url("https://yjxt.bupt.edu.cn/ULogin.aspx", APP).unwrap();
-        assert!(!single_ticket(&clean));
+        assert!(crate::transport::graduate_scope::ticketed_callback(clean.as_str()).is_none());
     }
 
     #[test]

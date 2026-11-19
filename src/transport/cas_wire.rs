@@ -177,6 +177,14 @@ fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<V
     {
         return Err(rejected());
     }
+    if matches!(route, Route::UcloudSubmit)
+        && (!has_header(request, "content-type", "application/json")
+            || request.body.iter().any(|byte| byte.is_ascii_control()))
+    {
+        // The submit body is written into the curl configuration text, so raw
+        // control bytes would end the directive line. Reject them here.
+        return Err(rejected());
+    }
     if probe && matches!(route, Route::UcloudToken) && !valid_ticket_exchange(body) {
         return Err(rejected());
     }
@@ -876,7 +884,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn homework_upload_is_staged_to_a_private_file_and_only_our_shape_is_accepted() {
         use std::sync::Mutex;
         const UPLOAD: &str = "https://apiucloud.bupt.edu.cn/blade-source/resource/upload/biz";
@@ -994,6 +1001,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn homework_submit_body_is_validated_and_never_probed() {
         const SUBMIT: &str = "https://apiucloud.bupt.edu.cn/ykt-site/work/submit";
         let headers = vec![
@@ -1020,6 +1028,10 @@ mod tests {
         let config = String::from_utf8(curl_config(&request).unwrap()).unwrap();
         assert!(config.contains("data-raw"));
 
+        // Pretty-printed JSON with a raw newline between tokens parses fine
+        // but must never reach the curl configuration text.
+        let pretty = b"{\n  \"assignmentId\": \"1\",\"assignmentType\":0,\"assignmentContent\":\"\",\"attachmentIds\":[],\"userId\":\"u1\",\"groupId\":\"\",\"commitId\":\"\"\n}".to_vec();
+        assert!(curl_config(&submit_request(SUBMIT, headers.clone(), &pretty)).is_err());
         for invalid in [
             br#"{"assignmentId":"1"}"#.to_vec(),
             br#"{"assignmentId":"1","assignmentType":1,"assignmentContent":"","attachmentIds":[],"userId":"u1","groupId":"","commitId":""}"#.to_vec(),

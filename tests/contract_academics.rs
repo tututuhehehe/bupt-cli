@@ -218,7 +218,7 @@ fn assert_refresh_required(invocation: Invocation, cache: &Path, before: &[u8], 
     assert_eq!(
         payload["error"]["type"],
         json!("auth"),
-        "{label}: a missing browser session is an auth failure"
+        "{label}: a missing CAS session is an auth failure"
     );
     let text = error_text(&payload);
     assert!(
@@ -366,8 +366,7 @@ fn assert_snapshot_refused(entry: &Value, class_date: Date, label: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Invalid arguments come first: before credentials, cache access, network or
-// a browser.
+// Invalid arguments come first: before credentials, cache access or network.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -890,7 +889,7 @@ fn missing_snapshot_and_session_report_auth_without_fabricating_cache() {
     assert_eq!(
         invocation.code(),
         3,
-        "a missing browser session must be an auth error; stdout={:?}; stderr={:?}",
+        "a missing CAS session must be an auth error; stdout={:?}; stderr={:?}",
         String::from_utf8_lossy(&invocation.0.stdout),
         String::from_utf8_lossy(&invocation.0.stderr)
     );
@@ -1001,7 +1000,7 @@ fn undergraduate_mobile_commands_require_a_bound_session_before_network() {
 }
 
 #[test]
-fn graduate_exams_without_a_session_is_an_auth_error_before_browser() {
+fn graduate_exams_without_a_session_is_an_auth_error_before_any_request() {
     let sandbox = Sandbox::new();
     write_credentials(&sandbox, USER, "graduate");
 
@@ -1009,7 +1008,7 @@ fn graduate_exams_without_a_session_is_an_auth_error_before_browser() {
     assert_eq!(
         invocation.code(),
         3,
-        "missing CAS session must stop before Chrome; stdout={:?}; stderr={:?}",
+        "missing CAS session must stop before any HTTPS request; stdout={:?}; stderr={:?}",
         String::from_utf8_lossy(&invocation.0.stdout),
         String::from_utf8_lossy(&invocation.0.stderr)
     );
@@ -1024,7 +1023,7 @@ fn graduate_exams_without_a_session_is_an_auth_error_before_browser() {
             .expect("read cache dir")
             .next()
             .is_none(),
-        "the browser source must not write state before the session check"
+        "the graduate source must not write state before the session check"
     );
 }
 
@@ -1032,7 +1031,7 @@ fn graduate_exams_without_a_session_is_an_auth_error_before_browser() {
 fn role_guards_only_refuse_graduate_accounts_not_unknown_passwords() {
     let sandbox = Sandbox::new();
     // Missing password stops before any source is contacted, so this can test
-    // role routing without a browser or campus network.
+    // role routing without campus network.
     for (command, role) in [("exams", "graduate"), ("scores", "undergraduate")] {
         fs::write(
             config_path(&sandbox),
