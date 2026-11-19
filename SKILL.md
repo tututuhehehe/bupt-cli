@@ -2,29 +2,37 @@
 name: bupt-cli
 description: >-
   Use this for anything on BUPT (北邮) campus systems: UCloud homework
-  (list/new/show/download/submit), courses, dorm electricity balance,
-  timetable/exams/scores.
+  (list/show/download/submit/verify), courses, graduate or undergraduate
+  timetable/exams/scores/classrooms, library, dorm electricity, notices.
 ---
 # bupt CLI
 
-After install, run `bupt <command>`. Output is JSON; add `--pretty` for indented output. Once credentials are configured, login is cached and reused automatically. Run `bupt <command> --help` for the full flags.
+Run `bupt <command>`. Output is one JSON document with `schema: "bupt.v1"` and `ok` on stdout; errors are one JSON document on stderr with `error.type` (`usage`=2, `auth`=3, `network`=4, `upstream`=5) and the matching exit code. `--pretty` only reformats. Run `bupt help <command>` for full flags.
+
+Credentials come only from `~/.bupt-cli/credentials.json` (created by interactive `bupt login`; `BUPT_USERNAME`-style env vars are ignored on purpose). Sessions are cached and reused; only an explicit auth error means the user must re-run `bupt login`.
 
 ## Common commands
-- `bupt homework list [--undone] [--course ID] [--new DAYS]`: list assignments.
-- `bupt homework show ID`: an assignment's details, attachments, and submission state (`submitted`, `submitted_at`, submitted attachments).
-- `bupt homework download ID --dir DIR`: download the teacher's attachments.
-- `bupt homework verify ID [--resource-id RID ...]`: read-only check that a submission is really there.
-- `bupt courses`: this semester's courses.
-- `bupt electricity`: dorm electricity balance. Configure your own dorm with `--building/--room`, `BUPT_DORM_*`, or `~/.bupt-cli/config.json` first; the built-in value is only a placeholder. The output has `low_balance`.
-- `bupt status` / `bupt probe`: check the session and which endpoints work.
-- `schedule/exams/scores/classrooms` are experimental (they need a separate 教务 password). `notices/card` depend on the campus-only portal and usually fail off-campus.
+- `bupt courses`: UCloud course sites.
+- `bupt homework [--undone] [--course ID] [--new DAYS]`: assignment list (bare `homework`, no `list` subcommand).
+- `bupt homework show ID`: detail, attachments, `submitted`/`submitted_at`.
+- `bupt homework download ID --dir DIR`: teacher attachments into the given directory only.
+- `bupt homework verify ID [--resource-id RID ...]`: read-only check that a submission is visible.
+- `bupt schedule --today | --week N`: reads the local snapshot in milliseconds; `bupt schedule update` refreshes it (graduate = direct HTTPS, ~0.8 s; no browser needed). `schedule calendar` maps teaching weeks to dates; `schedule export` writes an `.ics`.
+- `bupt exams`: routed by role; a successful empty result is reported as `count: 0`, never as an error.
+- `bupt scores` / `bupt classrooms --campus 01|04`: undergraduate only.
+- `bupt library search KEYWORD` / `hold ID` / `ebook ID`: anonymous, no login needed.
+- `bupt electricity --building B --room R`: dorm balance; set the user's own dorm via flags, `BUPT_DORM_*`, or `~/.bupt-cli/config.json` — the built-in value is a placeholder. `electricity buildings --area shahe|xitucheng` lists buildings.
+- `bupt diagnose [--only public,cas,ucloud]`: availability matrix; never submits passwords or writes state.
+- `bupt notices` / `notices show URL` / `card`: portal, needs a campus route; off-campus they fail with network 4.
+- `bupt update --check`: read-only release check.
 
 ## Submitting homework (only with the user's explicit consent)
-1. `bupt homework submit ID --file f.pdf --text "..." --dry-run`: preview first.
-2. Show the user the content you'll submit. Do a real submit only after they explicitly agree: `bupt homework submit ID --file f.pdf --i-confirm-submit`.
-3. Every submit sends the full set of content and attachments, overwriting the previous submission, so include every file each time.
-4. A real submit verifies itself afterwards (`verified`, `submitted_at`). Exit 6 means the submission couldn't be confirmed, and exit 7 means the check itself failed. In either case check with `show`/`verify` and tell the user; never resubmit on your own.
+1. `bupt homework submit ID --file f.pdf --text "..." --dry-run`: preview first — zero uploads, zero writes.
+2. Show the user exactly what would be submitted. Only after they explicitly agree: `bupt homework submit ID --file f.pdf --i-confirm-submit`.
+3. A confirmed submit uploads and submits at most once. Exit 6 means the outcome is unknown (never resubmit on your own — use `verify`), exit 7 means post-submit verification failed.
+4. After any submit, check with `bupt homework show ID` / `verify ID` and report honestly.
 
 ## Notes
-- Don't log in repeatedly in quick succession; the account can get locked.
-- Never print credentials.
+- Don't re-run `bupt login` in quick succession; repeated failures can lock the account. An auth error on one service does not mean the others are broken.
+- Never print credentials, cookies, tickets, or tokens; `bupt status` already shows only sanitized metadata.
+- Don't scrape at high frequency; campus endpoints rate-limit and change without notice.
