@@ -483,11 +483,22 @@ fn release_metadata_arguments(request: &Request, timeout: Duration) -> CliResult
 /// are supplied to the trusted executable only through stdin.
 pub(crate) struct CampusCurl {
     timeout: Duration,
+    diagnostic: bool,
 }
 
 impl CampusCurl {
     pub(crate) fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            diagnostic: false,
+        }
+    }
+
+    pub(crate) fn for_diagnose(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            diagnostic: true,
+        }
     }
 }
 
@@ -506,7 +517,11 @@ impl Transport for CampusCurl {
         let mut exec = SystemCurl {
             program: PathBuf::from("/usr/bin/curl"),
         };
-        cas_wire::exchange(&mut exec, self.timeout, &request)
+        if self.diagnostic {
+            cas_wire::exchange_probe(&mut exec, self.timeout, &request)
+        } else {
+            cas_wire::exchange(&mut exec, self.timeout, &request)
+        }
     }
 }
 

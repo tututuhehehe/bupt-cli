@@ -10,6 +10,9 @@ use url::Url;
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_HEADERS: usize = 64 * 1024;
 const ELECTRICITY_LANDING: &str = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
+const ANONYMOUS_PORTAL_PROBE: &str =
+    "http://my.bupt.edu.cn/list.jsp?totalpage=30&PAGENUM=0&urltype=tree.TreeTempUrl&wbtreeid=1154";
+const UCLOUD_TOKEN_URL: &str = "https://apiucloud.bupt.edu.cn/ykt-basics/oauth/token";
 
 #[derive(Clone, Copy)]
 enum Route {
@@ -21,6 +24,8 @@ enum Route {
     UcloudHomeworkList,
     ElectricityLanding,
     ElectricityRead(&'static [&'static str]),
+    PublicProbe,
+    MobileProbe,
 }
 
 pub(super) fn exchange(
@@ -28,11 +33,39 @@ pub(super) fn exchange(
     timeout: Duration,
     request: &Request,
 ) -> CliResult<Response> {
+    exchange_with_policy(exec, timeout, request, false)
+}
+
+pub(super) fn exchange_probe(
+    exec: &mut dyn CurlExec,
+    timeout: Duration,
+    request: &Request,
+) -> CliResult<Response> {
+    exchange_with_policy(exec, timeout, request, true)
+}
+
+fn exchange_with_policy(
+    exec: &mut dyn CurlExec,
+    timeout: Duration,
+    request: &Request,
+    probe: bool,
+) -> CliResult<Response> {
     if timeout.is_zero() {
         return Err(rejected());
     }
-    let input = curl_config(request)?;
+    let input = if probe {
+        curl_probe_config(request)?
+    } else {
+        curl_config(request)?
+    };
     let mut args = base_curl_arguments(timeout);
+    if probe && request.url == ANONYMOUS_PORTAL_PROBE {
+        let proto = args
+            .iter()
+            .position(|arg| arg == "--proto")
+            .expect("protocol is specified");
+        args[proto + 1] = "=http".into();
+    }
     args.extend(["--config".into(), "-".into()]);
     let output = exec.exec(&args, &input).map_err(|_| network_failure())?;
     if !output.success {
@@ -51,7 +84,14 @@ fn network_failure() -> CliError {
 }
 
 fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
-    let route = route(request).ok_or_else(rejected)?;
+    config_for_route(request, route(request).ok_or_else(rejected)?, false)
+}
+
+fn curl_probe_config(request: &Request) -> CliResult<Vec<u8>> {
+    config_for_route(request, probe_route(request).ok_or_else(rejected)?, true)
+}
+
+fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<Vec<u8>> {
     let body = std::str::from_utf8(&request.body).map_err(|_| rejected())?;
     let requires_body = matches!(
         route,
@@ -82,12 +122,20 @@ fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
         }
     }
     if matches!(route, Route::UcloudHomeworkList)
-        && (!valid_homework_list_body(body)
-            || !request
-                .headers
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "application/json"))
+        && (!valid_homework_list_body(body, if probe { 20 } else { 50 })
+            || !has_header(
+                request,
+                "content-type",
+                if probe {
+                    "application/json;charset=UTF-8"
+                } else {
+                    "application/json"
+                },
+            ))
     {
+        return Err(rejected());
+    }
+    if probe && matches!(route, Route::UcloudToken) && !valid_ticket_exchange(body) {
         return Err(rejected());
     }
     if let Route::ElectricityRead(keys) = route {
@@ -172,6 +220,97 @@ fn route(request: &Request) -> Option<Route> {
     }
 }
 
+fn probe_route(request: &Request) -> Option<Route> {
+    // Diagnostic mode never posts a CAS form, even if a caller constructs one.
+    const PUBLIC: &[&str] = &[
+        ANONYMOUS_PORTAL_PROBE,
+        UCLOUD_TOKEN_URL,
+        "https://auth.bupt.edu.cn/authserver/login",
+        "https://uc.bupt.edu.cn/api/uc/status",
+        "https://win.bupt.edu.cn/note.do",
+        "https://jwgl.bupt.edu.cn/jsxsd/framework/xsMain_bjyddx.jsp",
+        "https://jwgl.bupt.edu.cn/jsxsd/framework/xsdPerson.jsp",
+        "https://jwxt.bupt.edu.cn/caslogin.jsp",
+        "https://jwglweixin.bupt.edu.cn/bjyddx/login",
+    ];
+    if request.method == "GET" && PUBLIC.contains(&request.url.as_str()) {
+        return Some(Route::PublicProbe);
+    }
+    if let Some(route) = route(request) {
+        return match route {
+            Route::CasForm | Route::UcloudLanding => None,
+            Route::CasRead
+                if !matches!(
+                    request.url.as_str(),
+                    "https://auth.bupt.edu.cn/authserver/login"
+                        | "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fucloud.bupt.edu.cn%2Fuclass"
+                ) =>
+            {
+                None
+            }
+            _ => Some(route),
+        };
+    }
+    let raw = &request.url;
+    if raw.len() > 8192 || !raw.bytes().all(|b| matches!(b, 0x21..=0x7e)) || raw.contains('\\') {
+        return None;
+    }
+    let url = Url::parse(raw).ok()?;
+    let host = url.host_str()?;
+    if raw.strip_prefix("https://")?.split(['/', '?', '#']).next() != Some(host)
+        || url.as_str() != raw
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    match (host, request.method, url.path()) {
+        (
+            "apiucloud.bupt.edu.cn",
+            "GET",
+            "/ykt-basics/info"
+            | "/ykt-site/base-term/current"
+            | "/ykt-basics/userroledomaindept/listByUserId"
+            | "/ykt-site/examination/list-stu"
+            | "/ykt-activity/survey/page/todo",
+        ) => Some(Route::UcloudRead),
+        (
+            "jwglweixin.bupt.edu.cn",
+            "GET",
+            "/bjyddx/student/curriculum"
+            | "/bjyddx/Get_sjkbms"
+            | "/bjyddx/teachingWeek"
+            | "/bjyddx/kaowu/get_kszc"
+            | "/bjyddx/kaowu/getKsapcx"
+            | "/bjyddx/kaowu/findKcksapcx"
+            | "/bjyddx/student/examinationArrangement"
+            | "/bjyddx/noticeList"
+            | "/bjyddx/currentTerm",
+        ) if url.query().is_none() => Some(Route::MobileProbe),
+        ("jwglweixin.bupt.edu.cn", "GET", "/bjyddx/todayClassrooms")
+            if url.query() == Some("campusId=04") =>
+        {
+            Some(Route::MobileProbe)
+        }
+        ("jwglweixin.bupt.edu.cn", "POST", "/bjyddx/student/termGPA") if url.query().is_none() => {
+            Some(Route::MobileProbe)
+        }
+        _ => None,
+    }
+}
+
+fn valid_ticket_exchange(body: &str) -> bool {
+    let fields: Vec<_> = url::form_urlencoded::parse(body.as_bytes()).collect();
+    fields.len() == 2
+        && fields
+            .iter()
+            .any(|(key, value)| key == "grant_type" && value == "third")
+        && fields.iter().any(|(key, value)| {
+            key == "ticket"
+                && !value.is_empty()
+                && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+        })
+}
+
 fn allowed_header(route: Route, name: &str) -> bool {
     name == "user-agent"
         || match route {
@@ -181,7 +320,8 @@ fn allowed_header(route: Route, name: &str) -> bool {
                 "cookie" | "referer" | "x-requested-with" | "content-type"
             ),
             Route::CasForm => matches!(name, "cookie" | "content-type"),
-            Route::UcloudLanding => false,
+            Route::UcloudLanding | Route::PublicProbe => false,
+            Route::MobileProbe => matches!(name, "token" | "accept"),
             Route::UcloudToken => matches!(name, "authorization" | "content-type"),
             Route::UcloudRead | Route::UcloudHomeworkList => {
                 matches!(
@@ -215,7 +355,7 @@ fn valid_electricity_body(body: &str, expected_keys: &[&str]) -> bool {
     keys.len() == expected_keys.len()
 }
 
-fn valid_homework_list_body(body: &str) -> bool {
+fn valid_homework_list_body(body: &str, page_size: u64) -> bool {
     let Ok(serde_json::Value::Object(object)) = serde_json::from_str(body) else {
         return false;
     };
@@ -230,7 +370,7 @@ fn valid_homework_list_body(body: &str) -> bool {
             .get("current")
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|page| page > 0)
-        && object.get("size").and_then(serde_json::Value::as_u64) == Some(50)
+        && object.get("size").and_then(serde_json::Value::as_u64) == Some(page_size)
 }
 
 fn option(config: &mut String, name: &'static str, value: &str) {
@@ -371,6 +511,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.status, 429);
+    }
+
+    #[test]
+    fn diagnostic_transport_does_not_send_passwords_or_plaintext_cookies() {
+        let mut request = Request {
+            method: "GET",
+            url: ANONYMOUS_PORTAL_PROBE.into(),
+            headers: vec![("User-Agent".into(), "bupt-test".into())],
+            body: Vec::new(),
+        };
+        assert!(curl_probe_config(&request).is_ok());
+        assert!(curl_config(&request).is_err());
+        request.headers.push(("Cookie".into(), "TEST=ONLY".into()));
+        assert!(curl_probe_config(&request).is_err());
+        request.url = "https://auth.bupt.edu.cn/authserver/login".into();
+        assert!(
+            curl_probe_config(&request).is_err(),
+            "public CAS GET is anonymous"
+        );
+        request.method = "POST";
+        request.body = b"password=TEST-ONLY".to_vec();
+        assert!(
+            curl_probe_config(&request).is_err(),
+            "diagnose cannot post a CAS form"
+        );
+        request.url = UCLOUD_TOKEN_URL.into();
+        request.headers.clear();
+        assert!(
+            curl_probe_config(&request).is_err(),
+            "token exchange cannot post a password"
+        );
+        request.body = b"grant_type=third&ticket=ST-TEST-ONLY".to_vec();
+        assert!(curl_probe_config(&request).is_ok());
+        request.body.clear();
+        request.method = "GET";
+        request.url = "https://jwglweixin.bupt.edu.cn/bjyddx/student/curriculum".into();
+        request.headers.push(("token".into(), "TEST-ONLY".into()));
+        assert!(curl_probe_config(&request).is_ok());
+        request.url = "https://jwglweixin.bupt.edu.cn/bjyddx/login".into();
+        assert!(
+            curl_probe_config(&request).is_err(),
+            "public mobile login GET is anonymous"
+        );
     }
 
     #[test]
