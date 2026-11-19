@@ -106,7 +106,9 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `chrome_cookie_params_preserve_host_only_scope` | host-only Cookie 传 Chrome 时省略 `domain`、使用 auth host URL，并保留 path/secure/httpOnly |
 | `chrome_cookie_params_keep_domain_cookie_scope_and_expiry` | 非 host-only Cookie 使用 canonical auth domain，并保留 path/expiry |
 | `menu_urls_stay_on_known_graduate_pages` | 菜单绝对 URL、协议相对 URL、`..`、反斜杠都拒绝；只拼已知研究生页面 |
-| `menu_parser_and_eid_extraction_ignore_untrusted_urls` | 菜单 name/url 提取；EID 只接受安全字符 |
+| `menu_parser_and_eid_extraction_ignore_untrusted_urls` | 菜单 name/url 提取；拒绝空、控制字符和不支持的转义 EID |
+| `calendar_identifier_punctuation_is_preserved_in_one_query_value` | EID 中的标点和 `=` 不截断，也不能改变固定 HTTPS 路径或查询结构 |
+| `calendar_grid_can_be_nested_inside_a_layout_table` | 嵌套在布局表格内的 `dgData` 也能按周次解析 |
 | `websocket_handshake_helpers_match_known_vectors` | 自实现的 SHA-1/Base64 对已知向量正确，避免新增依赖 |
 
 ## 实现侧 mobile JWGL 客户端与映射用例

@@ -108,6 +108,14 @@ struct Element {
 }
 
 fn tag_elements(html: &str, tag: &str) -> Vec<Element> {
+    tag_elements_matching(html, tag, |_| true)
+}
+
+fn tag_elements_matching(
+    html: &str,
+    tag: &str,
+    matches_attrs: impl Fn(&str) -> bool,
+) -> Vec<Element> {
     let lower = html.to_ascii_lowercase();
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
@@ -128,6 +136,12 @@ fn tag_elements(html: &str, tag: &str) -> Vec<Element> {
             break;
         };
         let gt = after_name + gt_relative;
+        let attrs = &html[after_name..gt];
+        if !matches_attrs(attrs) {
+            // Search inside layout elements rather than consuming their first closing tag.
+            position = gt + 1;
+            continue;
+        }
         let Some(close_relative) = lower[gt + 1..].find(&close) else {
             break;
         };
@@ -135,7 +149,7 @@ fn tag_elements(html: &str, tag: &str) -> Vec<Element> {
         let inner_end = inner_start + close_relative;
         elements.push(Element {
             start,
-            attrs: html[after_name..gt].to_string(),
+            attrs: attrs.to_string(),
             inner: html[inner_start..inner_end].to_string(),
         });
         position = inner_end + close.len();
@@ -542,10 +556,12 @@ pub(super) fn parse_calendar(
     html: &str,
     academic_year_start: i32,
 ) -> CliResult<BTreeMap<i64, Vec<String>>> {
-    let table = tag_elements(html, "table")
-        .into_iter()
-        .find(|table| table.attrs.to_ascii_lowercase().contains("dgdata"))
-        .ok_or_else(|| calendar_error("教学日历页面结构已变（找不到 dgData 表格）"))?;
+    let table = tag_elements_matching(html, "table", |attrs| {
+        attrs.to_ascii_lowercase().contains("dgdata")
+    })
+    .into_iter()
+    .next()
+    .ok_or_else(|| calendar_error("教学日历页面结构已变（找不到 dgData 表格）"))?;
     let mut weeks = BTreeMap::new();
     for row in row_elements(&table.inner) {
         let cells = cell_elements(&row.inner);
@@ -919,6 +935,15 @@ mod tests {
                 "2027-01-03".to_string(),
                 "2027-01-04".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn calendar_grid_can_be_nested_inside_a_layout_table() {
+        let wrapped = format!("<table class='layout'><tr><td>{CALENDAR}</td></tr></table>");
+        assert_eq!(
+            parse_calendar(&wrapped, 2026).unwrap(),
+            parse_calendar(CALENDAR, 2026).unwrap()
         );
     }
 

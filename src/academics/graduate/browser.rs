@@ -184,8 +184,7 @@ impl GradPageSource for ChromePageSource {
                     "重试一次；页面结构可能已变。",
                 )
             })?;
-            let url = format!("{YJXT_BASE}/PublicPage/TermCalender.aspx?EID={eid}&UID=");
-            browser.goto(&url)?;
+            browser.goto(calendar_url(&eid).as_str())?;
             let calendar = browser
                 .wait_for_html(|html| html.contains("dgData") && html.contains("二十"), 25)
                 .ok_or_else(|| {
@@ -279,14 +278,25 @@ fn extract_eid(html: &str) -> Option<String> {
                 && !character.is_whitespace()
         })
         .collect::<String>();
+    // The link embeds an opaque literal identifier, including punctuation.
+    // Don't guess its alphabet; calendar_url encodes it as one query value.
     if eid.is_empty()
-        || !eid.chars().all(|character| {
-            character.is_ascii_alphanumeric() || character == '-' || character == '_'
-        })
+        || eid.len() > 2048
+        || !eid.bytes().any(|b| b.is_ascii_alphanumeric())
+        || !eid.bytes().all(|b| b.is_ascii_graphic() && b != b'%')
     {
         return None;
     }
     Some(eid)
+}
+
+fn calendar_url(eid: &str) -> Url {
+    let mut url = Url::parse(&format!("{YJXT_BASE}/PublicPage/TermCalender.aspx"))
+        .expect("static calendar origin and path");
+    url.query_pairs_mut()
+        .append_pair("EID", eid)
+        .append_pair("UID", "");
+    url
 }
 
 fn parse_menu(html: &str) -> BTreeMap<String, String> {
@@ -1234,7 +1244,33 @@ mod tests {
             extract_eid("TermCalender.aspx?EID=abc-123_XYZ&amp;x=1"),
             Some("abc-123_XYZ".to_string())
         );
-        assert_eq!(extract_eid("TermCalender.aspx?EID=abc/def"), None);
+        assert_eq!(
+            extract_eid("TermCalender.aspx?EID=abcd123=&amp;UID="),
+            Some("abcd123=".into())
+        );
+        assert_eq!(
+            extract_eid("TermCalender.aspx?EID=abc=:def=&amp;UID="),
+            Some("abc=:def=".into())
+        );
+        assert_eq!(extract_eid("TermCalender.aspx?EID===:"), None);
+        assert_eq!(extract_eid("TermCalender.aspx?EID=abc%2Fdef"), None);
+        assert_eq!(extract_eid("TermCalender.aspx?EID=ab\0cd"), None);
         assert_eq!(extract_eid("TermCalender.aspx?EID="), None);
+    }
+
+    #[test]
+    fn calendar_identifier_punctuation_is_preserved_in_one_query_value() {
+        let eid = extract_eid("TermCalender.aspx?EID=abc*def+/x#ghi==&amp;UID=").unwrap();
+        assert_eq!(eid, "abc*def+/x#ghi==");
+        let url = calendar_url(&eid);
+        assert!(url.fragment().is_none());
+        assert_eq!(
+            url.as_str().split_once('?').unwrap().0,
+            format!("{YJXT_BASE}/PublicPage/TermCalender.aspx")
+        );
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            [("EID".into(), eid.into()), ("UID".into(), "".into())]
+        );
     }
 }
