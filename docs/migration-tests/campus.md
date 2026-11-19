@@ -105,6 +105,61 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `malformed_payloads_are_parse_errors` | 非对象、缺 `e`、缺 `d.data`、错误数据类型均为 parse 5 |
 | `invalid_json_is_a_parse_error` | 非 JSON 响应为 parse 5 |
 
+### 匿名图书馆传输（rewrite/transport）
+
+`src/transport.rs` 新增 `Curl` 适配器；`src/cli.rs` 只把顶层 `library` 路由到它，其余命令（`login`、`homework`、`schedule`、`electricity`、`notices`、`card` 等）继续使用 `Offline`。生产路径使用系统 curl（macOS `/usr/bin/curl`，Windows 优先 `%SystemRoot%\System32\curl.exe`），不新增依赖或运行时包。
+
+安全与边界：
+
+- 只接受 `POST https://opac.bupt.edu.cn/search-full-result.json`、`POST https://opac.bupt.edu.cn/dianzi.json` 和 `GET https://opac.bupt.edu.cn/bookInfo_<id>.html`。`<id>` 只允许 ASCII unreserved 与 UTF-8 百分号字节；`%2F`、`%20` 等编码后的 ASCII 一律拒绝，避免编码路径分隔符或二次解码逃出 route 模板。
+- 请求头只允许 `User-Agent`、`Referer`、`X-Requested-With`、`Content-Type`；重复头、Cookie/Authorization/未知头和含 CR/LF 的值一律拒绝；`Referer` 只接受 OPAC 搜索页或馆藏页。
+- 首个参数固定 `--disable`，不读 `.curlrc`；`--proxy ""` 忽略代理环境；`--proto =https`；不传 `--location` 且显式 `--max-redirs 0`；不传 `--retry`。
+- 请求体经 curl stdin 传入，不进入 argv；参数由 `std::process::Command` 直接传递，不经过 shell。
+- `--max-time` 最多 120s、`--connect-timeout` 最多 10s、`--max-filesize` 8 MiB；Rust 侧管道读取再限制为 8 MiB 加状态标记，超限即终止子进程。
+- curl stdout 末尾用 `__BUPT_HTTP_STATUS__` ASCII 分隔符加三位 HTTP 状态；curl 退出非 0 一律返回 transport failure（network 4），退出 0 时保留真实 HTTP 状态（含 4xx/5xx）。错误消息不含请求、响应或 curl stderr 内容。
+
+本轮传输测试（全部离线，无真实校园网）：
+
+| Rust 测试 | 覆盖 |
+|---|---|
+| `builds_a_bounded_argument_vector_for_library_search` | 参数顺序、`--disable` 首位、超时/大小/无重定向参数、四个允许头、无 `--location`/`--retry`/`--cookie`，请求体不进入 argv |
+| `caps_the_request_timeout_and_connect_timeout` | 120s/10s 上限、亚秒值、零超时拒绝 |
+| `accepts_only_documented_methods_for_exact_library_routes` | 三条 route 的 GET/POST 组合；错误方法、GET 带 body、超长 body 拒绝 |
+| `rejects_urls_outside_the_exact_library_routes` | http、伪装/带端口/带 userinfo 主机、query/fragment、任意路径、空 id、路径分隔符、坏百分号、空格；UTF-8 id 仍接受 |
+| `rejects_credentials_unknown_headers_and_header_injection` | Cookie/Authorization/Proxy-Authorization/未知/重复头、坏 Referer、坏 X-Requested-With、坏 Content-Type、CRLF 注入；小写头名可用 |
+| `parses_the_status_from_the_final_write_out_marker` | 状态和 body 分离、body 含分隔符/换行/数字、malformed 状态、超限 body |
+| `reads_at_most_the_bounded_number_of_response_bytes` | 管道读取上限包含等于上限、拒绝多一字节 |
+| `send_preserves_the_http_status_and_calls_curl_once` | HTTP 503 仍返回 `Response`，只调用一次 curl |
+| `send_does_not_retry_a_transport_failure` | transport failure 只尝试一次，不消费第二次响应 |
+| `nonzero_curl_exit_is_a_transport_failure_even_with_a_status_line` | 退出非 0 即使已有状态行也归 network 4，且不回显 body |
+| `invalid_requests_do_not_reach_the_curl_process` | route 拒绝发生在 spawn 前，upstream 5 |
+| `malformed_or_oversized_output_is_a_transport_failure` | 缺状态标记、超限 synthetic 输出均为 network 4 |
+| `system_curl_receives_separate_arguments_and_the_body_on_stdin`（Unix） | 用临时 fake curl 进程验证真实 spawn：URL/含 shell 元字符的头值各为一个 argv，body 只走 stdin，状态标记被剥离 |
+| `library_search_uses_the_injected_public_transport`（`src/cli.rs`） | 正式 CLI 路由把 `library search` 交给注入的 public transport，`Offline` 零调用，输出仍是 `schema: "bupt.v1"` |
+| `only_the_library_lane_uses_the_public_network`（`src/cli.rs`） | 当前公开命令中只有顶层 `library` 选择 public transport |
+
+已知限制：
+
+- **Windows 实际执行未验证**：`%SystemRoot%\System32\curl.exe` 路径、Windows argv 引号/控制字符、进程终止和 stdin 管道都需要在 Windows 实机复跑；Unix fake curl 测试不覆盖 Windows。
+- **没有 Rust 侧真实 OPAC 实测**：Python 基线曾返回 HTTP 200 和 3 条公开结果，但本轮按任务要求不访问真实校园（含公共图书馆），因此不能声称 Rust live pass。
+- **命令层错误分层仍未接通**：`src/campus/library.rs` 的 `library_send` 仍把所有 transport error 映射为 usage 2；适配器内部已区分 HTTP 状态与 transport failure，但 CLI 退出码仍是旧行为。
+- **响应头未暴露**：`Curl` 返回空 `headers`，现有图书馆解析器不读取响应头；若后续需要 `Content-Type`/重定向诊断，要扩展适配器。
+- **代理被禁用**：`--proxy ""` 保证不把环境代理凭据带进请求，但也意味着需要代理才能出网的 Windows 环境会失败。
+- **异常 id 失败关闭**：含编码 ASCII（如空格、`/`、`?`、`%`）的馆藏 id 会在 transport 前被拒绝，普通 OPAC 字母数字 id 不受影响。
+- **3xx 不跟随**：上游若返回重定向，会作为 HTTP 状态交给 `ensure_success`，最终按旧行为成为 usage 错误，而不是自动跳转。
+- **依赖系统 curl**：macOS/Windows 缺少 curl 时返回 network 4，提示检查网络；没有内置下载或打包 curl。
+
+本轮验证：
+
+```sh
+cargo fmt --check
+cargo test --locked --offline
+```
+
+- `cargo fmt --check`：通过。
+- `cargo test --locked --offline`：通过；89 个库测试 + 25 academics + 33 campus + 14 homework + 28 identity + 23 lifecycle，共 212 个 Rust 测试，0 失败。
+- 没有运行真实校园网、浏览器、登录或公共图书馆请求；没有新增环境变量回放或公开 CLI 参数。
+
 ## 仍未接通的场景
 
 这些场景没有写成 `#[ignore]` 或永远通过的假测试；当前没有对应的红测在失败，等会话/传输能力接通后再补：
