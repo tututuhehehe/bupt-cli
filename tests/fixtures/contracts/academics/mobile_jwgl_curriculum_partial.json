@@ -1,0 +1,78 @@
+{
+  "code": 1,
+  "Msg": "synthetic current week",
+  "data": [
+    {
+      "semesterId": "2026-2027-1",
+      "week": "3",
+      "date": [
+        {
+          "zc": "3",
+          "mxrq": "2026-09-14",
+          "xqid": "1",
+          "xqmc": "一",
+          "rq": "14"
+        },
+        {
+          "zc": "3",
+          "mxrq": "2026-09-15",
+          "xqid": "2",
+          "xqmc": "二",
+          "rq": "15"
+        },
+        {
+          "zc": "3",
+          "mxrq": "2026-09-16",
+          "xqid": "3",
+          "xqmc": "三",
+          "rq": "16"
+        },
+        {
+          "zc": "3",
+          "mxrq": "2026-09-17",
+          "xqid": "4",
+          "xqmc": "四",
+          "rq": "17"
+        },
+        {
+          "zc": "3",
+          "mxrq": "2026-09-18",
+          "xqid": "5",
+          "xqmc": "五",
+          "rq": "18"
+        },
+        {
+          "zc": "3",
+          "mxrq": "2026-09-19",
+          "xqid": "6",
+          "xqmc": "六",
+          "rq": "19"
+        },
+        {
+          "zc": "3",
+          "mxrq": "2026-09-20",
+          "xqid": "7",
+          "xqmc": "日",
+          "rq": "20"
+        }
+      ],
+      "courses": [
+        {
+          "classWeek": "3",
+          "classWeekDetails": "",
+          "classTime": "",
+          "weekDay": "3",
+          "courseName": "只有当前周",
+          "teacherName": "王老师",
+          "buildingName": "教二",
+          "classroomName": "201",
+          "startTime": "08:00",
+          "endTime": "09:35",
+          "jx0408id": "course-current",
+          "campus": ""
+        }
+      ],
+      "item": null
+    }
+  ]
+}

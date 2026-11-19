@@ -1,0 +1,105 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/work/detail",
+        "query": {
+          "assignmentId": "1000000000000000001"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "id": "1000000000000000001",
+            "assignmentTitle": "作业一",
+            "className": "课程一",
+            "assignmentEndTime": "2026-10-26 23:59",
+            "assignmentStatus": 0,
+            "submitInfo": {
+              "submitContent": "详情里的提交正文"
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/work/submit-view",
+        "query": {
+          "assignmentId": "1000000000000000001"
+        }
+      },
+      "response": {
+        "status": 500,
+        "json": {
+          "code": 500,
+          "msg": "synthetic boom synthetic-access-token xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/site/list/student/current",
+        "query": {
+          "current": "1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "siteId": "site-1",
+                "siteName": "课程一"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/ykt-site/work/student/list",
+        "json": {
+          "siteId": "site-1",
+          "userId": "synthetic-user",
+          "current": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "records": [
+              {
+                "activityId": "1000000000000000001",
+                "assignmentTitle": "作业一",
+                "assignmentStatus": 0,
+                "submitTime": "2026-10-22 16:26"
+              }
+            ],
+            "total": 1
+          }
+        }
+      }
+    }
+  ]
+}

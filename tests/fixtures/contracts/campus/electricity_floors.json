@@ -1,0 +1,16 @@
+{
+  "e": 0,
+  "m": "",
+  "d": {
+    "data": [
+      {
+        "floorName": "1层",
+        "floorId": "fixture-floor-1"
+      },
+      {
+        "floorName": "2层",
+        "floorId": "fixture-floor-2"
+      }
+    ]
+  }
+}

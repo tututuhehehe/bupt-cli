@@ -1,0 +1,18 @@
+{
+  "e": 0,
+  "m": "",
+  "d": {
+    "data": [
+      {
+        "partmentName": "沙河校区雁北园A楼",
+        "partmentId": "fixture-shahe-a",
+        "areaId": 2
+      },
+      {
+        "partmentName": "示例宿舍楼B",
+        "partmentId": "fixture-shahe-b",
+        "areaId": 2
+      }
+    ]
+  }
+}

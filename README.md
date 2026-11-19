@@ -1,8 +1,8 @@
 # bupt — 北邮校园命令行工具
 
-[English](README.en.md) | **简体中文**
+[English](README.en.md) | **简体中文** | [使用说明](使用说明.md)
 
-北京邮电大学校园服务的非官方命令行客户端，面向人和 agent 使用：每次调用输出一行 JSON，所有状态集中在 `~/.bupt-cli/`（权限 `0600`）。
+北京邮电大学校园服务的非官方命令行客户端，**原生 Rust 单文件二进制**，面向人和 agent 使用：每次调用输出一行 JSON（`schema: "bupt.v1"`），所有状态集中在 `~/.bupt-cli/`（目录 `0700`，文件 `0600`）。
 
 **MIT 开源。** 源码里不含任何账号、密码或会话，首次使用跑一次 `bupt login` 配置你自己的。
 
@@ -10,360 +10,154 @@
 
 ## 功能
 
-- **统一身份认证（CAS）登录**：交互式保存账号，一套账号密码通用于北邮各系统
-- **云邮教学空间（UCloud）**：课程列表、作业列表/详情/附件下载；提交需二次确认
-- **图书馆**（`opac.bupt.edu.cn`）：书目检索、馆藏位置、电子版链接。**匿名接口**，本科生研究生都能用
-- **研究生系统**（`yjxt.bupt.edu.cn`）：学期课表、教学日历、考试安排，以及 **`bupt schedule export`** 导出带真实日期的日历文件
+- **统一身份认证（CAS）登录**：交互式保存账号，一套密码通用于北邮各系统；只读命令按需建立会话，不重复提交密码
+- **云邮教学空间（UCloud）**：课程列表、作业列表/详情/附件下载、提交前预演与只读核验；真实提交需 `--i-confirm-submit`
+- **研究生教务（yjxt）**：学期课表、教学日历、考试安排、iCalendar 导出，全程**直连 HTTPS，不需要浏览器**
+- **本科教务（移动 JWGL）**：课表、考试、成绩、空教室
+- **图书馆**（`opac.bupt.edu.cn`）：书目检索、馆藏位置、电子版链接，**匿名可用**
 - **信息门户**（`my.bupt.edu.cn`）：通知公告、饭卡余额
-- **宿舍电费**（`app.bupt.edu.cn`）：沙河 / 西土城
-- **`bupt probe`**：全部接口的实时健康矩阵
-- **`bupt update` / `bupt uninstall`**：自我更新与卸载
+- **宿舍电费**（`app.bupt.edu.cn`）：沙河 / 西土城楼栋与余额
+- **`bupt diagnose`**：公开入口与会话的实时健康矩阵
+- **`bupt update --check` / `bupt uninstall`**：只读更新检查与保守卸载
 
-每个接口的实测状态与证据见 [API_STATUS.md](API_STATUS.md)。
+## 实测状态（macOS Apple Silicon，2026-11）
 
-## 适用范围（本科生 vs 研究生）
-
-2026-11 在研究生账号上实测：
-
-| 功能 | 本科生 | 研究生 |
+| 场景 | 状态 | 证据 |
 |---|---|---|
-| 云邮教学空间（`courses`、`homework *`） | ✓ | **✓** |
-| 信息门户（`notices`、`card`） | ✓ | **✓** |
-| 图书馆（`library *`） | ✓ | **✓** |
-| 宿舍电费 | ✓ | ✓ |
-| 研究生系统（`grad *`） | ✗ | **✓** |
-| 本科教务（`schedule`、`exams`、`scores`、`classrooms`） | ✓ | **✗ — 账号在该系统中不存在** |
+| `login`（研究生） | ✅ 实测 | 单次密码提交建立 CAS 会话 |
+| `courses` / `homework`（列表、`--course`、`--new`、`show`、`download`、`verify`、`submit --dry-run`） | ✅ 实测 | 11 门课；真实附件下载成功；已交作业只读核验通过 |
+| `schedule` / `schedule update` / `calendar` / `export`（研究生） | ✅ 实测 | 20 教学周、6 门课；ICS 96 个事件与文件一致；刷新约 0.8 秒 |
+| `exams`（研究生） | ✅ 实测 | 查询成功返回 0 条（当学期无考试） |
+| `library search` / `hold` / `ebook` | ✅ 实测 | 匿名；检索 3 条、馆藏 10 条 |
+| `electricity buildings --area xitucheng` | ✅ 实测 | 12 栋宿舍楼 |
+| `diagnose` | ✅ 实测 | 14 个端点：13 成功、1 跳过、0 失败 |
+| `update --check` / `uninstall --dry-run` / `logout` | ✅ 实测（隔离副本） | 不安装、不误删 |
+| 门户 `notices` / `card` | ⛔ 环境受限 | 测试机到 `my.bupt.edu.cn` HTTPS 不通，未验收 |
+| `electricity --area shahe` | ⛔ 上游异常 | 接口返回业务错误 `e=1`，非本机网络问题 |
+| 真实作业提交 | ⏳ 待验收 | 代码已接线且门禁开启，等待指定目标作业实测 |
+| Windows x64 | ⏳ 待验收 | 见下方「平台支持」 |
 
-`schedule` / `exams` / `scores` / `classrooms` 访问的是**本科**教务系统（`jwgl.bupt.edu.cn` / `jwglweixin.bupt.edu.cn`），研究生学号在里面**根本不存在**，所以这些命令对研究生账号一定失败。
+## 平台支持
 
-**不要因为报"密码错误"就反复换密码重试——连续失败会锁号。** 报错提示里已经明确说明这一点。
+当前发布 **macOS Apple Silicon** 单文件二进制。Windows x64 是既定目标（凭据存储、系统 `curl.exe` 调用、自替换已留好分支），但尚未实机验收；需要 Windows 的用户请等发布说明确认后再用。
 
-## 安装与运行
-
-### 方式一：源码运行（开发用）
-
-`./bupt-dev` 是源码直跑入口（**不是** `bupt`，避免盖住二进制）。它把 `PYTHONPATH` 指向 `src/` 和 `.deps/`，直接跑 CPython——**没有虚拟环境、没有 editable 安装、没有 `.pth` 指针**，所以不会出现"包莫名消失"。改完源码立刻验证用它：
-
-```bash
-cd /path/to/bupt-cli
-./bupt-dev --help
-```
-
-| 内容 | 位置 |
-|---|---|
-| 源码 | `src/`（直接加载，不安装） |
-| httpx + lxml | `.deps/`（一次性装好，与任何 venv 无关） |
-| 解释器 | uv 管理的 CPython 3.14（只读引用） |
-
-`.deps/` 万一丢了，重装一次：
-
-```bash
-uv pip install --python ~/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bin/python3.14 \
-  --target .deps 'httpx>=0.27.0' 'lxml>=5.0.0'
-```
-
-### 方式二：单文件二进制（macOS arm64，推荐）
+## 安装
 
 从 [Releases](https://github.com/tututuhehehe/bupt-cli/releases) 下载 `bupt-macos-arm64.zip`：
 
 ```bash
-unzip bupt-macos-arm64.zip && chmod +x bupt
-./bupt login
+unzip bupt-macos-arm64.zip && chmod +x bupt-macos-arm64/bupt
+bupt --version        # 期望输出 bupt 0.6.0
 ```
 
-或者自己构建（构建完直接装到项目根目录的 `./bupt`）：
+把二进制放进 PATH 即可（例如本仓库根目录；`~/.zshrc` 已把 `moon_cli_or_tool/*` 全部加入 PATH 的机器直接复制进去就行）。
+
+自己构建（产物进 `dist/bupt-macos-arm64.zip`，构建前先跑离线冒烟）：
 
 ```bash
-./build.sh             # -> ./bupt（约 16 MB，自包含）
-bupt --version         # 项目目录在 PATH 上，直接就是二进制
+./build-rust.sh          # macOS Apple Silicon
 ```
 
-二进制只链接系统 `libSystem` / `libz`，**不需要装 Python**。所有状态仍在 `~/.bupt-cli/`，二进制本身不携带任何数据。
-
-`./bupt` 是构建产物（已在 `.gitignore` 里），重跑 `./build.sh` 覆盖即可；`./build.sh --clean` 只清中间产物，不动已装好的 `./bupt`。构建先打到临时目录并冒烟测试，失败不会弄坏现有二进制。
-
-**本仓库不会把自己装进系统。** 想放到别处就自己拷：
-
-```bash
-cp bupt ~/.local/bin/bupt && chmod 755 ~/.local/bin/bupt
-sudo cp bupt /usr/local/bin/bupt          # 或系统级
-```
-
-卸载：
-
-```bash
-bupt uninstall             # 删除 PATH 上的 bupt，同时删除 ~/.bupt-cli
-bupt uninstall --keep-data # 保留 ~/.bupt-cli（账号密码与会话）
-bupt uninstall --dry-run   # 只显示会删什么
-```
-
-`uninstall` 有安全护栏：拒绝删除 `/`、家目录、当前目录及其上级，且要求目标目录里只有 bupt 自己的数据文件，避免环境变量写错时误删。
+二进制只依赖系统 `curl`，**不需要 Python、不需要浏览器、不读你的 Chrome 配置**。
 
 ## 配置账号
 
-凭据从环境变量或 `~/.bupt-cli/credentials.json` 读取。`bupt login` 会交互式询问并写入后者（权限 `0600`）。
-
 ```zsh
-$ bupt login
-配置文件: /Users/you/.bupt-cli/credentials.json
+$ bupt login --role graduate
 学号：2026xxxxxx
 密码（输入时不显示）：
-身份（1=研究生 2=本科生）：1
 ```
 
-优先级：
+- 凭据只存 `~/.bupt-cli/credentials.json`（权限 `0600`）。**不再支持 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE` 环境变量**——环境里只有这些变量时命令会明确报 auth。
+- `role` 取 `graduate` 或 `undergraduate`，决定教务命令走哪条数据源。
+- `~/.bupt-cli/session.json` 等同于凭据（含 Cookie/token，不含密码），请当作机密保管。
+- `bupt status` 只显示脱敏元数据；`bupt logout` 删除凭据与会话，保留课表快照与宿舍设置。
 
-1. 环境变量（最高）
+### 宿舍电费默认值
 
-   ```bash
-   export BUPT_USERNAME=2026xxxxxx
-   export BUPT_PASSWORD='...'
-   ```
-
-2. `~/.bupt-cli/credentials.json`（权限 `0600`）
-
-   ```json
-   {
-     "username": "2026xxxxxx",
-     "password": "统一身份认证密码",
-     "role": "graduate"
-   }
-   ```
-
-   `role` 取 `graduate` 或 `undergraduate`，决定哪些教务命令可用。
-
-非交互模式（脚本用；密码会进 shell 历史，不推荐）：
+`bupt electricity` 不带参数时使用**示例占位符**（西土城 学一楼 101），查询前请指定自己的宿舍：
 
 ```bash
-bupt login --user 2026xxxxxx --password '...' --role graduate
+bupt electricity --building 学5 --room 416
+bupt electricity buildings --area shahe        # 或 xitucheng
 ```
 
-可选环境变量：
+楼/房间/楼层独立解析，优先级：**命令行参数 > 环境变量（`BUPT_DORM_BUILDING/ROOM/FLOOR`）> `~/.bupt-cli/config.json` > 占位符**。传 `--building` 必须同时传 `--room`。
+
+其他可用环境变量：
 
 | 变量 | 含义 |
 |---|---|
-| `BUPT_DORM_BUILDING` / `BUPT_DORM_ROOM` / `BUPT_DORM_FLOOR` | `bupt electricity` 的默认宿舍 |
-| `BUPT_CLI_CONFIG_DIR` | 覆盖配置目录（默认 `~/.bupt-cli`） |
-| `BUPT_CLI_CACHE_DIR` | 覆盖会话缓存目录（默认 `~/.bupt-cli`） |
-| `BUPT_MAX_CAS_LOGINS` | 单进程 CAS 登录上限（默认 5），防止反复登录锁号 |
-
-密码、Cookie、UCloud token 不会被任何命令打印。`bupt status` 只显示脱敏元数据（域名/条数、是否存在、过期时间）。**`~/.bupt-cli/session.json` 等同于凭据**：里面有会话 Cookie 和 token（不含密码），请当作机密保管。
-
-### 宿舍电费的默认值
-
-`bupt electricity` 不带参数时用的是**示例占位符**（西土城 学一楼 101），不是任何真实用户的宿舍。查询前请改成自己的：
-
-```bash
-bupt electricity --building 学一楼 --room 101 --pretty
-bupt electricity --building SHAHE_A --room 102 --pretty
-bupt electricity buildings --area xitucheng --pretty   # 列出西土城宿舍楼
-bupt electricity buildings --area shahe --pretty       # 列出沙河宿舍楼
-```
-
-每个字段（楼/房间/楼层）独立解析，顺序为：**命令行参数 > 环境变量 > `~/.bupt-cli/config.json` > 内置占位符**
-
-```json
-{"dorm": {"building": "学一楼", "room": "101", "floor": "1"}}
-```
-
-- 输出里的 `"source"`（`flag` / `env` / `config` / `default`）表示**房间号**来自哪里
-- 楼名支持 `学五楼` / `学5楼` / `学5` / `5` 和沙河的 `SHAHE_A` / `沙河校区雁北园A楼`，校区由楼名自动推断
-- 传了 `--building` 就必须同时传 `--room`，否则退出 2
-- `config.json` 写坏会阻塞查电（退出 2），但**不影响** `buildings` 列楼
+| `BUPT_CLI_CONFIG_DIR` / `BUPT_CLI_CACHE_DIR` | 覆盖配置/缓存目录（默认 `~/.bupt-cli`） |
+| `BUPT_CLI_REPO` | `update` 的默认 GitHub 仓库（`OWNER/REPO`，可用 `--repo` 覆盖） |
 
 ## 命令一览
 
-所有命令向 stdout 输出紧凑 JSON，任意位置加 `--pretty` 缩进。错误走 stderr，格式 `{"ok":false,"error":{"type":"...","message":"...","hint":"..."}}`。
+所有命令向 stdout 输出紧凑 JSON，任意位置加 `--pretty` 缩进。错误走 stderr：`{"schema":"bupt.v1","ok":false,"error":{"type":"...","message":"...","hint":"..."}}`，退出码分层：
+
+| 退出码 | 层 | 含义 |
+|---|---|---|
+| 0 | — | 成功 |
+| 2 | usage | 参数/本地配置非法，发生在联网之前 |
+| 3 | auth | 无凭据、会话过期或被拒；提示 `bupt login` |
+| 4 | network | 连接失败/超时 |
+| 5 | upstream | 校园接口返回异常或结构变化 |
+| 6 | — | 提交结果不明（绝不自动重发） |
+| 7 | — | 提交后核验失败/出错 |
 
 | 命令 | 说明 |
 |---|---|
-| `bupt login [--user ID] [--password PASS] [--role ROLE] [--force] [--jwgl]` | 保存账号到 `~/.bupt-cli/credentials.json` 并登录。无参数时交互式询问。`--jwgl` 额外尝试移动教务登录（仅本科） |
-| `bupt status [--check]` | 显示缓存会话是否有效（不含机密）。`--check` 做只读在线检查 |
-| `bupt logout` | 删除 `~/.bupt-cli/session.json` |
-| `bupt courses` | 当前云邮教学空间课程（自动翻页取全） |
-| `bupt homework list [--undone] [--course ID] [--new DAYS] [--limit N]` | 作业列表，按截止时间排序。`--undone` 只看未交；`--new N` 只看最近 N 天发布的 |
-| `bupt homework show ID [--course SITE_ID]` | 作业详情：提交状态、正文全文、附件地址 |
-| `bupt homework download ID [--dir DIR] [--force]` | 下载教师附件到 `DIR` |
-| `bupt homework submit ID [--file PATH]… [--text …] [--dry-run \| --i-confirm-submit] [--no-verify]` | 上传/提交。**默认绝不自动提交；不带 `--i-confirm-submit` 时连文件都不上传** |
-| `bupt homework verify ID [--resource-id RID]… [--text TEXT]` | 只读核验提交是否可见，不调用任何写接口。不给参数只查"有没有交"，给了才精确比对附件/正文 |
-| `bupt library search KEYWORD [--page N] [--page-size N] [--location CAMPUS] [--with-ebook]` | 图书馆书目检索（匿名）。`--with-ebook` 标出有电子版的记录 |
-| `bupt library hold RECCTRLID` | 某本书的各馆藏位置：部门、条码、索书号、状态 |
-| `bupt library ebook RECCTRLID` | 某本书的电子资源链接 |
-| `bupt schedule` | **本周课表**（读本地缓存，毫秒级）。`--today` / `--tomorrow` / `--date` / `--week N` 查指定日期；`--raw` 看原始课程网格；缓存过期自动重抓 |
-| `bupt schedule update` | 刷新 `~/.bupt-cli/timetable.json`。研究生走浏览器（4-8 秒），本科生走移动教务 API |
-| `bupt schedule export [--out PATH]` | 导出 iCalendar 文件（默认 `~/Downloads/bupt-<学期>.ics`），每次上课一个事件 |
-| `bupt schedule calendar` | 教学周 → 日期的对照表 |
-| `bupt schedule exams` | 考试安排（仅研究生系统，常为空） |
-| `bupt electricity [--building B] [--room R] [--floor F] [--threshold N]` | 宿舍电费余额 |
-| `bupt electricity buildings [--area shahe\|xitucheng]` | 列出某校区的宿舍楼 |
-| `bupt notices [--type notice,news,rules,ways] [--count N]` | 门户通知。校外常不可达 |
-| `bupt notices show URL` | 通知正文 |
+| `bupt login --role graduate\|undergraduate [--user ID] [--password PASS]` | 注册并验证账号；`--role` 必填，学号/密码缺省时交互式询问 |
+| `bupt status` | 本地账号与会话状态（脱敏，不联网） |
+| `bupt logout` | 删除凭据与会话，保留课表与设置 |
+| `bupt diagnose [--only public,cas,ucloud]` | 服务可用性矩阵；不提交密码、不写会话 |
+| `bupt courses` | 云邮教学空间全部课程 |
+| `bupt homework [--undone] [--course ID] [--new DAYS] [--limit N]` | 作业列表（默认全部，按截止时间排序） |
+| `bupt homework show ID [--course SITE_ID]` | 作业详情：提交状态、正文、附件 |
+| `bupt homework download ID [--dir DIR] [--force]` | 下载教师附件（≤8 MiB/个，只写指定目录） |
+| `bupt homework submit ID --dry-run` | 预演：读取详情与提交状态，展示将上传/提交的内容，零写入 |
+| `bupt homework submit ID --i-confirm-submit [--file PATH]… [--text …]` | 真实上传并提交**恰好一次**；失败/断连不自动重发，只提示用 `verify` 核查 |
+| `bupt homework verify ID [--resource-id RID]… [--text TEXT]` | 只读核验提交是否可见；不带参数只查「有没有交」 |
+| `bupt schedule [--today\|--tomorrow\|--date YYYY-MM-DD\|--week N] [--raw]` | 读本地课表快照（毫秒级）；学期内不自动重抓 |
+| `bupt schedule update` | 主动刷新快照；研究生走直连 HTTPS（约 0.8 秒），本科走移动教务 |
+| `bupt schedule calendar` | 教学周 → 日期对照 |
+| `bupt schedule export [--out PATH]` | 导出 iCalendar（默认 `~/Downloads/bupt-<学期>.ics`） |
+| `bupt exams` | 考试安排，按身份路由数据源；空结果与解析失败严格区分 |
+| `bupt scores` / `bupt classrooms [--campus 01\|04]` | 本科成绩 / 空教室 |
+| `bupt library search KEYWORD [--page N] [--page-size N] [--location CAMPUS] [--with-ebook]` | 匿名书目检索 |
+| `bupt library hold RECCTRLID` / `bupt library ebook RECCTRLID` | 馆藏位置 / 电子资源链接 |
+| `bupt electricity [--building B] [--room R] [--floor F] [--threshold N]` | 宿舍电费余额；传 `--building` 必须同时传 `--room` |
+| `bupt electricity buildings [--area shahe\|xitucheng]` | 宿舍楼列表 |
+| `bupt notices [--type notice,news,rules,ways] [--count N]` / `bupt notices show URL` | 门户通知（需校园网络路由） |
 | `bupt card` | 饭卡余额 |
-| `bupt exams` / `bupt scores [--semester NAME]` / `bupt classrooms [--campus 01\|04]` | 本科教务（实验性，研究生不可用） |
-| `bupt probe [--only GROUPS]` | 接口健康矩阵 |
-| `bupt update [--check] [--repo OWNER/REPO]` | 与最新 release 比对并原位替换二进制（保留 `bupt.old`） |
-| `bupt uninstall [--keep-data] [--dry-run]` | 卸载 |
-| `bupt help [command]` | `--help` 的别名，例如 `bupt help schedule` |
+| `bupt update --check [--repo OWNER/REPO]` | 只读检查新版本；安装只对带发布标记的 macOS 构建开放 |
+| `bupt uninstall [--keep-data] [--dry-run]` | 保守卸载：拒绝危险根目录、symlink、混合目录 |
 
-### 会话复用与锁号安全
+保留字段、删除别名：`probe`→`diagnose`、`homework list`→`homework`、`schedule exams`→`exams`、`status --check`、`login --jwgl` 不再存在。
 
-`bupt login` 会缓存 Cookie 和 token，后续命令复用，只在必要时重新登录。CAS 有登录次数上限，单进程内默认 5 次（`BUPT_MAX_CAS_LOGINS`）。
+## 隐私与安全设计
 
-**不要在短时间内反复 `login`。** 报错时先看 `type` 和 `hint`，不要盲目重试。
+- 凭据与会话文件全部 `0600`（所在目录 `0700`），写入走「临时文件 + 原子改名」，拒绝 symlink 与过宽权限
+- 所有请求走系统 `curl`（参数经 stdin 配置，命令行不出现密码/票据/Cookie）
+- 校外跳转逐个校验：CAS/教务/门户/电费各自只接受已验证的 HTTPS 主机；站点宣告的 HTTP 一律升级，绝不降级
+- 研究生教务**不启动浏览器**、不执行站点脚本、不读取浏览器配置
+- 作业提交默认只读；`--dry-run` 零写入；确认后至多一次提交，结果不明时退出 6 并指向只读核验
+- 卸载有护栏：只删「bupt 自己的」数据，混合目录整目录跳过并如实报告
 
-### 提交作业
+## 已知限制
 
-工具默认**不会自动提交**：
+- 门户 `notices`/`card` 依赖校园网到 `my.bupt.edu.cn` 的路由，校外或路由不通时报 network 4
+- 沙河电费楼栋接口当前返回上游业务错误（`e=1`），西土城正常
+- 真实提交与 Windows 版本尚未完成实机验收（见实测状态表）
 
-```bash
-# 1. 先 dry-run：只校验参数、显示将要提交的内容，不上传不提交
-bupt homework submit ID --file ./答案.pdf --text '说明' --dry-run --pretty
+## 与 Python 版（`d7c35ef`）的差异
 
-# 2. 你自己核对预览内容，确认后才加 --i-confirm-submit
-bupt homework submit ID --file ./答案.pdf --text '说明' --i-confirm-submit --pretty
-```
-
-- **每次真正提交都会发送完整正文和全部附件，并覆盖上一次提交。** 有多个文件时每次都要全部带上
-- 提交后工具会做只读核验：`verified: true` + 退出 0 表示确认；退出 6 表示未能确认；退出 7 表示核验过程本身失败。这两种情况请用 `bupt homework show` 或 `bupt homework verify` 复查，**不要盲目重交**
-- 没有 `--i-confirm-submit` 时工具会拒绝真正提交（退出码 2）
-
-核验逻辑：提交成功后用只读接口再确认一次——`submit-view`（附件集合、正文）和 `student/list`（`submitTime`）。最多尝试 2 次，每次前等待 5 秒；`--no-verify` 跳过核验。
-
-底层接口：
-
-- 上传 `POST https://apiucloud.bupt.edu.cn/blade-source/resource/upload/biz`
-- 提交 `POST https://apiucloud.bupt.edu.cn/ykt-site/work/submit`
-- 查看已交 `GET …/ykt-site/work/submit-view?assignmentId=…`
-- 作业详情 `/ykt-site/work/detail` **不含**学生自己的提交信息，所以 `show` 改从 `submit-view` 读 `submitted` / `submit_content` / `submit_attachments`，再用 `student/list` 的 `submitTime` 补 `submitted_at`；`submit-view` 失败时命令照常成功并带 `submit_view_error`
-- 附件在 `assignmentResource` 字段（不是 `attachmentList`）；`show` 通过 `/blade-source/resource/preview-url` 把 `resourceId` 解析成 `fileucloud.bupt.edu.cn` 下载链接。**CDN 不能带 Blade-Auth，否则 400**
-
-> 本仓库验证时只做了 `--dry-run`，**没有对真实作业执行过提交**。
-
-## 课表与本地缓存
-
-课表查询走**本地缓存**，第一次执行抓取整个学期并写入 `~/.bupt-cli/timetable.json`，之后查询都是读文件（约 0.1 秒，不开浏览器）。
-
-```bash
-bupt schedule                 # 本周
-bupt schedule --today         # 今天
-bupt schedule --tomorrow      # 明天
-bupt schedule --date 2026-11-20
-bupt schedule --week 12       # 第 12 周
-bupt schedule --raw           # 原始课程网格（不分日期）
-bupt schedule update          # 刷新缓存
-bupt schedule export          # 导出 .ics 到 ~/Downloads
-bupt schedule calendar        # 教学周 → 日期对照表
-bupt schedule exams           # 考试安排
-```
-
-**两种身份都支持**，命令相同，数据源按 `role` 自动选择：
-
-| 身份 | 数据源 | 抓取耗时 |
-|---|---|---|
-| 研究生（`role: graduate`） | `yjxt.bupt.edu.cn`，经无头 Chrome 过瑞数 | 4–8 秒 |
-| 本科生（`role: undergraduate`） | 移动教务 JSON API | 约 1 秒 |
-
-### 缓存什么时候释放
-
-`~/.bupt-cli/` 常驻 3 个文件，总共约 20 KB：
-
-| 文件 | 大小 | 说明 | 何时释放 |
-|---|---|---|---|
-| `credentials.json` | <100 B | 账号配置，不是缓存 | 只在 `uninstall`（或 `--keep-data` 时保留） |
-| `session.json` | 约 6 KB | Cookie 与 token | `bupt logout`，或 `uninstall` |
-| `timetable.json` | 约 7 KB | 课表缓存 | 会被下次抓取**覆盖**，不累积 |
-
-两个要点：
-
-1. **不会无限增长。** 三个文件都是整份覆盖写（`os.replace`），不是追加日志。用得再久，占用的也还是这 20 KB。
-2. **过期不会自动删文件，只会自动重抓。** 会话过期后命令会重新登录并覆盖 `session.json`；课表过期后下次查询重抓并覆盖 `timetable.json`。旧学期的课表不会留在磁盘上——始终只有一个学期的。
-
-唯一可能变大的是**无头 Chrome 的临时 profile**（6–150 MB），它不在 `~/.bupt-cli/` 而在系统临时目录：
-
-- 正常结束：`Driver.close()` 删除
-- Ctrl-C：`atexit` 兜底删除
-- 被 `kill -9`（或断电）：进程无法执行任何代码，会遗留；**下次运行 `bupt schedule update` 时自动清扫 6 小时前的遗留目录**
-
-### 缓存何时失效
-
-缓存里存了 `term` 和完整的周→日期表。**今天不在缓存的任何教学周内**（学期结束、换学期）时视为过期，下次查询自动重抓；**学期中途调课或新增不会自动发现**，请用 `bupt schedule update` 手动刷新。
-
-缓存文件损坏或版本不符会被忽略并重建，不会报错。
-
-### 日期是从哪来的
-
-- 研究生：`TermCalender.aspx` 教学日历页，**权威数据**（2026-2027 秋学期第 1 周 = 2026-08-31）
-- 本科生：移动教务 `get_curriculum()` 返回的 `SjdDay`，每个教学周都带 `zc`（周次）和 `mxrq`（真实日期）
-
-两条路都**不靠推算**。
-
-> ⚠️ **本科生那条路尚未在真实账号上验证**（写这段代码时没有本科生账号）。数据模型是从 vendored SDK 读出来的，但"一次调用是否返回全部教学周"这点未验证。你在本科账号上跑一次 `bupt schedule update`，然后 `bupt schedule calendar` 检查周数是否合理即可判断。
-
-### 研究生系统的技术细节
-
-研究生系统位于**瑞数（Riversafe）**动态防护之后，纯 HTTP 客户端拿不到数据，所以用无头 Chrome：
-
-- 只依赖系统里的 **Google Chrome**，不需要 Playwright / Selenium / agent-browser——本项目自己写了 CDP 客户端（`src/bupt_cli/cdp.py`，仅标准库）
-- 无头模式的关键：默认无头 UA 含 `HeadlessChrome`，CAS 页会**拒绝渲染登录表单**，必须覆盖成桌面 UA
-- 上课时间来自课表页的固定作息表：第 1 节 08:00–08:45 … 第 15 节 21:00–21:45
-
-## 错误与退出码
-
-| 退出码 | `error.type` | 含义 |
-|---|---|---|
-| 0 | — | 成功（`ok:true`） |
-| 2 | `usage` | 命令行参数错误 |
-| 3 | `auth` | 凭据缺失/无效，或会话失效 |
-| 4 | `network` | DNS / TLS / 连接失败 / 超时 |
-| 5 | `parse` / `not_found` / `upstream` | 上游返回或解析问题 |
-| 6 | —（`verification.status=failed`） | 提交报成功但只读核验未能确认（`verified:false`）；stdout 仍是 `ok:true`，请手动核对，**不要盲目重交** |
-| 7 | —（`verification.status=error`） | 提交报成功但核验无法执行（`verified:null`）；请手动核对 |
-
-错误信息里已知的机密值会被脱敏。usage 错误也是 JSON（不是 argparse 的散文），`--help` 仍是普通文本。
-
-## 测试
-
-纯离线，不需要网络和凭据：
-
-```bash
-PYTHONPATH=src:.deps ~/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bin/python3.14 -m pytest
-```
-
-当前 **190 个测试**，覆盖：时间解析、过滤、附件归一化、`homework list --new` 的过滤与降级、Cookie 往返、会话文件权限与脱敏、凭据优先级、CLI 错误信封与退出码、电费默认宿舍优先级与 `buildings`、提交后核验（退出码 6/7）、图书馆解析、研究生课表/日历/iCalendar（含跨年周）、CDP WebSocket 协议（假服务端，11 个场景）、自我更新（含 frozen 原位替换）、卸载护栏。
-
-## 已知限制（2026-11 实测）
-
-- `my.bupt.edu.cn` 在公共 DNS 上解析到校内私网地址 `10.3.55.84`。校外 HTTP 超时、HTTPS TLS 被重置 → `notices` / `card` 校外不可用。这是网络范围限制，**不是接口改版**。WebVPN（`webvpn.bupt.edu.cn`）可访问，但用户名密码登录处于维护中（仅支持企业微信扫码），本 CLI 无法代登
-- `jwgl.bupt.edu.cn` / `jwxt.bupt.edu.cn` 在校园网外 TLS 重置 → DOM 课表/成绩不可用
-- `jwglweixin.bupt.edu.cn` 仅 HTTPS 可达。该后端是**本科**教务，研究生账号不存在，请改用 `bupt schedule`
-- 云邮附件在 `assignmentResource` 字段（不是 `attachmentList`），vendored 解析器已打补丁
-- 研究生系统有瑞数防护，必须真实浏览器；**无头模式必须覆盖 UA**，且 CAS 表单在 iframe 内，点击要从 iframe 内部派发
-- 图书馆电子版覆盖率偏向英文书（英文科技书约八成有，老中文教材基本没有）
-- 二进制目前只构建 macOS arm64
+- 单文件原生二进制取代 PyInstaller 打包；不再需要 Python 运行时
+- 研究生教务从「无头 Chrome/CDP」改为直连 HTTPS，快约 4 倍，零浏览器依赖
+- 凭据只从 `credentials.json` 读取，环境变量回退已移除
+- `homework` 默认即列表；`exams` 按身份自动路由；`probe` 更名 `diagnose` 且不提交密码
+- 版本从 0.5.x 起跳至 **0.6.0**；旧 Python 版完整保留在 git 历史 `d7c35ef`
 
 ## 致谢
 
-本项目的接口与协议细节来自其他人的逆向工作：
-
-### 直接复用代码
-
-| 项目 | 许可 | 说明 |
-|---|---|---|
-| [Windy-Dance/campus-api](https://github.com/Windy-Dance/campus-api) | MIT | **已 vendored 并适配**到 `src/bupt_cli/_vendor/campus_api/`：CAS 登录、UCloud BladeX token 交换、电费、门户、移动教务客户端。许可证文本见 `src/bupt_cli/_vendor/campus_api/LICENSE`，完整声明见 [NOTICE](NOTICE) |
-
-### 接口调研参考（未拷贝代码）
-
-| 项目 | 许可 | 借鉴了什么 |
-|---|---|---|
-| [uarix/BUPT-API-Collection](https://github.com/uarix/BUPT-API-Collection) | MIT（声明；仓库无 LICENSE 文件） | 图书馆 OPAC 接口形态 |
-| [wzekin/bupt-api](https://github.com/wzekin/bupt-api) | MIT | 早期证据：CAS 表单在隐藏字段后明文提交密码 |
-| [Yokumii/bupt-api-collected](https://github.com/Yokumii/bupt-api-collected) | Apache-2.0 | 移动教务是 AES 而非 CAS；考试成绩接口名 |
-| ZeroCore-Zero/BUPT_APIS、YouXam/ucloud | MIT | 端点线索 |
-
-研究生系统接入（`bupt schedule`）、图书馆客户端、iCalendar 导出、无头 CDP 驱动与瑞数应对是为本项目写的，均在 2026-11 实测验证。
-
-如果要从本仓库拷贝代码，请同时遵守上游项目的许可。
-
-## 许可
-
-MIT，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。vendored 的 campus-api 同样是 MIT。
+接口知识来自社区整理与上游项目（[campus-api](https://github.com/Windy-Dance/campus-api)、[BUPT-API-Collection](https://github.com/uarix/BUPT-API-Collection)、[bupt-api](https://github.com/wzekin/bupt-api)、[bupt-api-collected](https://github.com/Yokumii/bupt-api-collected)），移植中逐项重新实测。MIT 许可见 [LICENSE](LICENSE)。

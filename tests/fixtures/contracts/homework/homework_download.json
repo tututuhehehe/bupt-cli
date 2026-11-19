@@ -1,0 +1,103 @@
+{
+  "schema": "bupt.contract-replay.v1",
+  "session": {
+    "username": "synthetic-student",
+    "role": "undergraduate",
+    "access_token": "synthetic-access-token",
+    "user_id": "synthetic-user"
+  },
+  "now": "2026-11-18T12:00:00",
+  "exchanges": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/ykt-site/work/detail",
+        "query": {
+          "assignmentId": "1000000000000000003"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "id": "1000000000000000003",
+            "assignmentTitle": "资料下载",
+            "className": "课程三",
+            "assignmentStatus": 99,
+            "assignmentEndTime": "2026-12-01 23:59",
+            "assignmentResource": [
+              {
+                "resourceId": "att-1",
+                "resourceName": "作业要求.pdf"
+              },
+              {
+                "resourceId": "att-2",
+                "resourceName": "data.csv"
+              },
+              {
+                "resourceName": "没有资源编号.txt"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/blade-source/resource/preview-url",
+        "query": {
+          "resourceId": "att-1"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "previewUrl": "https://fileucloud.bupt.edu.cn/ucloud/document/att-1-hash.pdf?response-content-disposition=attachment%3Bfilename%3D%E4%BD%9C%E4%B8%9A%E8%A6%81%E6%B1%82.pdf"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/blade-source/resource/preview-url",
+        "query": {
+          "resourceId": "att-2"
+        }
+      },
+      "response": {
+        "status": 200,
+        "json": {
+          "code": 200,
+          "data": {
+            "previewUrl": "https://fileucloud.bupt.edu.cn/ucloud/document/att-2-hash.csv?response-content-disposition=attachment%3Bfilename%3Ddata.csv"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://fileucloud.bupt.edu.cn/ucloud/document/att-1-hash.pdf?response-content-disposition=attachment%3Bfilename%3D%E4%BD%9C%E4%B8%9A%E8%A6%81%E6%B1%82.pdf"
+      },
+      "response": {
+        "status": 200,
+        "body": "synthetic teacher pdf\n"
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "url": "https://fileucloud.bupt.edu.cn/ucloud/document/att-2-hash.csv?response-content-disposition=attachment%3Bfilename%3Ddata.csv"
+      },
+      "response": {
+        "status": 200,
+        "body": "a,b\n1,2\n"
+      }
+    }
+  ]
+}

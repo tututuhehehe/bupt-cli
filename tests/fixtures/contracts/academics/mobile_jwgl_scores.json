@@ -1,0 +1,42 @@
+{
+  "code": "1",
+  "Msg": "synthetic ok",
+  "data": [
+    {
+      "studentID": 20260001,
+      "pjcj": "87.25",
+      "xqgpa": [
+        {
+          "term": "2025-2026-2",
+          "gpa": 3.75
+        }
+      ],
+      "achievement": [
+        {
+          "courseName": "合成课程一",
+          "kcbh": "A01",
+          "credit": "3.5",
+          "curriculumAttributes": "必修",
+          "courseNature": "专业课",
+          "examinationNature": "正常考试",
+          "fraction": "90",
+          "cjbs": "",
+          "curSemesterName": "2025-2026-2",
+          "cj0708id": "score-1"
+        },
+        {
+          "courseName": "合成课程二",
+          "kcbh": "A02",
+          "credit": null,
+          "curriculumAttributes": "选修",
+          "courseNature": "通识课",
+          "examinationNature": "正常考试",
+          "fraction": 85,
+          "cjbs": "缓考",
+          "curSemesterName": "2025-2026-1",
+          "cj0708id": "score-2"
+        }
+      ]
+    }
+  ]
+}
