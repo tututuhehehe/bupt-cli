@@ -2250,7 +2250,7 @@ mod tests {
                 302,
                 &[(
                     "location",
-                    "https://github.com/owner/repo/releases/tag/v0.0.1",
+                    "https://github.com/owner/repo/releases/tag/v99.0.0",
                 )],
             )),
         );
@@ -2259,7 +2259,7 @@ mod tests {
         assert_eq!(outcome.code, 0);
         assert_eq!(outcome.data["current"], json!(env!("CARGO_PKG_VERSION")));
         assert_eq!(outcome.data["repo"], json!("owner/repo"));
-        assert_eq!(outcome.data["latest"], json!("0.0.1"));
+        assert_eq!(outcome.data["latest"], json!("99.0.0"));
         assert_eq!(outcome.data["update_available"], json!(true));
         assert!(
             outcome.data["note"]
@@ -2452,7 +2452,7 @@ mod tests {
             ("1.2.2", "1.2.3", false),
             ("1.2", "1.2.0", false),
             ("1.2.3.4", "1.2.3", false),
-            ("0.0.1", "0.0.0", true),
+            ("99.0.0", "0.0.0", true),
             ("0.0", "0.0.0", false),
             ("nightly", "0.0.0", false),
         ] {
@@ -2475,7 +2475,7 @@ mod tests {
         let backup_text = backup.to_string_lossy().into_owned();
 
         let mut transport = Scripted::default();
-        script_apply(&mut transport, "owner/repo", "v0.0.1", &payload);
+        script_apply(&mut transport, "owner/repo", "v99.0.0", &payload);
         let outcome = run_update(
             root.path(),
             &mut transport,
@@ -2486,7 +2486,7 @@ mod tests {
         .expect("apply the fixture update");
 
         assert_eq!(outcome.code, 0);
-        assert_eq!(outcome.data["latest"], json!("0.0.1"));
+        assert_eq!(outcome.data["latest"], json!("99.0.0"));
         assert_eq!(outcome.data["update_available"], json!(true));
         assert_eq!(outcome.data["installed_to"], json!(target_text));
         assert_eq!(outcome.data["backup"], json!(backup_text));
@@ -2507,7 +2507,7 @@ mod tests {
         assert!(
             transport.calls[1]
                 .url
-                .ends_with(&format!("/releases/download/v0.0.1/{}", test_asset()))
+                .ends_with(&format!("/releases/download/v99.0.0/{}", test_asset()))
         );
     }
 
@@ -2526,7 +2526,7 @@ mod tests {
         script_apply(
             &mut transport,
             "owner/repo",
-            "v0.0.1",
+            "v99.0.0",
             &native_payload("new"),
         );
         let error = assert_upstream(expect_error(
@@ -2612,7 +2612,7 @@ mod tests {
             script_apply(
                 &mut transport,
                 "owner/repo",
-                "v0.0.1",
+                "v99.0.0",
                 &native_payload("new"),
             );
             let error = assert_upstream(expect_error(
@@ -2662,7 +2662,7 @@ mod tests {
         script_apply(
             &mut transport,
             "owner/repo",
-            "v0.0.1",
+            "v99.0.0",
             &native_payload("new"),
         );
         let error = assert_upstream(expect_error(
@@ -2755,7 +2755,7 @@ mod tests {
             let target = fixture_target(root.path());
             let original = fs::read(&target).expect("read fixture target");
             let mut transport = Scripted::default();
-            script_release(&mut transport, "owner/repo", "v0.0.1", asset_response);
+            script_release(&mut transport, "owner/repo", "v99.0.0", asset_response);
             let error = expect_error(
                 run_update(
                     root.path(),
@@ -2796,7 +2796,7 @@ mod tests {
             script_apply(
                 &mut transport,
                 "owner/repo",
-                "v0.0.1",
+                "v99.0.0",
                 &native_payload("new"),
             );
             let error = assert_upstream(expect_error(
@@ -2824,7 +2824,7 @@ mod tests {
         script_apply(
             &mut transport,
             "owner/repo",
-            "v0.0.1",
+            "v99.0.0",
             &native_payload("new"),
         );
         let fs = FaultFs {
@@ -2855,7 +2855,7 @@ mod tests {
         script_apply(
             &mut transport,
             "owner/repo",
-            "v0.0.1",
+            "v99.0.0",
             &native_payload("new"),
         );
         let fs = FaultFs {
@@ -2888,7 +2888,7 @@ mod tests {
         script_apply(
             &mut transport,
             "owner/repo",
-            "v0.0.1",
+            "v99.0.0",
             &native_payload("new"),
         );
         let fs = FaultFs {
@@ -2924,7 +2924,7 @@ mod tests {
         script_apply(
             &mut transport,
             "owner/repo",
-            "v0.0.1",
+            "v99.0.0",
             &native_payload("new"),
         );
         let fs = FaultFs {
@@ -2956,7 +2956,7 @@ mod tests {
         script_apply(
             &mut transport,
             "owner/repo",
-            "v0.0.1",
+            "v99.0.0",
             &native_payload("new"),
         );
         let outcome = run_update(
@@ -2968,7 +2968,7 @@ mod tests {
         )
         .expect("a source build must report that it did not install");
         assert_eq!(outcome.code, 0);
-        assert_eq!(outcome.data["latest"], json!("0.0.1"));
+        assert_eq!(outcome.data["latest"], json!("99.0.0"));
         assert_eq!(outcome.data["update_available"], json!(true));
         assert_eq!(outcome.data["installed_to"], json!(null));
         assert!(

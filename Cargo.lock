@@ -22,7 +22,7 @@ checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "bupt"
-version = "0.0.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "cookie_store",
