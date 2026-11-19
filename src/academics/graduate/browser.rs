@@ -683,23 +683,53 @@ fn http_get(port: u16, path: &str, timeout: Duration) -> Result<String, String> 
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     )
     .map_err(|e| e.to_string())?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| e.to_string())?;
-    let split = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
-    let status = String::from_utf8_lossy(&response[..split]);
-    if !status
-        .lines()
-        .next()
-        .is_some_and(|line| line.contains(" 200 "))
-    {
-        return Err("Chrome debug endpoint returned a non-200 status".to_string());
+    read_devtools_response(BufReader::new(stream))
+}
+
+fn read_devtools_response(mut reader: impl BufRead) -> Result<String, String> {
+    const MAX_HEADERS: u64 = 32 * 1024;
+    const MAX_BODY: usize = 1024 * 1024;
+    let invalid = || "malformed Chrome debug HTTP response".to_owned();
+    let mut length = None;
+    let mut remaining = MAX_HEADERS;
+    let mut first = true;
+    loop {
+        let mut line = Vec::new();
+        let size = reader
+            .by_ref()
+            .take(remaining)
+            .read_until(b'\n', &mut line)
+            .map_err(|e| e.to_string())?;
+        remaining -= size as u64;
+        let line = line.strip_suffix(b"\r\n").ok_or_else(invalid)?;
+        let line = std::str::from_utf8(line).map_err(|_| invalid())?;
+        if first {
+            let mut status = line.split_ascii_whitespace();
+            if !matches!(status.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+                || status.next() != Some("200")
+            {
+                return Err("Chrome debug endpoint returned a non-200 status".into());
+            }
+            first = false;
+        } else if line.is_empty() {
+            break;
+        } else {
+            let (name, value) = line.split_once(':').ok_or_else(invalid)?;
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err(invalid());
+            }
+            if name.eq_ignore_ascii_case("content-length") {
+                if length.is_some() {
+                    return Err(invalid());
+                }
+                length = Some(value.trim().parse::<usize>().map_err(|_| invalid())?);
+            }
+        }
     }
-    Ok(String::from_utf8_lossy(&response[split + 4..]).to_string())
+    let length = length.filter(|n| *n <= MAX_BODY).ok_or_else(invalid)?;
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).map_err(|e| e.to_string())?;
+    String::from_utf8(body).map_err(|_| invalid())
 }
 
 struct Ws {
@@ -1043,6 +1073,48 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devtools_http_reads_the_body_without_waiting_for_connection_close() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let stream = reader.get_mut();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n[]",
+                )
+                .unwrap();
+            let _ = stream.read(&mut [0]);
+        });
+        let result = http_get(port, "/json/list", Duration::from_millis(400));
+        server.join().unwrap();
+        assert_eq!(result.as_deref(), Ok("[]"));
+    }
+
+    #[test]
+    fn devtools_http_rejects_bad_lengths_and_truncated_bodies() {
+        for input in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n[]"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n[]",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5000000\r\n\r\n[]",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n[]",
+        ] {
+            assert!(read_devtools_response(std::io::Cursor::new(input)).is_err());
+        }
+    }
 
     #[test]
     fn yjxt_redirect_requires_the_exact_https_host() {
