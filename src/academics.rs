@@ -4,9 +4,11 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 
 const WEEKDAYS: [&str; 7] = [
     "星期一",
@@ -111,10 +113,10 @@ pub(crate) fn run(
 fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
     if let Some((subcommand, sub)) = matches.subcommand() {
         return match subcommand {
-            "update" => Err(pending_remote("课表刷新")),
+            "update" => update_schedule(ctx),
             "calendar" => {
-                let snapshot = owned_snapshot(ctx)?;
-                Ok(outcome(calendar_payload(&snapshot)))
+                let selected = current_selection(ctx, local_today()?, false)?;
+                Ok(outcome(calendar_payload(&selected)))
             }
             "export" => export_schedule(sub, ctx),
             _ => Err(CliError::usage(format!(
@@ -123,20 +125,22 @@ fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
         };
     }
 
-    let snapshot = owned_snapshot(ctx)?;
+    let today = local_today()?;
+    let selected = current_selection(ctx, today, false)?;
+    let snapshot = &selected.snapshot;
     if matches.get_flag("raw") {
         return Ok(outcome(json!({
             "term": snapshot.term,
             "role": snapshot.role,
-            "from_cache": true,
+            "from_cache": selected.from_cache,
             "count": snapshot.courses.len(),
             "courses": snapshot.courses,
         })));
     }
 
-    let today = utc_today();
     let (start, end, label) = if let Some(date) = matches.get_one::<String>("date") {
         let day = Date::parse(date).expect("clap validated --date");
+        ensure_date_in_term(snapshot, day)?;
         (day, day, date.clone())
     } else if matches.get_flag("today") {
         (today, today, today.iso())
@@ -155,20 +159,37 @@ fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
         let end = valid.next_back().unwrap_or(start);
         (start, end, format!("第 {week} 周"))
     } else {
-        let (start, end) = day_range(&snapshot, today);
+        let (start, end) = day_range(snapshot, today);
         (start, end, "本周".to_string())
     };
 
-    let sessions = occurrences(&snapshot, start, end);
+    let sessions = occurrences(snapshot, start, end);
     Ok(outcome(json!({
         "term": snapshot.term,
         "role": snapshot.role,
-        "from_cache": true,
+        "from_cache": selected.from_cache,
         "range": [start.iso(), end.iso()],
-        "week": week_of(&snapshot, start),
+        "week": week_of(snapshot, start),
         "label": label,
         "count": sessions.len(),
         "classes": sessions.into_iter().map(|session| session.data).collect::<Vec<_>>(),
+    })))
+}
+
+fn update_schedule(ctx: &Context<'_>) -> CliResult<Outcome> {
+    let selected = current_selection(ctx, local_today()?, true)?;
+    let snapshot = &selected.snapshot;
+    let (start, end) =
+        term_bounds(snapshot).ok_or_else(|| refresh_failed("刷新结果没有可用的学期日期范围"))?;
+    Ok(outcome(json!({
+        "updated": true,
+        "role": snapshot.role,
+        "source": snapshot.source,
+        "term": snapshot.term,
+        "courses": snapshot.courses.len(),
+        "weeks": snapshot.calendar.len(),
+        "range": [start.iso(), end.iso()],
+        "path": ctx.cache_dir.join("timetable.json").display().to_string(),
     })))
 }
 
@@ -253,48 +274,103 @@ fn role_error(message: impl Into<String>) -> CliError {
     )
 }
 
+#[derive(Clone, Debug)]
 struct Snapshot {
-    term: String,
+    username: String,
     role: String,
+    term: String,
+    source: String,
     courses: Vec<Value>,
     calendar: BTreeMap<i64, Vec<String>>,
 }
 
-fn owned_snapshot(ctx: &Context<'_>) -> CliResult<Snapshot> {
-    let account = identity::require_authenticated_profile(&ctx.config_dir)?;
-    let account_role = required_role(&account)?;
-    let expected_role = role_label(account_role);
-    let path = ctx.cache_dir.join("timetable.json");
-    let raw = fs::read(&path)
-        .map_err(|_| refresh_required("课表快照不存在或无法读取，不能确认它属于当前账号"))?;
-    let value: Value =
-        serde_json::from_slice(&raw).map_err(|_| refresh_required("课表快照不是有效的 JSON"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| refresh_required("课表快照不是 JSON 对象"))?;
+#[derive(Debug)]
+struct Selected {
+    snapshot: Snapshot,
+    from_cache: bool,
+}
 
-    if object.get("version").and_then(Value::as_i64) != Some(2) {
-        return Err(refresh_required("课表快照版本不受支持，无法确认旧快照归属"));
+trait TimetableSource {
+    fn fetch(&mut self, username: &str, role: Role) -> CliResult<Snapshot>;
+}
+
+struct UnavailableSource;
+
+impl TimetableSource for UnavailableSource {
+    fn fetch(&mut self, _: &str, _: Role) -> CliResult<Snapshot> {
+        Err(CliError::new(
+            5,
+            "upstream",
+            "当前构建没有接通教务课表刷新；不会伪造课表数据",
+            "等待教务响应注入后再接入联网刷新。",
+        ))
     }
-    let username = object.get("username").and_then(Value::as_str).unwrap_or("");
-    if username != account.username() {
-        return Err(refresh_required("课表快照属于另一个学号，不能用于当前账号"));
+}
+
+fn current_selection(ctx: &Context<'_>, today: Date, force: bool) -> CliResult<Selected> {
+    select_snapshot(
+        &ctx.config_dir,
+        &ctx.cache_dir,
+        today,
+        force,
+        &mut UnavailableSource,
+    )
+}
+
+fn select_snapshot(
+    config_dir: &Path,
+    cache_dir: &Path,
+    today: Date,
+    force: bool,
+    source: &mut impl TimetableSource,
+) -> CliResult<Selected> {
+    let account = identity::require_authenticated_profile(config_dir)?;
+    let role = required_role(&account)?;
+    let role_text = role_label(role);
+    let path = cache_dir.join("timetable.json");
+    let local = read_snapshot(&path);
+
+    if !force
+        && let Some(snapshot) = local
+        && snapshot.username == account.username()
+        && snapshot.role == role_text
+        && snapshot_covers(&snapshot, today)
+    {
+        return Ok(Selected {
+            snapshot,
+            from_cache: true,
+        });
     }
-    let role = object.get("role").and_then(Value::as_str).unwrap_or("");
-    if role != expected_role {
-        return Err(refresh_required(
-            "课表快照属于另一种校园身份，不能用于当前账号",
+
+    let fetched = source.fetch(account.username(), role)?;
+    if fetched.username != account.username() || fetched.role != role_text {
+        return Err(refresh_failed(
+            "刷新结果不属于当前学号或校园身份，已保留上一份快照",
         ));
     }
-    let courses = object
-        .get("courses")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| refresh_required("课表快照缺少课程列表"))?;
-    let calendar_object = object
-        .get("calendar")
-        .and_then(Value::as_object)
-        .ok_or_else(|| refresh_required("课表快照缺少教学周日历"))?;
+    validate_refreshed_snapshot(&fetched, today)?;
+    save_snapshot(&path, &fetched)?;
+    Ok(Selected {
+        snapshot: fetched,
+        from_cache: false,
+    })
+}
+
+fn read_snapshot(path: &Path) -> Option<Snapshot> {
+    let raw = fs::read(path).ok()?;
+    let value: Value = serde_json::from_slice(&raw).ok()?;
+    snapshot_from_value(&value)
+}
+
+fn snapshot_from_value(value: &Value) -> Option<Snapshot> {
+    let object = value.as_object()?;
+    if object.get("version").and_then(Value::as_i64) != Some(2) {
+        return None;
+    }
+    let username = object.get("username").and_then(Value::as_str)?.to_string();
+    let role = object.get("role").and_then(Value::as_str)?.to_string();
+    let courses = object.get("courses").and_then(Value::as_array)?.clone();
+    let calendar_object = object.get("calendar").and_then(Value::as_object)?;
     let mut calendar = BTreeMap::new();
     for (key, value) in calendar_object {
         let Ok(week) = key.parse::<i64>() else {
@@ -309,17 +385,219 @@ fn owned_snapshot(ctx: &Context<'_>) -> CliResult<Snapshot> {
             .collect();
         calendar.insert(week, dates);
     }
-
-    Ok(Snapshot {
+    Some(Snapshot {
+        username,
+        role,
         term: object
             .get("term")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        role: role.to_string(),
+        source: object
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         courses,
         calendar,
     })
+}
+
+fn save_snapshot(path: &Path, snapshot: &Snapshot) -> CliResult<()> {
+    let calendar: Map<String, Value> = snapshot
+        .calendar
+        .iter()
+        .map(|(week, dates)| (week.to_string(), json!(dates)))
+        .collect();
+    let payload = json!({
+        "version": 2,
+        "username": snapshot.username,
+        "role": snapshot.role,
+        "term": snapshot.term,
+        "source": snapshot.source,
+        "fetched_at": utc_stamp(),
+        "courses": snapshot.courses,
+        "calendar": calendar,
+    });
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|_| CliError::new(5, "upstream", "cannot serialize refreshed timetable", ""))?;
+    write_atomically(path, &bytes, "timetable snapshot")
+}
+
+fn write_atomically(path: &Path, bytes: &[u8], label: &str) -> CliResult<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| atomic_write_error(label, "create the parent directory", &error))?;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(CliError::new(
+                5,
+                "upstream",
+                format!("refusing to replace a symlink at the {label} path"),
+                "Remove the symlink manually; the link and its target were left untouched.",
+            ));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(CliError::new(
+                5,
+                "upstream",
+                format!("refusing to replace a non-regular {label}"),
+                "The existing path was left untouched.",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(atomic_write_error(label, "inspect the target", &error)),
+    }
+
+    let mut temporary = NamedTempFile::new_in(parent)
+        .map_err(|error| atomic_write_error(label, "create a temporary file", &error))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|error| atomic_write_error(label, "write the temporary file", &error))?;
+    temporary
+        .as_file_mut()
+        .flush()
+        .map_err(|error| atomic_write_error(label, "flush the temporary file", &error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| atomic_write_error(label, "sync the temporary file", &error))?;
+
+    let aliases = same_existing_file(temporary.path(), path)
+        .map_err(|error| atomic_write_error(label, "compare source and target", &error))?;
+    if aliases {
+        return Err(CliError::new(
+            5,
+            "upstream",
+            format!("refusing to replace the {label}: source and target are the same file"),
+            "The existing file was left untouched.",
+        ));
+    }
+
+    temporary
+        .persist(path)
+        .map_err(|error| atomic_write_error(label, "replace the target", &error.error))?;
+    Ok(())
+}
+
+fn atomic_write_error(label: &str, action: &str, error: &std::io::Error) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        format!("cannot {action} for the {label}: {error}"),
+        "The previous file was left untouched.",
+    )
+}
+
+#[cfg(unix)]
+fn same_existing_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = fs::metadata(left)?;
+    let right = match fs::metadata(right) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn same_existing_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    let right = match fs::canonicalize(right) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(fs::canonicalize(left)? == right)
+}
+
+fn validate_refreshed_snapshot(snapshot: &Snapshot, today: Date) -> CliResult<()> {
+    if snapshot.calendar.is_empty() {
+        return Err(refresh_failed("刷新结果缺少教学周日历，已保留上一份快照"));
+    }
+    for (week, dates) in &snapshot.calendar {
+        if *week <= 0 {
+            return Err(refresh_failed(format!(
+                "刷新结果包含无效周次 {week}，已保留上一份快照"
+            )));
+        }
+        if dates.len() != WEEKDAYS.len() {
+            return Err(refresh_failed(format!(
+                "刷新结果第 {week} 周不是完整的七天日期，已保留上一份快照"
+            )));
+        }
+        let mut previous: Option<Date> = None;
+        for raw in dates {
+            let Some(date) = Date::parse(raw) else {
+                return Err(refresh_failed(format!(
+                    "刷新结果第 {week} 周包含无效日期 {raw:?}，已保留上一份快照"
+                )));
+            };
+            if let Some(previous) = previous
+                && date != previous.add_days(1)
+            {
+                return Err(refresh_failed(format!(
+                    "刷新结果第 {week} 周日期不连续，已保留上一份快照"
+                )));
+            }
+            previous = Some(date);
+        }
+    }
+    let Some((start, end)) = term_bounds(snapshot) else {
+        return Err(refresh_failed(
+            "刷新结果缺少可用的学期日期，已保留上一份快照",
+        ));
+    };
+    if today < start || today > end {
+        return Err(refresh_failed("刷新结果不覆盖运行当天，已保留上一份快照"));
+    }
+    if let Err(error) = export_sessions(snapshot) {
+        return Err(refresh_failed(format!(
+            "刷新结果无法生成完整日历，已保留上一份快照：{}",
+            error.message
+        )));
+    }
+    Ok(())
+}
+
+fn snapshot_covers(snapshot: &Snapshot, day: Date) -> bool {
+    term_bounds(snapshot).is_some_and(|(start, end)| start <= day && day <= end)
+}
+
+fn refresh_failed(message: impl Into<String>) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        format!("课表刷新结果不可用：{}", message.into()),
+        "保留上一份快照；不会用它生成课表或日历。",
+    )
+}
+
+fn ensure_date_in_term(snapshot: &Snapshot, day: Date) -> CliResult<()> {
+    let Some((start, end)) = term_bounds(snapshot) else {
+        return Err(refresh_required("课表快照里没有可用的学期日期范围"));
+    };
+    if day < start || day > end {
+        return Err(CliError::new(
+            2,
+            "usage",
+            format!(
+                "指定日期 {} 不在当前学期 {} 的范围 {} 至 {} 内",
+                day.iso(),
+                snapshot.term,
+                start.iso(),
+                end.iso()
+            ),
+            "只筛选当前学期，不会切换学期或把范围外的日期当作没课。",
+        ));
+    }
+    Ok(())
 }
 
 fn refresh_required(message: impl Into<String>) -> CliError {
@@ -331,11 +609,8 @@ fn refresh_required(message: impl Into<String>) -> CliError {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot queries and iCalendar export.
-// ---------------------------------------------------------------------------
-
-fn calendar_payload(snapshot: &Snapshot) -> Value {
+fn calendar_payload(selected: &Selected) -> Value {
+    let snapshot = &selected.snapshot;
     let weeks: Vec<Value> = snapshot
         .calendar
         .iter()
@@ -351,25 +626,21 @@ fn calendar_payload(snapshot: &Snapshot) -> Value {
     json!({
         "term": snapshot.term,
         "role": snapshot.role,
-        "from_cache": true,
+        "from_cache": selected.from_cache,
         "week_count": weeks.len(),
         "weeks": weeks,
     })
 }
 
 fn export_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
-    let snapshot = owned_snapshot(ctx)?;
-    let (content, events) = build_ics(&snapshot)?;
+    let selected = current_selection(ctx, local_today()?, false)?;
+    let snapshot = &selected.snapshot;
+    let (content, events) = build_ics(snapshot)?;
     let out = matches
         .get_one::<String>("out")
         .map(|path| expand_home(path, &ctx.home_dir))
-        .unwrap_or_else(|| default_export_path(&snapshot, &ctx.home_dir));
-    if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|_| CliError::new(5, "upstream", "cannot create export directory", ""))?;
-    }
-    fs::write(&out, &content)
-        .map_err(|_| CliError::new(5, "upstream", "cannot write iCalendar file", ""))?;
+        .unwrap_or_else(|| default_export_path(snapshot, &ctx.home_dir));
+    write_export(&out, &content)?;
 
     if !matches.get_flag("no-open-folder") {
         reveal(&out);
@@ -377,13 +648,17 @@ fn export_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome
 
     Ok(outcome(json!({
         "term": snapshot.term,
-        "from_cache": true,
+        "from_cache": selected.from_cache,
         "courses": snapshot.courses.len(),
         "weeks": snapshot.calendar.len(),
         "events": events,
         "path": out.display().to_string(),
         "hint": "在日历 App 里双击导入；重复导入会生成重复事件",
     })))
+}
+
+fn write_export(path: &Path, content: &str) -> CliResult<()> {
+    write_atomically(path, content.as_bytes(), "iCalendar export")
 }
 
 fn default_export_path(snapshot: &Snapshot, home: &Path) -> PathBuf {
@@ -431,9 +706,7 @@ fn reveal(path: &Path) {
 }
 
 fn build_ics(snapshot: &Snapshot) -> CliResult<(String, usize)> {
-    let (start, end) =
-        week_bounds(snapshot).ok_or_else(|| refresh_required("课表快照里没有可用的日期信息"))?;
-    let sessions = occurrences(snapshot, start, end);
+    let sessions = export_sessions(snapshot)?;
     let stamp = utc_stamp();
     let term = if snapshot.term.is_empty() {
         "课表"
@@ -460,9 +733,6 @@ fn build_ics(snapshot: &Snapshot) -> CliResult<(String, usize)> {
 
     let mut emitted = 0;
     for session in sessions {
-        if !valid_clock(&session.time_start) || !valid_clock(&session.time_end) {
-            continue;
-        }
         let day = session.date.iso().replace('-', "");
         let start_clock = session.time_start.replace(':', "");
         let end_clock = session.time_end.replace(':', "");
@@ -506,20 +776,135 @@ fn build_ics(snapshot: &Snapshot) -> CliResult<(String, usize)> {
     Ok((format!("{}\r\n", lines.join("\r\n")), emitted))
 }
 
-fn valid_clock(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    if bytes.len() != 5
-        || !bytes[0].is_ascii_digit()
-        || !bytes[1].is_ascii_digit()
-        || bytes[2] != b':'
-        || !bytes[3].is_ascii_digit()
-        || !bytes[4].is_ascii_digit()
-    {
-        return false;
+fn normalize_clock(text: &str) -> Option<String> {
+    let text = text.trim().replace('：', ":");
+    let (hour, minute) = if text.len() == 4 && text.as_bytes().iter().all(u8::is_ascii_digit) {
+        (
+            text[0..2].parse::<u32>().ok()?,
+            text[2..4].parse::<u32>().ok()?,
+        )
+    } else {
+        let mut parts = text.split(':');
+        let hour = parts.next()?.parse::<u32>().ok()?;
+        let minute = parts.next()?.parse::<u32>().ok()?;
+        if let Some(seconds) = parts.next() {
+            if seconds != "00" || parts.next().is_some() {
+                return None;
+            }
+        }
+        (hour, minute)
+    };
+    if hour > 23 || minute > 59 {
+        return None;
     }
-    let hour = u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0');
-    let minute = u32::from(bytes[3] - b'0') * 10 + u32::from(bytes[4] - b'0');
-    hour <= 23 && minute <= 59
+    Some(format!("{hour:02}:{minute:02}"))
+}
+
+fn export_error(course: &str, detail: impl Into<String>) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        format!("无法生成完整课表日历：课程「{course}」{}", detail.into()),
+        "运行 `bupt schedule update` 重新获取完整课表；不会生成半份日历或覆盖已有 .ics。",
+    )
+}
+
+fn export_sessions(snapshot: &Snapshot) -> CliResult<Vec<Session>> {
+    let mut sessions = Vec::new();
+    for (index, course) in snapshot.courses.iter().enumerate() {
+        let Some(course) = course.as_object() else {
+            return Err(export_error(
+                &format!("第 {} 门课程", index + 1),
+                "不是有效的课程对象",
+            ));
+        };
+        let name = text_field(course, "name");
+        let label = if name.trim().is_empty() {
+            format!("第 {} 门课程", index + 1)
+        } else {
+            name.clone()
+        };
+        let Some(weekday) = course.get("weekday_index").and_then(Value::as_i64) else {
+            return Err(export_error(&label, "缺少星期信息"));
+        };
+        if !(0..=6).contains(&weekday) {
+            return Err(export_error(&label, format!("的星期信息无效（{weekday}）")));
+        }
+        let Some(weeks) = course.get("weeks").and_then(Value::as_array) else {
+            return Err(export_error(&label, "缺少周次信息"));
+        };
+        if weeks.is_empty() {
+            return Err(export_error(&label, "没有可导出的周次"));
+        }
+        for week in weeks {
+            let Some(week) = week.as_i64() else {
+                return Err(export_error(&label, "包含无效周次"));
+            };
+            let Some(dates) = snapshot.calendar.get(&week) else {
+                return Err(export_error(&label, format!("第 {week} 周缺少教学周日期")));
+            };
+            let Some(raw_date) = dates.get(weekday as usize) else {
+                return Err(export_error(
+                    &label,
+                    format!("第 {week} 周缺少{}的日期", WEEKDAYS[weekday as usize]),
+                ));
+            };
+            let Some(date) = Date::parse(raw_date) else {
+                return Err(export_error(
+                    &label,
+                    format!("第 {week} 周的日期无效或缺失：{raw_date:?}"),
+                ));
+            };
+            let Some(time_start) = normalize_clock(&text_field(course, "time_start")) else {
+                return Err(export_error(
+                    &label,
+                    format!(
+                        "第 {week} 周（{}）缺少或无法识别开始时间：{:?}",
+                        date.iso(),
+                        text_field(course, "time_start")
+                    ),
+                ));
+            };
+            let Some(time_end) = normalize_clock(&text_field(course, "time_end")) else {
+                return Err(export_error(
+                    &label,
+                    format!(
+                        "第 {week} 周（{}）缺少或无法识别结束时间：{:?}",
+                        date.iso(),
+                        text_field(course, "time_end")
+                    ),
+                ));
+            };
+            sessions.push(Session {
+                date,
+                week,
+                time_start: time_start.clone(),
+                time_end: time_end.clone(),
+                name: name.clone(),
+                data: json!({
+                    "date": date.iso(),
+                    "weekday": WEEKDAYS[weekday as usize],
+                    "week": week,
+                    "time_start": time_start,
+                    "time_end": time_end,
+                    "name": name,
+                    "teachers": string_array(course, "teachers"),
+                    "rooms": string_array(course, "rooms"),
+                    "campus": text_field(course, "campus"),
+                    "period_start": course.get("period_start").cloned().unwrap_or(Value::Null),
+                    "period_end": course.get("period_end").cloned().unwrap_or(Value::Null),
+                }),
+            });
+        }
+    }
+    sessions.sort_by(|a, b| {
+        (a.date, a.time_start.as_str(), a.name.as_str()).cmp(&(
+            b.date,
+            b.time_start.as_str(),
+            b.name.as_str(),
+        ))
+    });
+    Ok(sessions)
 }
 
 fn location_text(data: &Value) -> String {
@@ -578,7 +963,7 @@ fn ics_fold(line: String) -> String {
     String::from_utf8(out).expect("folded ICS is valid UTF-8")
 }
 
-fn week_bounds(snapshot: &Snapshot) -> Option<(Date, Date)> {
+fn term_bounds(snapshot: &Snapshot) -> Option<(Date, Date)> {
     let mut start: Option<Date> = None;
     let mut end: Option<Date> = None;
     for dates in snapshot.calendar.values() {
@@ -803,11 +1188,20 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-// std::time has no local-offset API in this build. today/tomorrow/week use
-// this UTC day for now; DTSTAMP below is intentionally UTC. See the clock item
-// in docs/migration-tests/academics.md for the requested shared date API.
-fn utc_today() -> Date {
-    Date::from_days((unix_seconds() / 86_400) as i64)
+fn local_today() -> CliResult<Date> {
+    let local = time::OffsetDateTime::now_local().map_err(|_| {
+        CliError::new(
+            5,
+            "upstream",
+            "无法确定本机日期，不能确认当前学期",
+            "检查系统时区设置后重试。",
+        )
+    })?;
+    Ok(Date {
+        year: local.year(),
+        month: u32::from(u8::from(local.month())),
+        day: u32::from(local.day()),
+    })
 }
 
 fn utc_stamp() -> String {
@@ -846,4 +1240,544 @@ fn week_arg(text: &str) -> Result<u32, String> {
         return Err("week must be >= 1".to_string());
     }
     Ok(week)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tempfile::tempdir;
+
+    const USER: &str = "20260001";
+    const OTHER_USER: &str = "20260002";
+    const SESSION_PASSWORD: &str = "synthetic-test-password";
+
+    fn today() -> Date {
+        Date::parse("2026-09-23").expect("fixed synthetic Wednesday")
+    }
+
+    fn monday_of(day: Date) -> Date {
+        day.add_days(-(day.weekday_index() as i64))
+    }
+
+    fn snapshot(
+        username: &str,
+        role: Role,
+        week_start: Date,
+        course_name: &str,
+        start: &str,
+        end: &str,
+    ) -> Snapshot {
+        let dates = (0..7)
+            .map(|offset| week_start.add_days(offset).iso())
+            .collect();
+        let mut calendar = BTreeMap::new();
+        calendar.insert(1, dates);
+        Snapshot {
+            username: username.to_string(),
+            role: role_label(role).to_string(),
+            term: "2026-2027秋学期".to_string(),
+            source: "fake".to_string(),
+            courses: vec![json!({
+                "name": course_name,
+                "weekday_index": today().weekday_index(),
+                "weeks": [1],
+                "period_start": 1,
+                "period_end": 1,
+                "time_start": start,
+                "time_end": end,
+                "teachers": [],
+                "rooms": [],
+                "campus": ""
+            })],
+            calendar,
+        }
+    }
+
+    fn fresh() -> Snapshot {
+        snapshot(
+            USER,
+            Role::Undergraduate,
+            monday_of(today()),
+            "当前学期课程",
+            "08:00",
+            "08:45",
+        )
+    }
+
+    fn stale() -> Snapshot {
+        snapshot(
+            USER,
+            Role::Undergraduate,
+            monday_of(today()).add_days(-28),
+            "旧学期课程",
+            "08:00",
+            "08:45",
+        )
+    }
+
+    fn account(config: &Path) {
+        fs::create_dir_all(config).expect("create config directory");
+        fs::write(
+            config.join("credentials.json"),
+            serde_json::to_vec_pretty(&json!({
+                "username": USER,
+                "password": SESSION_PASSWORD,
+                "role": "undergraduate",
+            }))
+            .expect("serialize synthetic account"),
+        )
+        .expect("write synthetic account");
+    }
+
+    struct FakeSource {
+        responses: VecDeque<CliResult<Snapshot>>,
+        calls: usize,
+    }
+
+    impl FakeSource {
+        fn with(responses: Vec<CliResult<Snapshot>>) -> Self {
+            Self {
+                responses: responses.into(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl TimetableSource for FakeSource {
+        fn fetch(&mut self, _: &str, _: Role) -> CliResult<Snapshot> {
+            self.calls += 1;
+            self.responses
+                .pop_front()
+                .expect("selection fetched more times than the test allowed")
+        }
+    }
+
+    fn cache_file(directory: &Path) -> PathBuf {
+        directory.join("timetable.json")
+    }
+
+    fn read_bytes(path: &Path) -> Vec<u8> {
+        fs::read(path).expect("read snapshot for comparison")
+    }
+
+    #[test]
+    fn fresh_owned_snapshot_is_served_without_fetching() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        let current = fresh();
+        save_snapshot(&cache_file(&cache), &current).unwrap();
+        let before = read_bytes(&cache_file(&cache));
+        let mut source = FakeSource::with(vec![]);
+
+        let selected =
+            select_snapshot(&config, &cache, today(), false, &mut source).expect("fresh snapshot");
+
+        assert_eq!(source.calls, 0, "a fresh owned snapshot must not fetch");
+        assert!(selected.from_cache);
+        assert_eq!(selected.snapshot.username, USER);
+        assert_eq!(selected.snapshot.role, "undergraduate");
+        assert_eq!(read_bytes(&cache_file(&cache)), before);
+    }
+
+    #[test]
+    fn freshness_includes_both_term_endpoints_and_ignores_fetch_age() {
+        for (label, day) in [
+            ("first day", monday_of(today())),
+            ("last day", monday_of(today()).add_days(6)),
+        ] {
+            let root = tempdir().unwrap();
+            let config = root.path().join("config");
+            let cache = root.path().join("cache");
+            account(&config);
+            let path = cache_file(&cache);
+            save_snapshot(&path, &fresh()).unwrap();
+
+            let mut value: Value = serde_json::from_slice(&read_bytes(&path)).unwrap();
+            value["fetched_at"] = json!("2000-01-01T00:00:00+00:00");
+            let old_bytes = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&path, &old_bytes).unwrap();
+
+            let mut source = FakeSource::with(vec![]);
+            let selected = select_snapshot(&config, &cache, day, false, &mut source)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+
+            assert_eq!(source.calls, 0, "{label}: inclusive term bounds are fresh");
+            assert!(selected.from_cache, "{label}: old fetched_at is not a TTL");
+            assert_eq!(
+                read_bytes(&path),
+                old_bytes,
+                "{label}: a fresh read must not rewrite the snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_snapshot_fetches_exactly_once_and_writes_the_new_term() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        let mut source = FakeSource::with(vec![Ok(fresh())]);
+
+        let selected =
+            select_snapshot(&config, &cache, today(), false, &mut source).expect("refreshed");
+
+        assert_eq!(
+            source.calls, 1,
+            "a missing snapshot must fetch exactly once"
+        );
+        assert!(!selected.from_cache);
+        assert_eq!(selected.snapshot.term, "2026-2027秋学期");
+        assert!(cache_file(&cache).exists());
+        let written = read_snapshot(&cache_file(&cache)).expect("written snapshot");
+        assert_eq!(written.username, USER);
+        assert_eq!(written.role, "undergraduate");
+    }
+
+    #[test]
+    fn stale_snapshot_fetches_exactly_once_and_replaces_the_cache() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        save_snapshot(&cache_file(&cache), &stale()).unwrap();
+        let mut source = FakeSource::with(vec![Ok(fresh())]);
+
+        let selected =
+            select_snapshot(&config, &cache, today(), false, &mut source).expect("refreshed");
+
+        assert_eq!(
+            source.calls, 1,
+            "a snapshot whose term excludes today must fetch exactly once"
+        );
+        assert!(!selected.from_cache);
+        assert_eq!(selected.snapshot.courses[0]["name"], json!("当前学期课程"));
+        let written = read_snapshot(&cache_file(&cache)).expect("refreshed cache");
+        assert_eq!(written.courses[0]["name"], json!("当前学期课程"));
+    }
+
+    #[test]
+    fn foreign_snapshot_is_never_used_even_when_refresh_fails() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        let foreign = snapshot(
+            OTHER_USER,
+            Role::Undergraduate,
+            monday_of(today()),
+            "他人课程",
+            "08:00",
+            "08:45",
+        );
+        save_snapshot(&cache_file(&cache), &foreign).unwrap();
+        let before = read_bytes(&cache_file(&cache));
+        let mut source = FakeSource::with(vec![Err(CliError::new(
+            5,
+            "upstream",
+            "synthetic refresh failure",
+            "",
+        ))]);
+
+        let error = select_snapshot(&config, &cache, today(), false, &mut source)
+            .expect_err("foreign snapshot must not be a fallback");
+
+        assert_eq!(source.calls, 1);
+        assert_eq!(error.code, 5);
+        assert_eq!(
+            read_bytes(&cache_file(&cache)),
+            before,
+            "a failed refresh must leave the foreign snapshot untouched"
+        );
+    }
+
+    #[test]
+    fn foreign_snapshot_is_replaced_only_after_a_clean_refresh() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        let foreign = snapshot(
+            OTHER_USER,
+            Role::Undergraduate,
+            monday_of(today()),
+            "他人课程",
+            "08:00",
+            "08:45",
+        );
+        save_snapshot(&cache_file(&cache), &foreign).unwrap();
+        let mut source = FakeSource::with(vec![Ok(fresh())]);
+
+        let selected = select_snapshot(&config, &cache, today(), false, &mut source)
+            .expect("refresh from the current account");
+
+        assert_eq!(source.calls, 1);
+        assert_eq!(selected.snapshot.username, USER);
+        assert_eq!(selected.snapshot.courses[0]["name"], json!("当前学期课程"));
+        let written = read_snapshot(&cache_file(&cache)).expect("refreshed cache");
+        assert_eq!(written.username, USER);
+    }
+
+    #[test]
+    fn date_outside_the_selected_term_never_fetches_again() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        save_snapshot(&cache_file(&cache), &fresh()).unwrap();
+        let mut source = FakeSource::with(vec![]);
+
+        let selected =
+            select_snapshot(&config, &cache, today(), false, &mut source).expect("fresh snapshot");
+        let outside = Date::parse("2026-10-15").expect("valid synthetic date");
+        let error = ensure_date_in_term(&selected.snapshot, outside)
+            .expect_err("outside --date must report the term range");
+
+        assert_eq!(source.calls, 0, "an out-of-range --date must not fetch");
+        assert_eq!(error.code, 2);
+        assert!(error.message.contains("2026-10-15"));
+        assert!(error.message.contains("2026-09-21"));
+        assert!(error.message.contains("2026-09-27"));
+    }
+
+    #[test]
+    fn failed_incomplete_or_out_of_term_refresh_preserves_the_old_snapshot() {
+        let failed = Err(CliError::new(
+            5,
+            "upstream",
+            "synthetic refresh failure",
+            "",
+        ));
+        let incomplete = Ok({
+            let mut snapshot = fresh();
+            snapshot.courses[0]["time_start"] = json!("");
+            snapshot
+        });
+        let out_of_term = Ok(snapshot(
+            USER,
+            Role::Undergraduate,
+            monday_of(today()).add_days(-28),
+            "刷新返回旧学期",
+            "08:00",
+            "08:45",
+        ));
+        let malformed_calendar_without_courses = Ok({
+            let mut snapshot = fresh();
+            snapshot.courses.clear();
+            snapshot.calendar.get_mut(&1).expect("week one")[3] = "not-a-date".to_string();
+            snapshot
+        });
+        let empty_calendar_without_courses = Ok({
+            let mut snapshot = fresh();
+            snapshot.courses.clear();
+            snapshot.calendar.clear();
+            snapshot
+        });
+
+        for (label, response) in [
+            ("failed", failed),
+            ("incomplete", incomplete),
+            ("out-of-term", out_of_term),
+            (
+                "malformed-calendar-without-courses",
+                malformed_calendar_without_courses,
+            ),
+            (
+                "empty-calendar-without-courses",
+                empty_calendar_without_courses,
+            ),
+        ] {
+            let root = tempdir().unwrap();
+            let config = root.path().join("config");
+            let cache = root.path().join("cache");
+            account(&config);
+            save_snapshot(&cache_file(&cache), &stale()).unwrap();
+            let before = read_bytes(&cache_file(&cache));
+            let mut source = FakeSource::with(vec![response]);
+
+            let error = select_snapshot(&config, &cache, today(), false, &mut source)
+                .expect_err("bad refresh must not be served");
+
+            assert_eq!(source.calls, 1, "{label}: exactly one refresh");
+            assert_eq!(error.code, 5, "{label}: upstream failure");
+            assert_eq!(
+                read_bytes(&cache_file(&cache)),
+                before,
+                "{label}: the previous snapshot must survive"
+            );
+            assert!(
+                !cache_file(&cache).with_extension("json.tmp").exists(),
+                "{label}: no temporary cache is left behind"
+            );
+        }
+    }
+
+    #[test]
+    fn forced_update_fetches_even_for_a_fresh_snapshot_and_preserves_on_failure() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        save_snapshot(&cache_file(&cache), &fresh()).unwrap();
+        let mut source = FakeSource::with(vec![Ok(snapshot(
+            USER,
+            Role::Undergraduate,
+            monday_of(today()),
+            "手动刷新课程",
+            "10:00",
+            "10:45",
+        ))]);
+
+        let selected =
+            select_snapshot(&config, &cache, today(), true, &mut source).expect("forced refresh");
+        assert_eq!(source.calls, 1, "update must fetch even when fresh");
+        assert!(!selected.from_cache);
+        assert_eq!(selected.snapshot.courses[0]["name"], json!("手动刷新课程"));
+
+        let before = read_bytes(&cache_file(&cache));
+        let mut failing = FakeSource::with(vec![Err(CliError::new(
+            5,
+            "upstream",
+            "synthetic forced refresh failure",
+            "",
+        ))]);
+        let error = select_snapshot(&config, &cache, today(), true, &mut failing)
+            .expect_err("forced refresh failure");
+        assert_eq!(failing.calls, 1);
+        assert_eq!(error.code, 5);
+        assert_eq!(
+            read_bytes(&cache_file(&cache)),
+            before,
+            "a failed manual update must preserve the previous snapshot"
+        );
+    }
+
+    #[test]
+    fn atomic_writes_leave_predictable_temp_files_untouched() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let snapshot_path = cache_file(&cache);
+        let snapshot_temp = snapshot_path.with_extension("json.tmp");
+        fs::write(&snapshot_temp, b"PRESERVE CACHE TEMP").unwrap();
+
+        save_snapshot(&snapshot_path, &fresh()).unwrap();
+
+        assert_eq!(
+            fs::read(&snapshot_temp).unwrap(),
+            b"PRESERVE CACHE TEMP",
+            "the old predictable cache temp path must not be reused"
+        );
+        assert!(read_snapshot(&snapshot_path).is_some());
+
+        let export_path = root.path().join("export.ics");
+        let export_temp = export_path.with_extension("ics.tmp");
+        fs::write(&export_temp, b"PRESERVE EXPORT TEMP").unwrap();
+
+        write_export(&export_path, "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").unwrap();
+
+        assert_eq!(
+            fs::read(&export_temp).unwrap(),
+            b"PRESERVE EXPORT TEMP",
+            "the old predictable export temp path must not be reused"
+        );
+        assert!(
+            fs::read_to_string(&export_path)
+                .unwrap()
+                .contains("BEGIN:VCALENDAR")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_do_not_follow_planted_temp_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"UNRELATED VICTIM").unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let snapshot_path = cache_file(&cache);
+        let snapshot_temp = snapshot_path.with_extension("json.tmp");
+        symlink(&victim, &snapshot_temp).unwrap();
+
+        save_snapshot(&snapshot_path, &fresh()).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"UNRELATED VICTIM");
+        assert!(
+            fs::symlink_metadata(&snapshot_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&snapshot_temp).unwrap(), victim);
+
+        let export_path = root.path().join("export.ics");
+        let export_temp = export_path.with_extension("ics.tmp");
+        symlink(&victim, &export_temp).unwrap();
+
+        write_export(&export_path, "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n").unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"UNRELATED VICTIM");
+        assert!(
+            fs::symlink_metadata(&export_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&export_temp).unwrap(), victim);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_refuses_a_symlink_target_without_touching_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let target = root.path().join("cache").join("timetable.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"UNRELATED VICTIM").unwrap();
+        symlink(&victim, &target).unwrap();
+
+        let error = save_snapshot(&target, &fresh()).expect_err("symlink target must be refused");
+
+        assert_eq!(error.code, 5);
+        assert!(error.message.contains("symlink"));
+        assert_eq!(fs::read(&victim).unwrap(), b"UNRELATED VICTIM");
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&target).unwrap(), victim);
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_leave_one_complete_file() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("shared.txt");
+        let mut handles = Vec::new();
+        for index in 0..8 {
+            let target = target.clone();
+            handles.push(std::thread::spawn(move || {
+                let payload = format!("payload-{index}");
+                write_atomically(&target, payload.as_bytes(), "test file").unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let content = fs::read_to_string(&target).unwrap();
+        assert!(
+            (0..8).any(|index| content == format!("payload-{index}")),
+            "concurrent writers must leave one complete payload, got {content:?}"
+        );
+    }
 }

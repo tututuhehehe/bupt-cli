@@ -647,11 +647,24 @@ fn notices_show_rejects_blank_url_before_auth() {
 }
 
 #[test]
+fn notices_show_rejects_external_and_credential_bearing_urls_before_auth() {
+    let sandbox = Sandbox::new();
+    for url in [
+        "https://example.invalid/notice/1",
+        "https://my.bupt.edu.cn@foreign.example/info/1.htm",
+        "https://test-user@my.bupt.edu.cn/info/1.htm",
+    ] {
+        assert_error(sandbox.run(&["notices", "show", url]), 2, "usage");
+    }
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
 fn notices_show_requires_credentials_without_creating_session() {
     let sandbox = Sandbox::new();
 
     let payload = assert_error(
-        sandbox.run(&["notices", "show", "https://example.invalid/notice/1"]),
+        sandbox.run(&["notices", "show", "http://my.bupt.edu.cn/info/1.htm"]),
         3,
         "auth",
     );
