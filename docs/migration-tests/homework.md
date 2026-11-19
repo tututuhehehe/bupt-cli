@@ -206,7 +206,7 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 
 ## 草稿覆盖矩阵
 
-以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。其中 `courses` 分页/去重/终止和空 undone 已由上面的 `read.rs` 源内 helper 用例覆盖；提交门禁、dry-run、确认一次写入、响应丢失四类已有 `submit.rs` 源内覆盖。草稿仍保留为后续完整进程级录制验收。
+以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。其中 `courses` 分页/去重/终止、默认 all / `--course` 分页/排序/过滤/`--limit` 和空 undone 已由上面的 `read.rs` 源内 helper 用例覆盖；提交门禁、dry-run、确认一次写入、响应丢失四类已有 `submit.rs` 源内覆盖。草稿仍保留为后续完整进程级录制验收。
 
 ### courses
 
