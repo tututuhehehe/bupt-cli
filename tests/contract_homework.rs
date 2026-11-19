@@ -106,6 +106,56 @@ fn legacy_roleless_credentials_cannot_prove_a_verified_login() {
 }
 
 #[test]
+fn deferred_new_filter_stops_before_network() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.root().join("config/credentials.json"),
+        r#"{"username":"2026000096","password":"TEST-ONLY-HOMEWORK-PASSWORD-6a7b","role":"undergraduate"}"#,
+    )
+    .expect("write synthetic role credentials");
+
+    let invocation = sandbox.run(&["homework", "--new", "7"]);
+    let error = assert_error(&invocation, 5, "upstream");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--new")),
+        "deferred --new should name the missing filter: {error}"
+    );
+    assert!(!sandbox.root().join("cache/session.json").exists());
+}
+
+#[test]
+fn read_commands_reach_the_verified_session_boundary() {
+    let sandbox = Sandbox::new();
+    fs::write(
+        sandbox.root().join("config/credentials.json"),
+        r#"{"username":"2026000098","password":"TEST-ONLY-HOMEWORK-PASSWORD-4e5f"}"#,
+    )
+    .expect("write synthetic roleless credentials");
+
+    for args in [
+        vec!["homework"],
+        vec!["homework", "--undone"],
+        vec!["homework", "--course", "site-1"],
+        vec!["homework", "--limit", "1"],
+        vec!["homework", "--new", "7"],
+        vec!["homework", "show", ASSIGNMENT_ID],
+        vec!["homework", "verify", ASSIGNMENT_ID],
+    ] {
+        let invocation = sandbox.run(&args);
+        let error = assert_error(&invocation, 3, "auth");
+        assert!(
+            error["error"]["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("login")),
+            "verified-session boundary should point at login for {args:?}: {error}"
+        );
+    }
+    assert!(!sandbox.root().join("cache/session.json").exists());
+}
+
+#[test]
 fn homework_defaults_to_the_list_command() {
     let sandbox = Sandbox::new();
     assert_error(&sandbox.run(&["homework"]), 3, "auth");
