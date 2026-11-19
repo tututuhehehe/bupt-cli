@@ -963,6 +963,39 @@ fn graduate_accounts_are_refused_by_undergraduate_jwgl_commands() {
 }
 
 #[test]
+fn undergraduate_mobile_commands_stop_at_the_unattached_token_accessor() {
+    let sandbox = Sandbox::new();
+    write_credentials(&sandbox, USER, "undergraduate");
+
+    for command in ["exams", "scores", "classrooms"] {
+        let invocation = run(&sandbox, &[command]);
+        assert_eq!(
+            invocation.code(),
+            5,
+            "{command}: no mobile token accessor is attached yet; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&invocation.0.stdout),
+            String::from_utf8_lossy(&invocation.0.stderr)
+        );
+        assert!(invocation.0.stdout.is_empty());
+        let payload = invocation.stderr_json();
+        assert_schema(&payload);
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["error"]["type"], json!("upstream"));
+        assert!(
+            error_text(&payload).contains("token 访问器尚未接入"),
+            "{command}: attach the identity accessor before expecting success"
+        );
+        assert!(
+            fs::read_dir(sandbox.root().join("cache"))
+                .expect("read cache dir")
+                .next()
+                .is_none(),
+            "{command}: must not reach transport/browser or write state before attachment"
+        );
+    }
+}
+
+#[test]
 fn graduate_exams_without_a_session_is_an_auth_error_before_browser() {
     let sandbox = Sandbox::new();
     write_credentials(&sandbox, USER, "graduate");
