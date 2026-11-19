@@ -29,6 +29,38 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 const MAX_CAS_REDIRECTS: usize = 5;
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
+/// CAS service tickets are only requested for this closed set of destinations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CasService {
+    UCloud,
+}
+
+impl CasService {
+    pub(crate) const fn url(self) -> &'static str {
+        match self {
+            Self::UCloud => super::CAS_SERVICE_URL,
+        }
+    }
+
+    const fn ticket_host(self) -> &'static str {
+        match self {
+            Self::UCloud => UCLOUD_HOST,
+        }
+    }
+
+    const fn ticket_path(self) -> &'static str {
+        match self {
+            Self::UCloud => "/uclass",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::UCloud => "UCloud",
+        }
+    }
+}
+
 /// A verified CAS login with a service ticket issued by CAS. Fields are
 /// private so only a completed login can construct this value.
 pub(super) struct CasLogin {
@@ -96,6 +128,40 @@ impl CasLogin {
         self.ucloud.as_ref().is_some_and(UCloudToken::is_usable)
     }
 
+    /// A fresh cached token as the `(access_token, user_id)` pair, without
+    /// requesting a ticket or writing state.
+    pub(super) fn cached_ucloud_credentials(&self) -> Option<(String, String)> {
+        self.ucloud.as_ref()?.identity_pair()
+    }
+
+    /// Obtain a ticket for one of the predeclared CAS service destinations.
+    /// This never performs a login form POST.
+    pub(super) fn ticket_for(
+        &mut self,
+        transport: &mut dyn Transport,
+        service: CasService,
+    ) -> CliResult<String> {
+        request_cas_service_ticket(transport, &mut self.cookies, service)
+    }
+
+    /// Exchange an already obtained ticket. State stays in memory; callers that
+    /// need durability must persist separately.
+    pub(super) fn exchange_ucloud_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        ticket: &str,
+    ) -> CliResult<&UCloudToken> {
+        let token = exchange_ucloud_token(transport, ticket)?;
+        self.ucloud = Some(token);
+        Ok(self.ucloud.as_ref().expect("UCloud token was just set"))
+    }
+
+    /// A Cookie header for a fixed, reviewed authenticated probe endpoint.
+    /// The caller cannot supply an arbitrary destination to this helper.
+    pub(super) fn cookie_header_for_authenticated(&self, raw: &str) -> Option<String> {
+        self.cookies.header_for_authenticated(raw)
+    }
+
     /// Fetch a UCloud token only when a caller needs one. The service ticket
     /// obtained during login is consumed first; later needs request a new CAS
     /// service ticket. No OAuth token request happens before this call.
@@ -107,7 +173,9 @@ impl CasLogin {
         if !cached {
             let ticket = match self.ticket.take() {
                 Some(ticket) => ticket,
-                None => request_cas_service_ticket(transport, &mut self.cookies)?,
+                None => {
+                    request_cas_service_ticket(transport, &mut self.cookies, CasService::UCloud)?
+                }
             };
             let token = exchange_ucloud_token(transport, &ticket)?;
             self.ucloud = Some(token);
@@ -298,7 +366,7 @@ pub(super) fn cas_login(
         }
     }
 
-    let ticket = request_cas_service_ticket(transport, &mut cookies)?;
+    let ticket = request_cas_service_ticket(transport, &mut cookies, CasService::UCloud)?;
     Ok(CasLogin {
         cookies,
         ticket: Some(ticket),
@@ -311,8 +379,9 @@ pub(super) fn cas_login(
 fn request_cas_service_ticket(
     transport: &mut dyn Transport,
     cookies: &mut CookieJar,
+    service: CasService,
 ) -> CliResult<String> {
-    let response = send_get(transport, cookies, super::CAS_SERVICE_URL)?;
+    let response = send_get(transport, cookies, service.url())?;
     match response.status {
         401 | 403 => Err(auth_error(format!(
             "CAS service ticket rejected authentication (HTTP {})",
@@ -322,7 +391,7 @@ fn request_cas_service_ticket(
             let location = header(&response.headers, "location").ok_or_else(|| {
                 parse_error("CAS service redirect response has no Location header")
             })?;
-            ticket_from_location(location)
+            ticket_from_location_for(service, location)
         }
         200..=299 => {
             if is_login_page_body(&response.body) {
@@ -490,9 +559,14 @@ fn allowed_cas_redirect(raw: &str) -> CliResult<String> {
     Ok(parsed.into())
 }
 
+#[cfg(test)]
 fn ticket_from_location(location: &str) -> CliResult<String> {
+    ticket_from_location_for(CasService::UCloud, location)
+}
+
+fn ticket_from_location_for(service: CasService, location: &str) -> CliResult<String> {
     let parsed = parse_https_url(location.trim()).ok_or_else(redirect_error)?;
-    if parsed.host_str() != Some(UCLOUD_HOST) || parsed.path() != "/uclass" {
+    if parsed.host_str() != Some(service.ticket_host()) || parsed.path() != service.ticket_path() {
         return Err(redirect_error());
     }
     let mut tickets = parsed
@@ -503,11 +577,17 @@ fn ticket_from_location(location: &str) -> CliResult<String> {
             let (key, value) = pair.split_once('=')?;
             (key == "ticket").then_some(value)
         });
-    let raw = tickets
-        .next()
-        .ok_or_else(|| auth_error("No CAS ticket issued for UCloud (login may have expired)"))?;
+    let raw = tickets.next().ok_or_else(|| {
+        auth_error(format!(
+            "No CAS ticket issued for {} (login may have expired)",
+            service.label()
+        ))
+    })?;
     if tickets.next().is_some() {
-        return Err(auth_error("CAS issued an ambiguous UCloud ticket"));
+        return Err(auth_error(format!(
+            "CAS issued an ambiguous {} ticket",
+            service.label()
+        )));
     }
     let ticket = percent_decode(raw)
         .filter(|ticket| {
@@ -517,7 +597,7 @@ fn ticket_from_location(location: &str) -> CliResult<String> {
                     .chars()
                     .any(|ch| ch.is_control() || ch.is_whitespace())
         })
-        .ok_or_else(|| auth_error("CAS issued an invalid UCloud ticket"))?;
+        .ok_or_else(|| auth_error(format!("CAS issued an invalid {} ticket", service.label())))?;
     Ok(ticket)
 }
 
@@ -900,14 +980,47 @@ impl CookieJar {
 
     fn header_for(&self, raw: &str) -> Option<String> {
         let url = parse_https_url(raw).filter(|url| url.host_str() == Some(CAS_HOST))?;
+        self.header_for_url(&url)
+    }
+
+    /// Cookie headers are only exposed for the fixed authenticated probe
+    /// targets below; UCloud API requests never receive CAS cookies.
+    fn header_for_authenticated(&self, raw: &str) -> Option<String> {
+        let url = authenticated_cookie_url(raw)?;
+        self.header_for_url(&url)
+    }
+
+    fn header_for_url(&self, url: &Url) -> Option<String> {
         let values: Vec<_> = self
             .0
-            .get_request_values(&url)
+            .get_request_values(url)
             .filter(|(name, value)| !name.is_empty() && !value.is_empty())
             .map(|(name, value)| format!("{name}={value}"))
             .collect();
         (!values.is_empty()).then(|| values.join("; "))
     }
+}
+
+fn authenticated_cookie_url(raw: &str) -> Option<Url> {
+    if raw.chars().any(|ch| ch.is_control() || ch.is_whitespace()) || raw.contains('@') {
+        return None;
+    }
+    let url = Url::parse(raw).ok()?;
+    // These probe endpoints have canonical ports only. Reject an explicit
+    // port so a crafted cookie URL cannot select a different service.
+    if url.port().is_some() {
+        return None;
+    }
+    let allowed = match (url.scheme(), url.host_str()?, url.path()) {
+        ("https", CAS_HOST, path) => path == "/authserver" || path.starts_with("/authserver/"),
+        ("http", "my.bupt.edu.cn", "/list.jsp")
+        | ("http", "my.bupt.edu.cn", "/system/resource/app/cuser/getwxtsA.jsp") => true,
+        ("https", "app.bupt.edu.cn", path) => {
+            path == "/buptdf/wap/default" || path.starts_with("/buptdf/wap/default/")
+        }
+        _ => false,
+    };
+    allowed.then_some(url)
 }
 
 fn approved_cookie_domain(domain: &CookieDomain) -> bool {
@@ -1757,6 +1870,37 @@ mod tests {
             7,
             "an expired token must not be served from cache"
         );
+    }
+
+    #[test]
+    fn authenticated_cookie_urls_are_closed_over_the_probe_endpoints() {
+        for allowed in [
+            "https://auth.bupt.edu.cn/authserver/login",
+            "https://auth.bupt.edu.cn/authserver",
+            "http://my.bupt.edu.cn/list.jsp?totalpage=30",
+            "http://my.bupt.edu.cn/system/resource/app/cuser/getwxtsA.jsp",
+            "https://app.bupt.edu.cn/buptdf/wap/default/chong",
+        ] {
+            assert!(
+                authenticated_cookie_url(allowed).is_some(),
+                "expected approved cookie target: {allowed}"
+            );
+        }
+        for rejected in [
+            "https://evil.example/authserver/login",
+            "https://auth.bupt.edu.cn:444/authserver/login",
+            "https://auth.bupt.edu.cn/other",
+            "http://auth.bupt.edu.cn/authserver/login",
+            "https://my.bupt.edu.cn/list.jsp",
+            "https://app.bupt.edu.cn/other",
+            "https://app.bupt.edu.cn/buptdf/wap/default/../other",
+            "https://user@auth.bupt.edu.cn/authserver/login",
+        ] {
+            assert!(
+                authenticated_cookie_url(rejected).is_none(),
+                "expected rejected cookie target: {rejected}"
+            );
+        }
     }
 
     #[test]

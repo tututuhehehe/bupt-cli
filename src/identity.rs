@@ -20,10 +20,14 @@ const CAS_SERVICE_URL: &str =
 // The protocol and native store are production code with an injected transport.
 // The CLI keeps `Offline` until the parent wires the bounded transport.
 mod cas;
-// The parent read command is wired in a later lane; these helpers are exercised
-// by the identity library tests now.
+// `diagnose` uses the injected transport; the parent lane still owns the CLI
+// transport factory and the final command wiring.
+mod probe;
 #[allow(dead_code)]
 mod session;
+
+pub(crate) use cas::CasService;
+pub(crate) use session::{OwnedCasSession, load_owned_cas_session};
 
 const DIAGNOSE_GROUPS: &[&str] = &[
     "public",
@@ -103,7 +107,7 @@ pub(crate) fn run(
         "login" => run_login(matches, context),
         "status" => run_status(context),
         "logout" => run_logout(context),
-        "diagnose" => run_diagnose(matches, context),
+        "diagnose" => probe::run(matches, context),
         _ => Err(CliError::usage(format!("unknown identity command: {name}"))),
     }
 }
@@ -786,24 +790,6 @@ fn remove_owned_file(path: &Path, label: &str) -> CliResult<bool> {
     }
 }
 
-fn run_diagnose(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
-    let _request_timeout = matches.get_one::<f64>("request_timeout");
-    let groups = requested_groups(matches)?;
-    let account = load_profile(&context.config_dir)?;
-    let session = load_session(&context.cache_dir, account.as_ref());
-    let has_cookies =
-        session.accepted && cookie_status(session.data.get("cookies"), unix_now()).usable > 0;
-
-    if !has_cookies && groups.iter().all(|group| group == "cas") {
-        return Ok(Outcome {
-            data: skipped_cas_report(context),
-            code: 0,
-            diagnostic: None,
-        });
-    }
-    Err(CliError::pending())
-}
-
 fn requested_groups(matches: &ArgMatches) -> CliResult<Vec<String>> {
     let Some(raw) = matches.get_one::<String>("only") else {
         return Ok(DIAGNOSE_GROUPS
@@ -835,29 +821,6 @@ fn requested_groups(matches: &ArgMatches) -> CliResult<Vec<String>> {
     } else {
         Ok(groups)
     }
-}
-
-fn skipped_cas_report(context: &Context<'_>) -> Value {
-    json!({
-        "generated_at": iso_epoch(unix_now()).unwrap_or_default(),
-        "duration_s": 0.0,
-        "session_path": path_string(&context.cache_dir.join(SESSION_FILENAME)),
-        "auth": {
-            "cached_cas_cookies": false,
-            "ucloud_token": false,
-            "ucloud_token_refreshed": false,
-            "mobile_jwgl_token": false,
-        },
-        "summary": {"ok": 0, "fail": 0, "skipped": 1, "total": 1},
-        "endpoints": [{
-            "group": "cas",
-            "name": "CAS service ticket",
-            "method": "GET",
-            "url": CAS_SERVICE_URL,
-            "status": "skipped",
-            "evidence": "no cached CAS session; run `bupt login`",
-        }],
-    })
 }
 
 fn path_string(path: &Path) -> String {
