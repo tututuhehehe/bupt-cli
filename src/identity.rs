@@ -22,6 +22,7 @@ const CAS_SERVICE_URL: &str =
 mod cas;
 // `diagnose` uses the injected transport; the parent lane still owns the CLI
 // transport factory and the final command wiring.
+mod mobile;
 mod probe;
 #[allow(dead_code)]
 mod session;
@@ -347,6 +348,17 @@ pub(crate) fn require_authenticated_profile(config_dir: &Path) -> CliResult<Loca
 #[allow(dead_code)]
 pub(crate) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(String, String)> {
     session::require_ucloud_session(context)
+}
+
+/// Return an undergraduate mobile-JWGL token, reusing a bound unexpired token
+/// before making the one allowed lazy login request.
+///
+/// This is crate-internal because only the academics service consumes it. The
+/// token is persisted atomically in the existing native session; no password or
+/// token is returned in any error or output object.
+#[allow(dead_code)]
+pub(crate) fn require_mobile_jwgl_token(context: &mut Context<'_>) -> CliResult<String> {
+    session::require_mobile_jwgl_token(context)
 }
 
 #[derive(Debug)]

@@ -99,6 +99,92 @@ pub(super) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(St
     Ok((access_token, user_id))
 }
 
+/// Return an undergraduate mobile-JWGL token, reusing a bound unexpired token
+/// before making exactly one lazy login POST.
+///
+/// The existing native session is the source of ownership and of every
+/// non-mobile field. On success only `mobile_jwgl` and `updated_at` change;
+/// on failure the session bytes are left untouched. A graduate profile is
+/// refused before the session or transport is touched.
+pub(super) fn require_mobile_jwgl_token(context: &mut Context<'_>) -> CliResult<String> {
+    ensure_supported_platform()?;
+    let account = load_native_account(&context.config_dir)?;
+    if account.role != Role::Undergraduate {
+        return Err(CliError::new(
+            3,
+            "auth",
+            "mobile JWGL is only available for undergraduate accounts",
+            "Graduate accounts do not exist in the undergraduate mobile JWGL system; use the graduate academic commands.",
+        ));
+    }
+    validate_owner_relationship(&context.config_dir, &context.cache_dir)?;
+    let mut data = load_native_session(&context.cache_dir)?;
+    validate_binding(&account, &data)?;
+
+    if let Some(token) = reusable_mobile_token(&data, unix_now()) {
+        return Ok(token);
+    }
+
+    // Validate the writable private session before spending the one password
+    // POST. The probe is removed immediately and does not alter session bytes.
+    preflight_session_write(&context.cache_dir)?;
+    let password = load_mobile_password(&context.config_dir)?;
+    let issued = super::mobile::login(context.transport, &account.username, &password)?;
+    let mut mobile = match data.remove("mobile_jwgl") {
+        Some(Value::Object(mobile)) => mobile,
+        _ => Map::new(),
+    };
+    mobile.insert("token".to_owned(), Value::String(issued.token.clone()));
+    mobile.insert("expires_at".to_owned(), json!(issued.expires_at));
+    data.insert("mobile_jwgl".to_owned(), Value::Object(mobile));
+    data.insert(
+        "updated_at".to_owned(),
+        json!(iso_epoch(unix_now()).unwrap_or_default()),
+    );
+    write_session_json(&context.cache_dir, &data)?;
+    Ok(issued.token)
+}
+
+fn load_mobile_password(config_dir: &Path) -> CliResult<String> {
+    let credentials = read_private_json(&config_dir.join(CREDENTIALS_FILENAME), "credentials")?;
+    credentials
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| session_error("BUPT credentials are not configured"))
+}
+
+fn reusable_mobile_token(data: &Map<String, Value>, now: f64) -> Option<String> {
+    let mobile = data.get("mobile_jwgl")?.as_object()?;
+    let token = mobile
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && !value
+                    .chars()
+                    .any(|ch| ch.is_control() || ch.is_whitespace())
+        })?;
+    let expiry = mobile
+        .get("expires_at")
+        .and_then(number_value)
+        .filter(|value| value.is_finite())
+        .or_else(|| mobile_jwt_expiry(token))
+        .unwrap_or_else(|| now + 1800.0);
+    (expiry > now).then(|| token.to_owned())
+}
+
+fn mobile_jwt_expiry(token: &str) -> Option<f64> {
+    let exp = super::jwt_payload(token)?
+        .get("exp")
+        .and_then(number_value)
+        .filter(|value| value.is_finite())?;
+    let seconds = if exp > 1e12 { exp / 1000.0 } else { exp };
+    Some(seconds - 120.0)
+}
+
 /// An owned, verified native CAS session for read-only protocol consumers.
 ///
 /// It can request tickets only for `CasService` values; it has no password and
@@ -756,7 +842,7 @@ fn write_session_json(cache_dir: &Path, data: &Map<String, Value>) -> CliResult<
         CliError::new(
             5,
             "upstream",
-            "the UCloud token was refreshed but the local session could not be updated",
+            "the refreshed session token was obtained but the local session could not be updated",
             "Retry the command; if it persists, inspect local permissions and run `bupt login`.",
         )
     })
@@ -902,6 +988,10 @@ mod tests {
     const USER_ID: &str = "42";
     const OLD_REVISION: &str = "TEST-ONLY-OLD-REVISION-a1b2c3";
     const NEW_REVISION: &str = "TEST-ONLY-NEW-REVISION-d4e5f6";
+    const MOBILE_LOGIN_URL: &str = "https://jwglweixin.bupt.edu.cn/bjyddx/login";
+    const MOBILE_PASSWORD: &str = "TEST-ONLY-MOBILE-PASSWORD-7m8n";
+    const OLD_MOBILE_TOKEN: &str = "TEST-ONLY-OLD-MOBILE-TOKEN-p9q0";
+    const NEW_MOBILE_TOKEN: &str = "TEST-ONLY-NEW-MOBILE-TOKEN-r1s2";
 
     struct Sandbox {
         root: TempDir,
@@ -1125,6 +1215,43 @@ mod tests {
         );
     }
 
+    fn seed_native_undergraduate(sandbox: &Sandbox, mobile: Value) {
+        write_private(
+            &sandbox.config_dir().join(CREDENTIALS_FILENAME),
+            &serde_json::json!({
+                "username": USER,
+                "password": MOBILE_PASSWORD,
+                "role": "undergraduate",
+                SESSION_REVISION_KEY: OLD_REVISION,
+                "unrelated": {"keep": "yes"},
+            }),
+        );
+        write_private(
+            &sandbox.cache_dir().join(SESSION_FILENAME),
+            &serde_json::json!({
+                "version": CACHE_VERSION,
+                "username": USER,
+                "role": "undergraduate",
+                SESSION_REVISION_KEY: OLD_REVISION,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-02T03:04:05Z",
+                "cookies": native_cookies(),
+                "ucloud": {
+                    "access_token": OLD_ACCESS_TOKEN,
+                    "refresh_token": REFRESH_TOKEN,
+                    "user_id": USER_ID,
+                    "user_name": USER,
+                    "real_name": "Synthetic Tester",
+                    "jwt_payload": {},
+                    "expires_at": 4102444800.0,
+                },
+                "mobile_jwgl": mobile,
+                "cas_logins_total": 2,
+                "unrelated_session": {"keep": "yes"},
+            }),
+        );
+    }
+
     fn assert_error_redacted(error: &CliError, secrets: &[&str], paths: &[&Path]) {
         let rendered = format!("{error:?}");
         for secret in secrets {
@@ -1179,6 +1306,12 @@ mod tests {
         assert!(!outcome.data.to_string().contains(NEW_PASSWORD));
         assert_eq!(transport.calls.len(), 4);
         assert!(transport.calls.iter().all(|call| call.url != TOKEN_URL));
+        assert!(
+            transport
+                .calls
+                .iter()
+                .all(|call| call.url != MOBILE_LOGIN_URL)
+        );
 
         let post = transport
             .calls
@@ -2076,5 +2209,260 @@ mod tests {
         assert_eq!(error.kind, "upstream");
         assert!(transport.calls.is_empty());
         assert!(entry_names(&sandbox.config_dir()).is_empty());
+    }
+    #[test]
+    fn mobile_requires_undergraduate_role_before_transport() {
+        let sandbox = Sandbox::new();
+        seed_native_state(&sandbox, OLD_PASSWORD, OLD_REVISION);
+        let credentials_path = sandbox.config_dir().join(CREDENTIALS_FILENAME);
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let credentials_before = fs::read(&credentials_path).expect("read credentials");
+        let session_before = fs::read(&session_path).expect("read session");
+        let mut transport = Scripted::default();
+        let error = {
+            let mut context = sandbox.context(&mut transport);
+            require_mobile_jwgl_token(&mut context)
+                .err()
+                .expect("graduate role is refused")
+        };
+        assert_eq!(error.code, 3);
+        assert_eq!(error.kind, "auth");
+        assert!(error.message.contains("undergraduate"));
+        assert!(transport.calls.is_empty());
+        assert_eq!(
+            fs::read(&credentials_path).expect("read credentials"),
+            credentials_before
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("read session"),
+            session_before
+        );
+    }
+
+    #[test]
+    fn mobile_reuses_a_bound_unexpired_token_without_transport_or_write() {
+        let sandbox = Sandbox::new();
+        seed_native_undergraduate(
+            &sandbox,
+            serde_json::json!({
+                "token": OLD_MOBILE_TOKEN,
+                "expires_at": 4102444800.0,
+                "last_error": "old safe marker",
+            }),
+        );
+        // Mobile reuse must not depend on the CAS/UCloud half of the session.
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let mut session = read_json(&session_path);
+        session["cookies"] = serde_json::json!([]);
+        session["ucloud"] = serde_json::json!({"unusable": "synthetic"});
+        write_private(&session_path, &session);
+        let credentials_path = sandbox.config_dir().join(CREDENTIALS_FILENAME);
+        let credentials_before = fs::read(&credentials_path).expect("read credentials");
+        let session_before = fs::read(&session_path).expect("read session");
+        let mut transport = Scripted::default();
+        let token = {
+            let mut context = sandbox.context(&mut transport);
+            require_mobile_jwgl_token(&mut context).expect("fresh token is reused")
+        };
+        assert_eq!(token, OLD_MOBILE_TOKEN);
+        assert!(transport.calls.is_empty());
+        assert_eq!(
+            fs::read(&credentials_path).expect("read credentials"),
+            credentials_before
+        );
+        assert_eq!(
+            fs::read(&session_path).expect("read session"),
+            session_before
+        );
+    }
+
+    #[test]
+    fn mobile_renews_an_expired_token_once_and_preserves_session_scope() {
+        let sandbox = Sandbox::new();
+        seed_native_undergraduate(
+            &sandbox,
+            serde_json::json!({
+                "token": OLD_MOBILE_TOKEN,
+                "expires_at": 1.0,
+                "last_error": "old safe marker",
+                "extra": "keep",
+            }),
+        );
+        let credentials_path = sandbox.config_dir().join(CREDENTIALS_FILENAME);
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let credentials_before = fs::read(&credentials_path).expect("read credentials");
+        let session_before = read_json(&session_path);
+        let mut transport = Scripted::default();
+        enqueue(
+            &mut transport,
+            "POST",
+            MOBILE_LOGIN_URL,
+            200,
+            &[],
+            &format!("{{\"code\":\"1\",\"data\":{{\"token\":\"{NEW_MOBILE_TOKEN}\"}}}}"),
+        );
+        let token = {
+            let mut context = sandbox.context(&mut transport);
+            require_mobile_jwgl_token(&mut context).expect("expired token is renewed once")
+        };
+        assert_eq!(token, NEW_MOBILE_TOKEN);
+        assert_eq!(transport.calls.len(), 1);
+        let call = &transport.calls[0];
+        assert_eq!(call.method, "POST");
+        assert_eq!(call.url, MOBILE_LOGIN_URL);
+        assert_eq!(
+            String::from_utf8_lossy(&call.body),
+            format!("userNo={USER}&pwd={MOBILE_PASSWORD}")
+        );
+        assert!(call.headers.iter().all(|(name, value)| {
+            !name.eq_ignore_ascii_case("cookie")
+                && !name.eq_ignore_ascii_case("authorization")
+                && !value.contains(MOBILE_PASSWORD)
+        }));
+        let session_after = read_json(&session_path);
+        assert_eq!(
+            fs::read(&credentials_path).expect("read credentials"),
+            credentials_before
+        );
+        assert_eq!(
+            session_after["mobile_jwgl"]["token"],
+            serde_json::json!(NEW_MOBILE_TOKEN)
+        );
+        let expires_at = session_after["mobile_jwgl"]["expires_at"]
+            .as_f64()
+            .expect("mobile expiry is numeric");
+        assert!(expires_at > super::unix_now());
+        assert_eq!(
+            session_after["mobile_jwgl"]["last_error"],
+            "old safe marker"
+        );
+        assert_eq!(session_after["mobile_jwgl"]["extra"], "keep");
+        assert_eq!(session_after["cookies"], session_before["cookies"]);
+        assert_eq!(session_after["ucloud"], session_before["ucloud"]);
+        assert_eq!(session_after["cas_logins_total"], 2);
+        assert_eq!(
+            session_after["unrelated_session"],
+            session_before["unrelated_session"]
+        );
+        assert_eq!(session_after["created_at"], session_before["created_at"]);
+        assert_ne!(session_after["updated_at"], session_before["updated_at"]);
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&session_path), 0o600);
+            assert_eq!(entry_names(&sandbox.cache_dir()), vec!["session.json"]);
+            assert_eq!(entry_names(&sandbox.config_dir()), vec!["credentials.json"]);
+        }
+    }
+
+    #[test]
+    fn mobile_failure_preserves_existing_state_and_never_retries() {
+        for (status, headers, body, expected_code) in [
+            (302, vec![("Location", "https://evil.example/")], "", 5),
+            (401, vec![], "", 3),
+            (403, vec![], "", 3),
+            (429, vec![], "", 5),
+            (500, vec![], "", 5),
+            (200, vec![], "not json", 5),
+            (200, vec![], "{}", 5),
+            (200, vec![], "{\"code\":0,\"Msg\":\"rejected\"}", 3),
+            (200, vec![], "{\"code\":1,\"data\":{}}", 3),
+        ] {
+            let sandbox = Sandbox::new();
+            seed_native_undergraduate(
+                &sandbox,
+                serde_json::json!({
+                    "token": OLD_MOBILE_TOKEN,
+                    "expires_at": 1.0,
+                    "last_error": "old safe marker",
+                }),
+            );
+            let credentials_path = sandbox.config_dir().join(CREDENTIALS_FILENAME);
+            let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+            let credentials_before = fs::read(&credentials_path).expect("read credentials");
+            let session_before = fs::read(&session_path).expect("read session");
+            let mut transport = Scripted::default();
+            transport.expected.push_back((
+                "POST",
+                MOBILE_LOGIN_URL.to_owned(),
+                Ok(response(status, &headers, body)),
+            ));
+            let error = {
+                let mut context = sandbox.context(&mut transport);
+                require_mobile_jwgl_token(&mut context)
+                    .err()
+                    .expect("failed mobile login is reported")
+            };
+            assert_eq!(error.code, expected_code, "HTTP {status} body {body}");
+            assert_eq!(
+                transport.calls.len(),
+                1,
+                "HTTP {status} must not retry the password"
+            );
+            assert!(transport.calls[0].url == MOBILE_LOGIN_URL);
+            assert!(!format!("{error:?}").contains(MOBILE_PASSWORD));
+            assert_eq!(
+                fs::read(&credentials_path).expect("read credentials"),
+                credentials_before
+            );
+            assert_eq!(
+                fs::read(&session_path).expect("read session"),
+                session_before
+            );
+            #[cfg(unix)]
+            assert_eq!(entry_names(&sandbox.cache_dir()), vec!["session.json"]);
+        }
+
+        let sandbox = Sandbox::new();
+        seed_native_undergraduate(
+            &sandbox,
+            serde_json::json!({"token": OLD_MOBILE_TOKEN, "expires_at": 1.0}),
+        );
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let session_before = fs::read(&session_path).expect("read session");
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "POST",
+            MOBILE_LOGIN_URL.to_owned(),
+            Err(CliError::new(4, "network", "synthetic network failure", "")),
+        ));
+        let error = {
+            let mut context = sandbox.context(&mut transport);
+            require_mobile_jwgl_token(&mut context)
+                .err()
+                .expect("network failure is reported")
+        };
+        assert_eq!(error.code, 4);
+        assert_eq!(transport.calls.len(), 1);
+        assert_eq!(
+            fs::read(&session_path).expect("read session"),
+            session_before
+        );
+    }
+
+    #[test]
+    fn mobile_rejects_stale_session_binding_before_password_post() {
+        let sandbox = Sandbox::new();
+        seed_native_undergraduate(
+            &sandbox,
+            serde_json::json!({"token": OLD_MOBILE_TOKEN, "expires_at": 4102444800.0}),
+        );
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let mut session = read_json(&session_path);
+        session[SESSION_REVISION_KEY] = serde_json::json!(NEW_REVISION);
+        write_private(&session_path, &session);
+        let session_before = fs::read(&session_path).expect("read session");
+        let mut transport = Scripted::default();
+        let error = {
+            let mut context = sandbox.context(&mut transport);
+            require_mobile_jwgl_token(&mut context)
+                .err()
+                .expect("stale revision is refused")
+        };
+        assert_eq!(error.code, 3);
+        assert!(transport.calls.is_empty());
+        assert_eq!(
+            fs::read(&session_path).expect("read session"),
+            session_before
+        );
     }
 }
