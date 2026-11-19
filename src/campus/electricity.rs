@@ -1,10 +1,13 @@
-use super::dorm::Area;
-use crate::cli::{CliError, CliResult, Context};
-use crate::transport::{Request, Response};
+use super::dorm::{Area, Building, Dorm};
+use super::session::{Route, ScopedTransport, Service, SessionDriver};
+#[cfg(test)]
+use crate::cli::Context;
+use crate::cli::{CliError, CliResult};
+use crate::transport::{Request, Response, Transport};
 use serde_json::{Map, Value, json};
 
 const ELECTRICITY_BASE: &str = "https://app.bupt.edu.cn/buptdf/wap/default";
-const ELECTRICITY_REFERER: &str = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
+pub(super) const REFERER: &str = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
 const AUTH_MARKERS: &[&str] = &["未登录", "请先登录", "登录失效", "登录过期"];
 const NOT_FOUND_MARKERS: &[&str] = &["未找到", "不存在", "无数据"];
 
@@ -22,24 +25,60 @@ pub(super) struct MeterTarget<'a> {
     pub(super) source: &'a str,
 }
 
-#[allow(dead_code)] // exercised offline; wired when the session/room resolver lands
+pub(super) fn request_url(path: &str) -> String {
+    format!("{ELECTRICITY_BASE}{path}")
+}
+
+#[cfg(test)]
 pub(super) fn get_buildings(context: &mut Context<'_>, area: Area) -> CliResult<Value> {
+    buildings_from_transport(context.transport, area)
+}
+
+#[cfg(test)]
+fn buildings_from_transport(transport: &mut dyn Transport, area: Area) -> CliResult<Value> {
     let area_id = area_id(area).to_string();
-    let payload = post(context, "/part", &[("areaid", area_id.as_str())])?;
+    let payload = post(transport, "/part", &[("areaid", area_id.as_str())])?;
     let data = extract_data(&payload, "/part", Expected::Array)?;
+    Ok(buildings_output(data, area))
+}
+
+pub(super) fn get_buildings_with_session(
+    driver: &mut dyn SessionDriver,
+    area: Area,
+) -> CliResult<Value> {
+    let area_id = area_id(area).to_string();
+    let data = post_with_session(
+        driver,
+        Route::electricity_buildings(),
+        "/part",
+        &[("areaid", area_id.as_str())],
+        Expected::Array,
+    )?;
+    Ok(buildings_output(&data, area))
+}
+
+fn buildings_output(data: &Value, area: Area) -> Value {
     let buildings = data.as_array().expect("extract_data validated an array");
-    Ok(json!({
+    json!({
         "area": area.name(),
         "count": buildings.len(),
         "buildings": buildings,
-    }))
+    })
 }
 
-#[allow(dead_code)] // exercised offline; wired when the session/room resolver lands
+#[cfg(test)]
 pub(super) fn get_balance(context: &mut Context<'_>, target: &MeterTarget<'_>) -> CliResult<Value> {
+    balance_from_transport(context.transport, target)
+}
+
+#[cfg(test)]
+fn balance_from_transport(
+    transport: &mut dyn Transport,
+    target: &MeterTarget<'_>,
+) -> CliResult<Value> {
     let area_id = target.area_id.to_string();
     let payload = post(
-        context,
+        transport,
         "/search",
         &[
             ("partmentId", target.partment_id),
@@ -48,19 +87,47 @@ pub(super) fn get_balance(context: &mut Context<'_>, target: &MeterTarget<'_>) -
             ("areaid", area_id.as_str()),
         ],
     )?;
-    let data = extract_data(&payload, "/search", Expected::Object)?;
-    let object = data.as_object().expect("extract_data validated an object");
-    Ok(balance_output(object, target))
+    balance_output_from_payload(&payload, target)
 }
 
-fn post(context: &mut Context<'_>, path: &str, fields: &[(&str, &str)]) -> CliResult<Value> {
-    let response = context
-        .transport
+pub(super) fn get_balance_with_session(
+    driver: &mut dyn SessionDriver,
+    target: &MeterTarget<'_>,
+) -> CliResult<Value> {
+    let area_id = target.area_id.to_string();
+    let data = post_with_session(
+        driver,
+        Route::electricity_balance(),
+        "/search",
+        &[
+            ("partmentId", target.partment_id),
+            ("floorId", target.floor_id),
+            ("dromNumber", target.meter_number),
+            ("areaid", area_id.as_str()),
+        ],
+        Expected::Object,
+    )?;
+    Ok(balance_output_from_data(&data, target))
+}
+
+#[cfg(test)]
+fn balance_output_from_payload(payload: &Value, target: &MeterTarget<'_>) -> CliResult<Value> {
+    let data = extract_data(payload, "/search", Expected::Object)?;
+    Ok(balance_output_from_data(data, target))
+}
+
+fn balance_output_from_data(data: &Value, target: &MeterTarget<'_>) -> Value {
+    let object = data.as_object().expect("extract_data validated an object");
+    balance_output(object, target)
+}
+
+fn post(transport: &mut dyn Transport, path: &str, fields: &[(&str, &str)]) -> CliResult<Value> {
+    let response = transport
         .send(Request {
             method: "POST",
-            url: format!("{ELECTRICITY_BASE}{path}"),
+            url: request_url(path),
             headers: vec![
-                ("Referer".into(), ELECTRICITY_REFERER.into()),
+                ("Referer".into(), REFERER.into()),
                 ("X-Requested-With".into(), "XMLHttpRequest".into()),
                 (
                     "Content-Type".into(),
@@ -80,6 +147,286 @@ fn post(context: &mut Context<'_>, path: &str, fields: &[(&str, &str)]) -> CliRe
     check_http(&response, path)?;
     let body = String::from_utf8_lossy(&response.body);
     serde_json::from_str(&body).map_err(|_| parse_error(path, "returned invalid JSON"))
+}
+
+/// Retry one `/post` only after a confirmed auth failure, mirroring Python's
+/// invalidate-and-retry recursion.
+fn post_with_session(
+    driver: &mut dyn SessionDriver,
+    route: Route,
+    path: &str,
+    fields: &[(&str, &str)],
+    expected: Expected,
+) -> CliResult<Value> {
+    let mut renewed = false;
+    loop {
+        let result = {
+            let mut transport = ScopedTransport::new(driver, route);
+            post(&mut transport, path, fields).and_then(|payload| {
+                let data = extract_data(&payload, path, expected)?;
+                Ok(data.clone())
+            })
+        };
+        match result {
+            Err(error) if !renewed && error.kind == "auth" => {
+                driver.renew(Service::Electricity)?;
+                renewed = true;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn get_floors_with_session(
+    driver: &mut dyn SessionDriver,
+    partment_id: &str,
+    area: Area,
+) -> CliResult<Vec<Value>> {
+    let area_id = area_id(area).to_string();
+    let data = post_with_session(
+        driver,
+        Route::electricity_floors(),
+        "/floor",
+        &[("partmentId", partment_id), ("areaid", area_id.as_str())],
+        Expected::Array,
+    )?;
+    Ok(data
+        .as_array()
+        .expect("extract_data validated an array")
+        .clone())
+}
+
+fn get_rooms_with_session(
+    driver: &mut dyn SessionDriver,
+    partment_id: &str,
+    floor_id: &str,
+    area: Area,
+) -> CliResult<Vec<Value>> {
+    let area_id = area_id(area).to_string();
+    let data = post_with_session(
+        driver,
+        Route::electricity_rooms(),
+        "/drom",
+        &[
+            ("partmentId", partment_id),
+            ("floorId", floor_id),
+            ("areaid", area_id.as_str()),
+        ],
+        Expected::Array,
+    )?;
+    Ok(data
+        .as_array()
+        .expect("extract_data validated an array")
+        .clone())
+}
+
+/// Resolve the caller's dorm through the Python request sequence:
+/// `/floor` -> `/drom` -> `/search`. Metadata caching is intentionally omitted
+/// because a CLI invocation performs one query; the session may still cache at
+/// the HTTP layer.
+pub(super) fn query_with_session(
+    driver: &mut dyn SessionDriver,
+    dorm: &Dorm,
+    threshold: f64,
+) -> CliResult<Value> {
+    let building = dorm.building;
+    let partment_id = building.partment_id();
+    let area = building.area();
+    let area_id = building.area_id();
+    let floor_name = resolved_floor_name(*building, dorm.floor.as_deref(), &dorm.room);
+
+    let floors = get_floors_with_session(driver, partment_id, area)?;
+    let mut floor_id = String::new();
+    for floor in &floors {
+        let Some(object) = floor.as_object() else {
+            return Err(parse_error(
+                "/floor",
+                "field 'd.data' contains a non-object item",
+            ));
+        };
+        let name = object
+            .get("floorName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if name == floor_name {
+            floor_id = string_value(object.get("floorId"));
+        }
+    }
+    if floor_id.is_empty() {
+        return Err(CliError::new(
+            5,
+            "not_found",
+            format!(
+                "electricity floor '{floor_name}' was not found for building '{}'",
+                building.name
+            ),
+            "check the room/floor or run `bupt electricity buildings`",
+        ));
+    }
+
+    let rooms = get_rooms_with_session(driver, partment_id, &floor_id, area)?;
+    let mut target_room = None;
+    let mut best_score = 0;
+    for room in &rooms {
+        let Some(object) = room.as_object() else {
+            return Err(parse_error(
+                "/drom",
+                "field 'd.data' contains a non-object item",
+            ));
+        };
+        let score = room_match_score(
+            &string_value(object.get("dromName")),
+            &string_value(object.get("dromNum")),
+            &dorm.room,
+        );
+        if score > best_score {
+            target_room = Some(object);
+            best_score = score;
+        }
+    }
+    let Some(target_room) = target_room else {
+        return Err(CliError::new(
+            5,
+            "not_found",
+            format!(
+                "electricity room '{}' was not found on floor '{floor_name}' in '{}'",
+                dorm.room, building.name
+            ),
+            "check the room number or run `bupt electricity buildings`",
+        ));
+    };
+
+    let meter_number = string_value(target_room.get("dromNum"));
+    if meter_number.is_empty() {
+        let name = string_value(target_room.get("dromName"));
+        let name = if name.is_empty() {
+            dorm.room.as_str()
+        } else {
+            name.as_str()
+        };
+        return Err(parse_error(
+            "/drom",
+            &format!("room '{name}' is missing its meter number"),
+        ));
+    }
+    let room_name = {
+        let name = string_value(target_room.get("dromName"));
+        if name.is_empty() {
+            dorm.room.clone()
+        } else {
+            name
+        }
+    };
+    let target = MeterTarget {
+        partment_id,
+        floor_id: &floor_id,
+        meter_number: &meter_number,
+        area_id,
+        building: building.name,
+        floor: &floor_name,
+        room: &room_name,
+        threshold,
+        source: dorm.source,
+    };
+    get_balance_with_session(driver, &target)
+}
+
+fn resolved_floor_name(building: Building, explicit: Option<&str>, room: &str) -> String {
+    if let Some(floor) = explicit {
+        let mut floor = floor.trim().to_string();
+        if building.area_id() == 2
+            && !floor.is_empty()
+            && !floor.ends_with('层')
+            && floor.chars().all(|character| character.is_ascii_digit())
+        {
+            floor.push('层');
+        }
+        return floor;
+    }
+    infer_floor_name(room, building.default_floors(), building.area_id())
+}
+
+fn infer_floor_name(room: &str, floors: &[&str], area_id: i32) -> String {
+    let room_digits = room
+        .split(|character: char| !character.is_ascii_digit())
+        .rfind(|part| !part.is_empty());
+    let floor_num = match room_digits {
+        Some(digits) if digits.len() >= 3 => &digits[..digits.len() - 2],
+        Some(digits) => digits,
+        None => {
+            return floors
+                .first()
+                .map(|floor| (*floor).to_string())
+                .unwrap_or_else(|| {
+                    if area_id == 2 {
+                        "1层".into()
+                    } else {
+                        "1".into()
+                    }
+                });
+        }
+    };
+    let suffix = if area_id == 2 { "层" } else { "" };
+    let target = format!("{floor_num}{suffix}");
+    for floor in floors {
+        if *floor == target || floor.replace('层', "") == floor_num {
+            return (*floor).to_string();
+        }
+    }
+    floors
+        .first()
+        .map(|floor| (*floor).to_string())
+        .unwrap_or_else(|| {
+            if area_id == 2 {
+                "1层".into()
+            } else {
+                "1".into()
+            }
+        })
+}
+
+fn normalize_room_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '_' | '-'))
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn room_match_score(room_name: &str, room_number: &str, query: &str) -> u8 {
+    let normalized_query = normalize_room_key(query);
+    if normalized_query.is_empty() {
+        return 0;
+    }
+    let candidates = [
+        normalize_room_key(room_name),
+        normalize_room_key(room_number),
+    ]
+    .into_iter()
+    .filter(|candidate| !candidate.is_empty())
+    .collect::<Vec<_>>();
+    if candidates.contains(&normalized_query) {
+        return 3;
+    }
+    if candidates.iter().any(|candidate| {
+        candidate.ends_with(&normalized_query) || normalized_query.ends_with(candidate)
+    }) {
+        return 2;
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.contains(&normalized_query))
+    {
+        return 1;
+    }
+    0
+}
+
+fn string_value(value: Option<&Value>) -> String {
+    match value {
+        Some(value) if python_truthy(value) => python_string(value),
+        _ => String::new(),
+    }
 }
 
 fn check_http(response: &Response, path: &str) -> CliResult<()> {
@@ -386,7 +733,7 @@ mod tests {
         assert!(
             transport.calls[0]
                 .headers
-                .contains(&("Referer".into(), ELECTRICITY_REFERER.into()))
+                .contains(&("Referer".into(), REFERER.into()))
         );
     }
 
@@ -550,5 +897,167 @@ mod tests {
         };
         assert_eq!(error.code, 5);
         assert_eq!(error.kind, "parse");
+    }
+    struct TestSession {
+        transport: Scripted,
+        routes: Vec<Route>,
+        renew_calls: usize,
+    }
+
+    impl TestSession {
+        fn new() -> Self {
+            Self {
+                transport: Scripted::default(),
+                routes: Vec::new(),
+                renew_calls: 0,
+            }
+        }
+
+        fn queue(&mut self, url: String, body: String) {
+            self.transport
+                .expected
+                .push_back(("POST", url, response(200, body)));
+        }
+    }
+
+    impl SessionDriver for TestSession {
+        fn ensure(&mut self, _: Service) -> CliResult<()> {
+            Ok(())
+        }
+
+        fn send(&mut self, route: Route, request: Request) -> CliResult<Response> {
+            self.routes.push(route);
+            self.transport.send(request)
+        }
+
+        fn renew(&mut self, _: Service) -> CliResult<()> {
+            self.renew_calls += 1;
+            Ok(())
+        }
+    }
+
+    fn dorm(building: &str, room: &str, floor: Option<&str>) -> Dorm {
+        let flags = super::super::dorm::DormFlags {
+            building: Some(building.into()),
+            room: Some(room.into()),
+            floor: floor.map(str::to_string),
+        };
+        super::super::dorm::resolve_dorm(
+            &flags,
+            &super::super::dorm::DormEnv::default(),
+            Path::new("/bupt-test/no-config"),
+        )
+        .expect("resolve test dorm")
+    }
+
+    #[test]
+    fn floor_inference_and_explicit_suffix_match_python_examples() {
+        let xue1 = dorm("学一楼", "101", None);
+        assert_eq!(resolved_floor_name(*xue1.building, None, "101"), "1");
+        assert_eq!(resolved_floor_name(*xue1.building, None, "1204"), "-1");
+        assert_eq!(resolved_floor_name(*xue1.building, Some(" 2 "), "101"), "2");
+
+        let shahe = dorm("沙河校区雁北园A楼", "1204", None);
+        assert_eq!(resolved_floor_name(*shahe.building, None, "1204"), "1层");
+        assert_eq!(
+            resolved_floor_name(*shahe.building, Some("2"), "101"),
+            "2层"
+        );
+        assert_eq!(
+            resolved_floor_name(*shahe.building, Some("2层"), "101"),
+            "2层"
+        );
+        assert_eq!(
+            resolved_floor_name(*shahe.building, Some("强电"), "101"),
+            "强电"
+        );
+
+        let xue29 = dorm("学29楼", "1204", None);
+        assert_eq!(resolved_floor_name(*xue29.building, None, "1204"), "1");
+        let no_digits = dorm("学29楼", "A", None);
+        assert_eq!(resolved_floor_name(*no_digits.building, None, "A"), "1");
+    }
+
+    #[test]
+    fn room_scores_are_exact_then_suffix_then_containment() {
+        assert_eq!(room_match_score("A-101", "M-101", "a101"), 3);
+        assert_eq!(room_match_score("Room-101", "M-102", "101"), 2);
+        assert_eq!(room_match_score("A-1101", "M-102", "101"), 2);
+        assert_eq!(room_match_score("A-1010", "M-102", "101"), 1);
+        assert_eq!(room_match_score("A-101", "M-101", ""), 0);
+        assert_eq!(room_match_score("A-101", "M-101", "202"), 0);
+        assert_eq!(room_match_score("A 101", "M-102", "a_101"), 3);
+    }
+
+    #[test]
+    fn query_rejects_a_floor_name_that_is_not_exactly_present() {
+        let mut session = TestSession::new();
+        session.queue(request_url("/floor"), fixture("electricity_floors.json"));
+        let target = dorm("学一楼", "101", None);
+        let error = query_with_session(&mut session, &target, 10.0).unwrap_err();
+        assert_eq!((error.code, error.kind), (5, "not_found"));
+        assert!(error.message.contains("'1'"));
+        assert_eq!(session.routes.len(), 1);
+    }
+
+    #[test]
+    fn query_rejects_a_room_without_a_match_after_floor_and_room_requests() {
+        let mut session = TestSession::new();
+        session.queue(
+            request_url("/floor"),
+            fixture("electricity_floors_xitucheng.json"),
+        );
+        session.queue(request_url("/drom"), fixture("electricity_rooms.json"));
+        let target = dorm("学一楼", "103", None);
+        let error = query_with_session(&mut session, &target, 10.0).unwrap_err();
+        assert_eq!((error.code, error.kind), (5, "not_found"));
+        assert!(error.message.contains("'103'"), "message={}", error.message);
+        assert_eq!(session.routes.len(), 2);
+    }
+
+    #[test]
+    fn query_fails_honestly_on_non_object_floor_or_room_items() {
+        let mut session = TestSession::new();
+        session.queue(
+            request_url("/floor"),
+            r#"{"e":0,"m":"","d":{"data":["not-an-object"]}}"#.into(),
+        );
+        let target = dorm("学一楼", "101", None);
+        let error = query_with_session(&mut session, &target, 10.0).unwrap_err();
+        assert_eq!((error.code, error.kind), (5, "parse"));
+        assert!(error.message.contains("/floor"));
+        assert_eq!(session.routes.len(), 1);
+
+        let mut session = TestSession::new();
+        session.queue(
+            request_url("/floor"),
+            fixture("electricity_floors_xitucheng.json"),
+        );
+        session.queue(
+            request_url("/drom"),
+            r#"{"e":0,"m":"","d":{"data":["not-an-object"]}}"#.into(),
+        );
+        let error = query_with_session(&mut session, &target, 10.0).unwrap_err();
+        assert_eq!((error.code, error.kind), (5, "parse"));
+        assert!(error.message.contains("/drom"));
+        assert_eq!(session.routes.len(), 2);
+    }
+
+    #[test]
+    fn query_rejects_a_room_without_a_meter_number() {
+        let mut session = TestSession::new();
+        session.queue(
+            request_url("/floor"),
+            fixture("electricity_floors_xitucheng.json"),
+        );
+        session.queue(
+            request_url("/drom"),
+            r#"{"e":0,"m":"","d":{"data":[{"dromName":"101","dromNum":""}]}}"#.into(),
+        );
+        let target = dorm("学一楼", "101", None);
+        let error = query_with_session(&mut session, &target, 10.0).unwrap_err();
+        assert_eq!((error.code, error.kind), (5, "parse"));
+        assert!(error.message.contains("meter number"));
+        assert_eq!(session.routes.len(), 2);
     }
 }
