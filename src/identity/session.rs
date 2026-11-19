@@ -136,6 +136,13 @@ impl OwnedCasSession {
         self.cas.cookie_header_for_authenticated(url)
     }
 
+    pub(crate) fn electricity_cookie(&self, url: &str) -> Option<String> {
+        let path = url.strip_prefix("https://app.bupt.edu.cn/buptdf/wap/default/")?;
+        matches!(path, "chong" | "part" | "floor" | "drom" | "search")
+            .then(|| self.cas.cookie_header_for_authenticated(url))
+            .flatten()
+    }
+
     pub(super) fn mobile_token(&self) -> Option<(String, Option<f64>)> {
         let mobile = self.data.get("mobile_jwgl")?.as_object()?;
         let token = mobile

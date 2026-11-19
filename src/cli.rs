@@ -100,7 +100,7 @@ fn uses_public_library(name: &str) -> bool {
 
 /// Allow the CAS protocol and the implemented read-only UCloud commands.
 fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
-    matches!(name, "login" | "courses")
+    matches!(name, "login" | "courses" | "electricity")
         || (name == "homework"
             && match arguments.subcommand_name() {
                 Some("show" | "verify" | "download") => true,
@@ -435,6 +435,8 @@ mod tests {
             (&["bupt", "homework", "--new", "7"][..], true),
             (&["bupt", "homework", "submit", "1"][..], false),
             (&["bupt", "homework", "download", "1"][..], true),
+            (&["bupt", "electricity", "buildings"][..], true),
+            (&["bupt", "notices"][..], false),
             (&["bupt", "status"][..], false),
             (&["bupt", "diagnose"][..], false),
             (&["bupt", "library", "search", "example"][..], false),

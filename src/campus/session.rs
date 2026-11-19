@@ -8,15 +8,16 @@
 //! silently. No credential material is ever put into a [`Request`] by this
 //! module.
 //!
-//! The parent-owned CLI/session layer attaches a driver through
-//! [`super::run_with_session`]. Until then the default driver reports the same
-//! "not connected" upstream error as the migration build without touching the
-//! network or local state.
+//! The electricity driver uses the fixed HTTPS landing and query routes.
+//! The portal driver remains pending a verified secure session entry point.
 
 use super::electricity;
 use super::portal::{self, NoticeType};
-use crate::cli::{CliError, CliResult};
+use crate::cli::{CliError, CliResult, Context};
+use crate::identity::{self, OwnedCasSession};
 use crate::transport::{Request, Response, Transport};
+use cookie_store::{Cookie, CookieDomain, CookieStore};
+use url::Url;
 
 /// The service scope for session establishment. Portal and electricity use
 /// different Python session-priming paths even when both share CAS cookies.
@@ -105,6 +106,16 @@ impl Route {
         }
     }
 
+    fn is_electricity(self) -> bool {
+        matches!(
+            self.0,
+            RouteKind::ElectricityBuildings
+                | RouteKind::ElectricityFloors
+                | RouteKind::ElectricityRooms
+                | RouteKind::ElectricityBalance
+        )
+    }
+
     pub(crate) fn describe(self) -> &'static str {
         match self.0 {
             RouteKind::PortalNoticeList(_) => "portal notice list",
@@ -182,6 +193,174 @@ impl SessionDriver for PendingSession {
 
     fn renew(&mut self, _: Service) -> CliResult<()> {
         Err(pending())
+    }
+}
+
+/// Per-invocation app cookies; never load or persist a portal session here.
+pub(super) struct ElectricitySession<'a, 't> {
+    context: &'a mut Context<'t>,
+    cas: Option<OwnedCasSession>,
+    cookies: CookieStore,
+    ready: bool,
+    renewed: bool,
+}
+
+impl<'a, 't> ElectricitySession<'a, 't> {
+    pub(super) fn new(context: &'a mut Context<'t>) -> Self {
+        Self {
+            context,
+            cas: None,
+            cookies: CookieStore::default(),
+            ready: false,
+            renewed: false,
+        }
+    }
+
+    fn attach_cookies(&self, request: &mut Request) {
+        let Some(url) = Url::parse(&request.url).ok() else {
+            return;
+        };
+        let app: Vec<_> = self.cookies.get_request_values(&url).collect();
+        let extra = self
+            .cas
+            .as_ref()
+            .and_then(|cas| cas.electricity_cookie(&request.url));
+        let mut pairs: Vec<String> = app
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        if let Some(extra) = &extra {
+            pairs.extend(
+                extra
+                    .split("; ")
+                    .filter(|entry| {
+                        entry
+                            .split_once('=')
+                            .is_some_and(|(name, _)| !app.iter().any(|(key, _)| *key == name))
+                    })
+                    .map(str::to_owned),
+            );
+        }
+        if !pairs.is_empty() {
+            request.headers.push(("Cookie".into(), pairs.join("; ")));
+        }
+    }
+
+    fn exchange(&mut self, mut request: Request) -> CliResult<Response> {
+        self.attach_cookies(&mut request);
+        // This wire layer disables redirects independently of these checks.
+        let url = Url::parse(&request.url).map_err(|_| campus_scope_error())?;
+        let response = self.context.transport.send(request)?;
+        retain_app_cookies(&mut self.cookies, &url, &response);
+        Ok(response)
+    }
+}
+
+impl SessionDriver for ElectricitySession<'_, '_> {
+    fn ensure(&mut self, service: Service) -> CliResult<()> {
+        if service != Service::Electricity {
+            return Err(campus_scope_error());
+        }
+        if self.ready {
+            return Ok(());
+        }
+        if self.cas.is_none() {
+            let cas = identity::load_owned_cas_session(self.context)?;
+            if !cas.has_usable_cookies() {
+                return Err(CliError::new(
+                    3,
+                    "auth",
+                    "the saved CAS session has no usable cookies",
+                    "Run `bupt login`, then try again.",
+                ));
+            }
+            self.cas = Some(cas);
+        }
+        let response = self.exchange(Request {
+            method: "GET",
+            url: electricity::REFERER.to_owned(),
+            headers: vec![],
+            body: vec![],
+        })?;
+        check_electricity_landing(response.status)?;
+        self.ready = true;
+        Ok(())
+    }
+
+    fn send(&mut self, route: Route, request: Request) -> CliResult<Response> {
+        if !self.ready || !route.is_electricity() || !route.accepts(&request) {
+            return Err(campus_scope_error());
+        }
+        self.exchange(request)
+    }
+
+    fn renew(&mut self, service: Service) -> CliResult<()> {
+        if service != Service::Electricity {
+            return Err(campus_scope_error());
+        }
+        if self.renewed {
+            return Err(CliError::new(
+                3,
+                "auth",
+                "the electricity session could not be renewed",
+                "No password was sent; verify the saved campus session.",
+            ));
+        }
+        self.renewed = true;
+        self.ready = false;
+        self.cookies.clear();
+        self.ensure(service)
+    }
+}
+
+fn campus_scope_error() -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        "request is outside the electricity session scope",
+        "",
+    )
+}
+
+fn check_electricity_landing(status: u16) -> CliResult<()> {
+    match status {
+        200..=299 => Ok(()),
+        401 | 403 => Err(CliError::new(
+            3,
+            "auth",
+            "electricity landing rejected the saved session",
+            "No password was sent.",
+        )),
+        301 | 302 | 303 | 307 | 308 => Err(CliError::new(
+            5,
+            "upstream",
+            "electricity landing returned an unverified redirect",
+            "Confirm the app's campus-network sign-in flow; no redirect was followed.",
+        )),
+        _ => Err(CliError::new(
+            5,
+            "upstream",
+            format!("electricity landing returned HTTP {status}"),
+            "",
+        )),
+    }
+}
+
+fn retain_app_cookies(store: &mut CookieStore, url: &Url, response: &Response) {
+    const HOST: &str = "app.bupt.edu.cn";
+    if url.scheme() != "https" || url.host_str() != Some(HOST) {
+        return;
+    }
+    for (key, value) in &response.headers {
+        if !key.eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        if let Ok(cookie) = Cookie::parse(value.clone(), url)
+            && (matches!(&cookie.domain, CookieDomain::HostOnly(host) if host == HOST)
+                || matches!(&cookie.domain, CookieDomain::Suffix(domain) if domain == HOST))
+        {
+            let _ = store.insert(cookie, url);
+        }
     }
 }
 
@@ -277,6 +456,52 @@ mod tests {
         assert!(Route::portal_detail().accepts(&detail));
         detail.url = "https://example.invalid/2026/a/page.htm".into();
         assert!(!Route::portal_detail().accepts(&detail));
+    }
+
+    #[test]
+    fn electricity_landing_cookies_are_app_only_and_keep_the_default_path() {
+        let mut store = CookieStore::default();
+        let landing = Url::parse(electricity::REFERER).unwrap();
+        let response = Response {
+            status: 200,
+            headers: vec![
+                (
+                    "Set-Cookie".into(),
+                    "app=TEST-ONLY; Secure; HttpOnly".into(),
+                ),
+                (
+                    "Set-Cookie".into(),
+                    "parent=TEST-ONLY; Domain=bupt.edu.cn; Path=/".into(),
+                ),
+                (
+                    "Set-Cookie".into(),
+                    "other=TEST-ONLY; Domain=auth.bupt.edu.cn; Path=/".into(),
+                ),
+            ],
+            body: Vec::new(),
+        };
+        retain_app_cookies(&mut store, &landing, &response);
+        let part = Url::parse(&electricity::request_url("/part")).unwrap();
+        assert_eq!(
+            store.get_request_values(&part).collect::<Vec<_>>(),
+            [("app", "TEST-ONLY")]
+        );
+        for raw in [
+            "https://auth.bupt.edu.cn/authserver/login",
+            "https://app.bupt.edu.cn/other",
+            "http://app.bupt.edu.cn/buptdf/wap/default/part",
+        ] {
+            assert!(
+                store
+                    .get_request_values(&Url::parse(raw).unwrap())
+                    .next()
+                    .is_none()
+            );
+        }
+        let error = check_electricity_landing(302).unwrap_err();
+        assert_eq!(error.code, 5);
+        assert!(error.message.contains("redirect"));
+        assert_eq!(check_electricity_landing(401).unwrap_err().code, 3);
     }
 
     #[test]

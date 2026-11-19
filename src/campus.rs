@@ -1,6 +1,7 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::identity;
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use std::path::Path;
 
 mod dorm;
 mod electricity;
@@ -103,6 +104,11 @@ pub(crate) fn run(
     matches: &ArgMatches,
     context: &mut Context<'_>,
 ) -> CliResult<Outcome> {
+    if name == "electricity" {
+        let config_dir = context.config_dir.clone();
+        let mut session = session::ElectricitySession::new(context);
+        return run_electricity(matches, &config_dir, &mut session);
+    }
     let mut session = session::PendingSession;
     run_with_session(name, matches, context, &mut session)
 }
@@ -111,8 +117,8 @@ pub(crate) fn run(
 ///
 /// Kept separate from [`run`] so the parent CLI/session layer can attach its
 /// credential, cookie, and renewal implementation without changing any campus
-/// request or parser. The default [`run`] uses a pending driver and therefore
-/// preserves the migration build's upstream-5 failure after local validation.
+/// request or parser. Portal commands still use the pending driver until the
+/// secure session entry point is verified.
 pub(crate) fn run_with_session(
     name: &str,
     matches: &ArgMatches,
@@ -121,7 +127,7 @@ pub(crate) fn run_with_session(
 ) -> CliResult<Outcome> {
     match name {
         "library" => run_library(matches, context),
-        "electricity" => run_electricity(matches, context, session),
+        "electricity" => run_electricity(matches, &context.config_dir, session),
         "notices" => run_notices(matches, context, session),
         "card" => run_card(context, session),
         _ => Err(CliError::usage("unknown campus command")),
@@ -167,11 +173,11 @@ fn outcome(data: serde_json::Value) -> Outcome {
 }
 
 fn require_session(
-    context: &Context<'_>,
+    config_dir: &Path,
     session: &mut dyn SessionDriver,
     service: Service,
 ) -> CliResult<()> {
-    identity::require_authenticated_profile(&context.config_dir)?;
+    identity::require_authenticated_profile(config_dir)?;
     session.ensure(service)
 }
 
@@ -219,7 +225,7 @@ fn run_library(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Out
 
 fn run_electricity(
     matches: &ArgMatches,
-    context: &mut Context<'_>,
+    config_dir: &Path,
     session: &mut dyn SessionDriver,
 ) -> CliResult<Outcome> {
     if let Some(("buildings", arguments)) = matches.subcommand() {
@@ -228,7 +234,7 @@ fn run_electricity(
             .map(String::as_str)
             .unwrap_or("shahe");
         let area = dorm::resolve_area(requested)?;
-        require_session(context, session, Service::Electricity)?;
+        require_session(config_dir, session, Service::Electricity)?;
         return Ok(outcome(electricity::get_buildings_with_session(
             session, area,
         )?));
@@ -250,8 +256,8 @@ fn run_electricity(
         room: matches.get_one::<String>("room").cloned(),
         floor: matches.get_one::<String>("floor").cloned(),
     };
-    let dorm = dorm::resolve_dorm(&flags, &dorm::dorm_env(), &context.config_dir)?;
-    require_session(context, session, Service::Electricity)?;
+    let dorm = dorm::resolve_dorm(&flags, &dorm::dorm_env(), config_dir)?;
+    require_session(config_dir, session, Service::Electricity)?;
     Ok(outcome(electricity::query_with_session(
         session, &dorm, threshold,
     )?))
@@ -272,7 +278,7 @@ fn run_notices(
         let max_chars = *arguments
             .get_one::<usize>("max-chars")
             .expect("max-chars has a default");
-        require_session(context, session, Service::Portal)?;
+        require_session(&context.config_dir, session, Service::Portal)?;
         return Ok(outcome(portal::fetch_notice_detail_with_session(
             session, &url, max_chars,
         )?));
@@ -282,7 +288,7 @@ fn run_notices(
     let count = *matches
         .get_one::<u64>("count")
         .expect("count has a default");
-    require_session(context, session, Service::Portal)?;
+    require_session(&context.config_dir, session, Service::Portal)?;
     Ok(outcome(portal::fetch_notices_with_session(
         session,
         types.as_deref(),
@@ -291,7 +297,7 @@ fn run_notices(
 }
 
 fn run_card(context: &mut Context<'_>, session: &mut dyn SessionDriver) -> CliResult<Outcome> {
-    require_session(context, session, Service::Portal)?;
+    require_session(&context.config_dir, session, Service::Portal)?;
     Ok(outcome(portal::fetch_card_with_session(session)?))
 }
 
