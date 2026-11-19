@@ -136,13 +136,22 @@ fn post(transport: &mut dyn Transport, path: &str, fields: &[(&str, &str)]) -> C
             ],
             body: form_body(fields),
         })
-        .map_err(|_| {
-            CliError::new(
-                4,
-                "network",
-                "electricity request failed",
-                "app.bupt.edu.cn must be reachable; try `bupt diagnose`",
-            )
+        .map_err(|error| {
+            if error.kind == "network" {
+                CliError::new(
+                    4,
+                    "network",
+                    format!("electricity {path} HTTPS request failed"),
+                    "app.bupt.edu.cn must be reachable; try `bupt diagnose`",
+                )
+            } else {
+                CliError::new(
+                    error.code,
+                    error.kind,
+                    format!("electricity {path} request failed"),
+                    "",
+                )
+            }
         })?;
     check_http(&response, path)?;
     let body = String::from_utf8_lossy(&response.body);
@@ -881,6 +890,30 @@ mod tests {
             assert_eq!(error.kind, "parse");
             assert!(!error.message.is_empty());
         }
+    }
+
+    #[test]
+    fn electricity_transport_error_preserves_the_layer_and_route_without_diagnostics() {
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "POST",
+            request_url("/floor"),
+            Err(CliError::new(
+                5,
+                "upstream",
+                "TEST-ONLY-INTERNAL",
+                "TEST-ONLY-HINT",
+            )),
+        ));
+        let err = post(
+            &mut transport,
+            "/floor",
+            &[("partmentId", "fixture"), ("areaid", "1")],
+        )
+        .unwrap_err();
+        assert_eq!((err.code, err.kind), (5, "upstream"));
+        assert_eq!(err.message, "electricity /floor request failed");
+        assert!(err.hint.is_empty());
     }
 
     #[test]
