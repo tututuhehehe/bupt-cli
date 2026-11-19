@@ -98,10 +98,15 @@ fn uses_public_library(name: &str) -> bool {
     name == "library"
 }
 
-/// Allow the CAS protocol and only the first two read-only UCloud flows.
+/// Allow the CAS protocol and the implemented read-only UCloud commands.
 fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
     matches!(name, "login" | "courses")
-        || (name == "homework" && arguments.subcommand().is_none() && arguments.get_flag("undone"))
+        || (name == "homework"
+            && match arguments.subcommand_name() {
+                Some("show" | "verify") => true,
+                None => arguments.get_one::<u64>("new").is_none(),
+                _ => false,
+            })
 }
 
 const LANES: &[Lane] = &[
@@ -373,7 +378,13 @@ mod tests {
             (&["bupt", "login"][..], true),
             (&["bupt", "courses"][..], true),
             (&["bupt", "homework", "--undone"][..], true),
-            (&["bupt", "homework"][..], false),
+            (&["bupt", "homework"][..], true),
+            (&["bupt", "homework", "--course", "site-1"][..], true),
+            (&["bupt", "homework", "show", "1"][..], true),
+            (&["bupt", "homework", "verify", "1"][..], true),
+            (&["bupt", "homework", "--new", "7"][..], false),
+            (&["bupt", "homework", "submit", "1"][..], false),
+            (&["bupt", "homework", "download", "1"][..], false),
             (&["bupt", "status"][..], false),
             (&["bupt", "diagnose"][..], false),
             (&["bupt", "library", "search", "example"][..], false),
