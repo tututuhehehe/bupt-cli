@@ -18,7 +18,7 @@ const SUBMIT_VIEW_ERROR_LIMIT: usize = 200;
 pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     let assignment_id = matches.get_one::<String>("id").cloned().unwrap_or_default();
     let course_id = matches.get_one::<String>("course").map(String::as_str);
-    let session = super::load_session(context)?;
+    let session = super::load_read_session(context)?;
     execute_show(&assignment_id, course_id, &session, context.transport)
 }
 

@@ -33,7 +33,7 @@ pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<
         .map(|values| values.cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     let expected_text = matches.get_one::<String>("text").cloned();
-    let session = super::load_session(context)?;
+    let session = super::load_read_session(context)?;
     execute_verify(
         &assignment_id,
         &expected_ids,

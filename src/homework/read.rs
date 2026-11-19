@@ -1,8 +1,7 @@
-//! Read-only UCloud course paging and undone-homework mapping.
+//! Read-only UCloud course, homework-list, and undone mapping.
 //!
-//! This is an in-process scaffold: callers inject both the transport and a
-//! synthetic session. The public CLI does not create a real session yet, so no
-//! production credential, browser, or network path reaches these helpers.
+//! Callers inject both the transport and the verified native session; tests
+//! substitute a synthetic session and `Scripted` transport.
 
 use crate::cli::{CliError, CliResult};
 use crate::transport::{Request, Transport};
@@ -12,8 +11,27 @@ use std::collections::HashSet;
 const UCLOUD_API: &str = "https://apiucloud.bupt.edu.cn";
 const COURSES_PATH: &str = "/ykt-site/site/list/student/current";
 const UNDONE_PATH: &str = "/ykt-site/site/student/undone";
+const LIST_PATH: &str = "/ykt-site/work/student/list";
 const COURSE_PAGE_SIZE: usize = 50;
 const COURSE_PAGE_LIMIT: u32 = 10;
+/// Python `get_all` stops at 30 course sites and requests 30 per course page.
+const HOMEWORK_SITE_LIMIT: usize = 30;
+const HOMEWORK_COURSE_PAGE_SIZE: usize = 30;
+const LIST_PAGE_SIZE: usize = 50;
+const MAX_PAGINATION_PAGES: u32 = 1000;
+/// Raw UCloud keys that may carry a publish/created/start timestamp, in
+/// Python `publish_time` preference order.
+const PUBLISH_TIME_KEYS: &[&str] = &[
+    "assignmentBeginTime",
+    "beginTime",
+    "publishTime",
+    "releaseTime",
+    "createTime",
+    "createdTime",
+    "gmtCreate",
+    "createDate",
+    "startTime",
+];
 
 pub(super) struct Session {
     pub(super) access_token: String,
@@ -57,23 +75,38 @@ pub(super) fn courses_json(courses: &[Course]) -> Value {
     })
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(super) struct UndoneItem {
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct HomeworkItem {
     pub(super) activity_id: String,
     pub(super) activity_name: String,
     pub(super) site_id: Option<String>,
     pub(super) site_name: String,
     pub(super) begin_time: Option<String>,
-    pub(super) published_at: Option<time::PrimitiveDateTime>,
     pub(super) end_time: Option<String>,
+    pub(super) submit_time: Option<String>,
     pub(super) is_submitted: bool,
+    pub(super) score: Option<f64>,
+    pub(super) raw: Map<String, Value>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+impl HomeworkItem {
+    fn parsed_end_time(&self) -> Option<time::PrimitiveDateTime> {
+        self.end_time.as_deref().and_then(local_timestamp)
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub(super) struct UndoneOverview {
     pub(super) total_sites: u64,
     pub(super) undone_count: u64,
-    pub(super) items: Vec<UndoneItem>,
+    pub(super) items: Vec<HomeworkItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ListFilters {
+    pub(super) undone: bool,
+    pub(super) course: Option<String>,
+    pub(super) new_days: Option<u64>,
 }
 
 pub(super) fn undone_json(
@@ -81,49 +114,113 @@ pub(super) fn undone_json(
     limit: u64,
     now: time::PrimitiveDateTime,
 ) -> Value {
+    homework_list_json(
+        overview.items,
+        "undone",
+        ListFilters {
+            undone: true,
+            course: None,
+            new_days: None,
+        },
+        limit,
+        now,
+    )
+}
+
+/// Normalize homework rows into the Python `assignment_dict` shape, then
+/// deduplicate by non-empty activity id, filter, sort by deadline/title, and
+/// apply `--limit` (0 means all). `now` is injected so overdue and
+/// `hours_remaining` stay deterministic in tests.
+pub(super) fn homework_list_json(
+    items: Vec<HomeworkItem>,
+    method: &str,
+    filters: ListFilters,
+    limit: u64,
+    now: time::PrimitiveDateTime,
+) -> Value {
     let mut seen = HashSet::new();
-    let mut entries: Vec<_> = overview
-        .items
+    let mut selected: Vec<HomeworkItem> = items
         .into_iter()
-        .filter(|item| {
-            !item.is_submitted
-                && (item.activity_id.is_empty() || seen.insert(item.activity_id.clone()))
-        })
-        .map(|item| (item.end_time.as_deref().and_then(local_timestamp), item))
+        .filter(|item| item.activity_id.is_empty() || seen.insert(item.activity_id.clone()))
         .collect();
-    entries.sort_by(|(due_a, item_a), (due_b, item_b)| {
-        due_a
+    if let Some(course) = filters
+        .course
+        .as_deref()
+        .filter(|course| !course.is_empty())
+    {
+        selected.retain(|item| item.site_id.as_deref() == Some(course));
+    }
+    if filters.undone {
+        selected.retain(|item| !item.is_submitted);
+    }
+    selected.sort_by(|left, right| {
+        let left_due = left.parsed_end_time();
+        let right_due = right.parsed_end_time();
+        left_due
             .is_none()
-            .cmp(&due_b.is_none())
-            .then(due_a.cmp(due_b))
-            .then(item_a.activity_name.cmp(&item_b.activity_name))
+            .cmp(&right_due.is_none())
+            .then(left_due.cmp(&right_due))
+            .then(left.activity_name.cmp(&right.activity_name))
     });
     if limit != 0 {
-        entries.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        selected.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
-    let assignments: Vec<_> = entries
-        .into_iter()
-        .map(|(due, item)| {
-            let overdue = due.is_some_and(|due| due < now);
-            let hours =
-                due.map(|due| (((due - now).as_seconds_f64() / 36.0).round_ties_even()) / 100.0);
-            serde_json::json!({
-                "id": item.activity_id, "title": item.activity_name,
-                "course": (!item.site_name.is_empty()).then_some(item.site_name),
-                "course_id": item.site_id,
-                "published_at": item.published_at.map(iso_local_timestamp),
-                "deadline": item.end_time, "begin_time": item.begin_time,
-                "status": if overdue { "overdue" } else { "pending" },
-                "submitted": false, "submitted_at": null, "score": null,
-                "hours_remaining": hours, "overdue": overdue,
-            })
-        })
+    let assignments: Vec<Value> = selected
+        .iter()
+        .map(|item| assignment_json(item, now))
         .collect();
     serde_json::json!({
-        "count": assignments.len(), "method": "undone",
-        "filters": { "undone": true, "course": null, "new_days": null },
+        "count": assignments.len(),
+        "method": method,
+        "filters": {
+            "undone": filters.undone,
+            "course": filters.course,
+            "new_days": filters.new_days,
+        },
         "assignments": assignments,
     })
+}
+
+fn assignment_json(item: &HomeworkItem, now: time::PrimitiveDateTime) -> Value {
+    let due = item.parsed_end_time();
+    let overdue = due.is_some_and(|due| now > due);
+    let status = if item.is_submitted {
+        "submitted"
+    } else if overdue {
+        "overdue"
+    } else {
+        "pending"
+    };
+    let hours = due.map(|due| (((due - now).as_seconds_f64() / 36.0).round_ties_even()) / 100.0);
+    serde_json::json!({
+        "id": item.activity_id,
+        "title": item.activity_name,
+        "course": (!item.site_name.is_empty()).then_some(item.site_name.clone()),
+        "course_id": item.site_id,
+        "published_at": publish_time(item).map(iso_local_timestamp),
+        "deadline": item.end_time,
+        "begin_time": item.begin_time,
+        "status": status,
+        "submitted": item.is_submitted,
+        "submitted_at": item.submit_time,
+        "score": item.score,
+        "hours_remaining": hours,
+        "overdue": overdue,
+    })
+}
+
+fn publish_time(item: &HomeworkItem) -> Option<time::PrimitiveDateTime> {
+    for key in PUBLISH_TIME_KEYS {
+        if let Some(parsed) = item
+            .raw
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(local_timestamp)
+        {
+            return Some(parsed);
+        }
+    }
+    item.begin_time.as_deref().and_then(local_timestamp)
 }
 
 fn local_timestamp(text: &str) -> Option<time::PrimitiveDateTime> {
@@ -196,9 +293,290 @@ pub(super) fn fetch_course_page(
     session: &Session,
     page: u32,
 ) -> CliResult<(Vec<Course>, usize)> {
-    let url = format!("{UCLOUD_API}{COURSES_PATH}?size={COURSE_PAGE_SIZE}&current={page}");
+    let parsed = fetch_course_page_with_size(transport, session, page, COURSE_PAGE_SIZE)?;
+    Ok((parsed.courses, parsed.record_count))
+}
+
+#[derive(Debug)]
+struct CoursePage {
+    courses: Vec<Course>,
+    record_count: usize,
+    total: Option<u64>,
+    signature: String,
+}
+
+fn fetch_course_page_with_size(
+    transport: &mut dyn Transport,
+    session: &Session,
+    page: u32,
+    size: usize,
+) -> CliResult<CoursePage> {
+    let url = format!("{UCLOUD_API}{COURSES_PATH}?size={size}&current={page}");
     let data = get_data(transport, session, "UCloud course list", url)?;
     parse_course_page(&data)
+}
+
+/// Walk the course list for the default `homework` view. Python `get_all`
+/// requests up to 30 sites, follows a page when `total` says more rows remain,
+/// and refuses to loop on an unchanged page.
+fn fetch_all_courses_for_homework(
+    transport: &mut dyn Transport,
+    session: &Session,
+) -> CliResult<Vec<Course>> {
+    let mut courses = Vec::new();
+    let mut fetched_records = 0usize;
+    let mut seen_pages = HashSet::new();
+    let mut finished = false;
+    for page in 1..=MAX_PAGINATION_PAGES {
+        let CoursePage {
+            courses: batch,
+            record_count,
+            total,
+            signature,
+        } = fetch_course_page_with_size(transport, session, page, HOMEWORK_COURSE_PAGE_SIZE)?;
+        if record_count > 0 && !seen_pages.insert(signature) {
+            return Err(CliError::new(
+                5,
+                "parse",
+                "UCloud course pagination repeated a page",
+                "",
+            ));
+        }
+        let remaining = HOMEWORK_SITE_LIMIT - courses.len();
+        courses.extend(batch.into_iter().take(remaining));
+        fetched_records += record_count;
+        if courses.len() >= HOMEWORK_SITE_LIMIT
+            || pagination_finished(
+                record_count,
+                HOMEWORK_COURSE_PAGE_SIZE,
+                fetched_records,
+                total,
+            )
+        {
+            finished = true;
+            break;
+        }
+    }
+    if !finished {
+        return Err(CliError::new(
+            5,
+            "parse",
+            "UCloud course pagination exceeded the safety limit",
+            "",
+        ));
+    }
+    Ok(courses)
+}
+
+/// Fetch one course's homework pages. The CLI uses this for `--course`, so a
+/// course with more than one page is not silently truncated.
+pub(super) fn fetch_course_homework(
+    transport: &mut dyn Transport,
+    session: &Session,
+    site_id: &str,
+) -> CliResult<Vec<HomeworkItem>> {
+    if session.user_id.is_empty() {
+        return Err(missing_user_id());
+    }
+    let mut items = Vec::new();
+    let mut fetched_records = 0usize;
+    let mut seen_pages = HashSet::new();
+    let mut finished = false;
+    for page in 1..=MAX_PAGINATION_PAGES {
+        let HomeworkPage {
+            items: batch,
+            record_count,
+            total,
+            signature,
+        } = fetch_homework_page(transport, session, site_id, page)?;
+        if record_count > 0 && !seen_pages.insert(signature) {
+            return Err(CliError::new(
+                5,
+                "parse",
+                format!("UCloud homework pagination repeated a page for site '{site_id}'"),
+                "",
+            ));
+        }
+        items.extend(batch);
+        fetched_records += record_count;
+        if pagination_finished(record_count, LIST_PAGE_SIZE, fetched_records, total) {
+            finished = true;
+            break;
+        }
+    }
+    if !finished {
+        return Err(CliError::new(
+            5,
+            "parse",
+            format!("UCloud homework pagination exceeded the safety limit for site '{site_id}'"),
+            "",
+        ));
+    }
+    Ok(items)
+}
+
+/// Fetch all homework for up to 30 course sites, matching Python `get_all`:
+/// a course's own `siteName` fills rows that omit it.
+pub(super) fn fetch_all_homework(
+    transport: &mut dyn Transport,
+    session: &Session,
+) -> CliResult<Vec<HomeworkItem>> {
+    if session.user_id.is_empty() {
+        return Err(missing_user_id());
+    }
+    let courses = fetch_all_courses_for_homework(transport, session)?;
+    let mut items = Vec::new();
+    for course in courses {
+        if course.site_id.is_empty() {
+            continue;
+        }
+        let mut batch = fetch_course_homework(transport, session, &course.site_id)?;
+        for item in &mut batch {
+            if item.site_name.is_empty() {
+                item.site_name = course.site_name.clone();
+            }
+        }
+        items.extend(batch);
+    }
+    Ok(items)
+}
+
+#[derive(Debug)]
+struct HomeworkPage {
+    items: Vec<HomeworkItem>,
+    record_count: usize,
+    total: Option<u64>,
+    signature: String,
+}
+
+fn fetch_homework_page(
+    transport: &mut dyn Transport,
+    session: &Session,
+    site_id: &str,
+    page: u32,
+) -> CliResult<HomeworkPage> {
+    let body = serde_json::json!({
+        "siteId": site_id,
+        "userId": session.user_id,
+        "current": page,
+        "size": LIST_PAGE_SIZE,
+    });
+    let data = post_data(
+        transport,
+        session,
+        "UCloud homework list",
+        format!("{UCLOUD_API}{LIST_PATH}"),
+        &body,
+    )?;
+    parse_homework_page(&data, site_id)
+}
+
+fn parse_homework_page(data: &Value, site_id: &str) -> CliResult<HomeworkPage> {
+    let object = data.as_object().ok_or_else(|| {
+        CliError::new(
+            5,
+            "parse",
+            "UCloud homework list returned malformed data",
+            "",
+        )
+    })?;
+    let records = object
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CliError::new(
+                5,
+                "parse",
+                "UCloud homework list returned malformed records",
+                "",
+            )
+        })?;
+
+    let mut items = Vec::with_capacity(records.len());
+    for record in records {
+        let record = record.as_object().ok_or_else(|| {
+            CliError::new(
+                5,
+                "parse",
+                "UCloud homework list returned malformed records",
+                "",
+            )
+        })?;
+        let status = first_present(record, &["assignmentStatus", "status"]);
+        let submitted = status.is_some_and(list_status_submitted)
+            || record.get("submitTime").is_some_and(is_truthy);
+        items.push(HomeworkItem {
+            activity_id: first_present_or_empty(record, &["activityId", "id"]),
+            activity_name: first_present_or_empty(record, &["assignmentTitle", "activityName"]),
+            site_id: Some(site_id.to_owned()),
+            site_name: record
+                .get("siteName")
+                .filter(|value| is_truthy(value))
+                .and_then(value_as_string)
+                .unwrap_or_default(),
+            begin_time: first_present(record, &["assignmentBeginTime", "beginTime"])
+                .and_then(value_as_string),
+            end_time: first_present(record, &["assignmentEndTime", "endTime"])
+                .and_then(value_as_string),
+            submit_time: record
+                .get("submitTime")
+                .filter(|value| is_truthy(value))
+                .and_then(value_as_string),
+            is_submitted: submitted,
+            score: record.get("score").and_then(parse_score),
+            raw: record.clone(),
+        });
+    }
+    let total = pagination_total(object, "UCloud homework list")?;
+    let signature = serde_json::to_string(records).unwrap_or_default();
+    Ok(HomeworkPage {
+        items,
+        record_count: records.len(),
+        total,
+        signature,
+    })
+}
+
+fn list_status_submitted(value: &Value) -> bool {
+    match value {
+        Value::Bool(_) => false,
+        Value::Number(number) => number.as_f64() == Some(0.0),
+        Value::String(text) => text == "0" || text == "SUBMITTED",
+        _ => false,
+    }
+}
+
+fn parse_score(value: &Value) -> Option<f64> {
+    match value {
+        Value::Bool(_) | Value::Null | Value::Array(_) | Value::Object(_) => None,
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) if !text.trim().is_empty() => text.trim().parse().ok(),
+        Value::String(_) => None,
+    }
+}
+
+fn pagination_finished(
+    record_count: usize,
+    requested_size: usize,
+    fetched_records: usize,
+    total: Option<u64>,
+) -> bool {
+    if record_count == 0 {
+        return true;
+    }
+    if let Some(total) = total {
+        return fetched_records as u64 >= total;
+    }
+    record_count < requested_size
+}
+
+fn missing_user_id() -> CliError {
+    CliError::new(
+        3,
+        "auth",
+        "UCloud token is missing user_id",
+        "Run `bupt login --force`, then retry.",
+    )
 }
 
 /// Fetch the pending-assignment overview. This maps only fields present in the
@@ -209,12 +587,7 @@ pub(super) fn fetch_undone(
     session: &Session,
 ) -> CliResult<UndoneOverview> {
     if session.user_id.is_empty() {
-        return Err(CliError::new(
-            3,
-            "auth",
-            "UCloud token is missing user_id",
-            "Run `bupt login --force`, then retry.",
-        ));
+        return Err(missing_user_id());
     }
     let url = query_url(UNDONE_PATH, &[("userId", session.user_id.as_str())]);
     let data = get_data(transport, session, "UCloud undone homework", url)?;
@@ -336,7 +709,7 @@ pub(super) fn send_payload(
     Ok(object.clone())
 }
 
-fn parse_course_page(data: &Value) -> CliResult<(Vec<Course>, usize)> {
+fn parse_course_page(data: &Value) -> CliResult<CoursePage> {
     let object = data.as_object().ok_or_else(|| {
         CliError::new(5, "parse", "UCloud course list returned malformed data", "")
     })?;
@@ -373,8 +746,14 @@ fn parse_course_page(data: &Value) -> CliResult<(Vec<Course>, usize)> {
     }
     // `cmd_courses` does not use `total` to stop, but the Python parser still
     // rejects a malformed pagination total. Validate it for parity.
-    let _ = pagination_total(object, "UCloud course list")?;
-    Ok((courses, records.len()))
+    let total = pagination_total(object, "UCloud course list")?;
+    let signature = serde_json::to_string(records).unwrap_or_default();
+    Ok(CoursePage {
+        courses,
+        record_count: records.len(),
+        total,
+        signature,
+    })
 }
 
 fn parse_undone(data: &Value) -> CliResult<UndoneOverview> {
@@ -408,7 +787,7 @@ fn parse_undone(data: &Value) -> CliResult<UndoneOverview> {
                 "",
             )
         })?;
-        items.push(UndoneItem {
+        items.push(HomeworkItem {
             activity_id: first_truthy_string(record, &["activityId", "id"]),
             activity_name: first_truthy_string(record, &["activityName", "assignmentTitle"]),
             site_id: record
@@ -417,22 +796,11 @@ fn parse_undone(data: &Value) -> CliResult<UndoneOverview> {
                 .and_then(value_as_string),
             site_name: first_truthy_string(record, &["siteName"]),
             begin_time: record.get("beginTime").and_then(value_as_string),
-            published_at: [
-                "assignmentBeginTime",
-                "beginTime",
-                "publishTime",
-                "releaseTime",
-                "createTime",
-                "createdTime",
-                "gmtCreate",
-                "createDate",
-                "startTime",
-            ]
-            .into_iter()
-            .filter_map(|key| record.get(key).and_then(Value::as_str))
-            .find_map(local_timestamp),
             end_time: record.get("endTime").and_then(value_as_string),
+            submit_time: None,
             is_submitted: false,
+            score: None,
+            raw: record.clone(),
         });
     }
 
@@ -1113,5 +1481,490 @@ mod tests {
 
         assert_eq!(error.code, 3);
         assert!(transport.calls.is_empty());
+    }
+
+    fn course_url_sized(page: u32, size: usize) -> String {
+        format!("{UCLOUD_API}{COURSES_PATH}?size={size}&current={page}")
+    }
+
+    fn homework_list_url() -> String {
+        format!("{UCLOUD_API}{LIST_PATH}")
+    }
+
+    fn homework_page(records: Value, total: Option<u64>) -> CliResult<Response> {
+        let mut data = json!({"records": records});
+        if let Some(total) = total {
+            data["total"] = json!(total);
+        }
+        json_response(200, json!({"code": 200, "data": data}))
+    }
+
+    fn course_page(records: Value, total: Option<u64>) -> CliResult<Response> {
+        let mut data = json!({"records": records});
+        if let Some(total) = total {
+            data["total"] = json!(total);
+        }
+        json_response(200, json!({"code": 200, "data": data}))
+    }
+
+    fn list_record(index: usize) -> Value {
+        json!({
+            "activityId": format!("hw-{index:02}"),
+            "assignmentTitle": format!("作业 {index:02}"),
+            "assignmentStatus": 99,
+            "assignmentEndTime": "2026-12-01 23:59",
+        })
+    }
+
+    fn homework_items() -> Vec<HomeworkItem> {
+        let data = json!({
+            "records": [
+                {
+                    "activityId": "hw-submitted",
+                    "assignmentTitle": "已交作业",
+                    "siteName": "课程一",
+                    "assignmentStatus": 0,
+                    "assignmentBeginTime": "2026-11-01 08:00",
+                    "assignmentEndTime": "2026-11-20 23:59",
+                    "submitTime": "2026-11-15 10:00",
+                    "score": 88
+                },
+                {
+                    "activityId": "hw-past",
+                    "assignmentTitle": "已过期作业",
+                    "siteName": "课程一",
+                    "assignmentStatus": 99,
+                    "assignmentEndTime": "2026-11-01 23:59"
+                },
+                {
+                    "activityId": "hw-no-deadline",
+                    "assignmentTitle": "无截止时间",
+                    "siteName": "课程一",
+                    "assignmentStatus": 99
+                },
+                {
+                    "activityId": "hw-late",
+                    "assignmentTitle": "待完成作业",
+                    "siteName": "课程一",
+                    "assignmentStatus": 99,
+                    "assignmentEndTime": "2026-11-30 23:59"
+                }
+            ],
+            "total": 4
+        });
+        parse_homework_page(&data, "site-1")
+            .expect("synthetic homework page")
+            .items
+    }
+
+    fn now() -> time::PrimitiveDateTime {
+        local_timestamp("2026-11-18 12:00:00").expect("synthetic clock")
+    }
+
+    #[test]
+    fn homework_all_paginates_course_and_student_pages() {
+        let first: Vec<Value> = (0..50).map(list_record).collect();
+        let second: Vec<Value> = (50..60).map(list_record).collect();
+        let mut transport = scripted(vec![
+            (
+                "GET",
+                course_url_sized(1, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(json!([{"siteId": "site-1", "siteName": "课程一"}]), Some(1)),
+            ),
+            (
+                "POST",
+                homework_list_url(),
+                homework_page(json!(first), Some(60)),
+            ),
+            (
+                "POST",
+                homework_list_url(),
+                homework_page(json!(second), Some(60)),
+            ),
+        ]);
+        let items = fetch_all_homework(&mut transport, &session()).expect("all homework");
+
+        assert_eq!(items.len(), 60);
+        assert_eq!(items[0].site_id.as_deref(), Some("site-1"));
+        assert_eq!(items[0].site_name, "课程一");
+        assert_eq!(transport.calls.len(), 3);
+        let first_body: Value =
+            serde_json::from_slice(&transport.calls[1].body).expect("first page body");
+        assert_eq!(
+            first_body,
+            json!({
+                "siteId": "site-1",
+                "userId": "synthetic-user",
+                "current": 1,
+                "size": LIST_PAGE_SIZE,
+            })
+        );
+        let second_body: Value =
+            serde_json::from_slice(&transport.calls[2].body).expect("second page body");
+        assert_eq!(second_body["current"], 2);
+    }
+
+    #[test]
+    fn homework_course_list_paginates_until_total() {
+        let first: Vec<Value> = (0..50).map(list_record).collect();
+        let second: Vec<Value> = (50..55).map(list_record).collect();
+        let mut transport = scripted(vec![
+            (
+                "POST",
+                homework_list_url(),
+                homework_page(json!(first), Some(55)),
+            ),
+            (
+                "POST",
+                homework_list_url(),
+                homework_page(json!(second), Some(55)),
+            ),
+        ]);
+        let items = fetch_course_homework(&mut transport, &session(), "site-1")
+            .expect("course homework pages");
+
+        assert_eq!(items.len(), 55);
+        assert_eq!(transport.calls.len(), 2);
+        assert_eq!(transport.calls[0].method, "POST");
+        assert_eq!(transport.calls[0].url, homework_list_url());
+    }
+
+    #[test]
+    fn homework_course_list_short_page_stops_without_a_second_request() {
+        let records = json!([
+            {"activityId": "hw-1", "assignmentTitle": "一", "assignmentStatus": 99},
+            {"activityId": "hw-2", "assignmentTitle": "二", "assignmentStatus": 99}
+        ]);
+        let mut transport = scripted(vec![(
+            "POST",
+            homework_list_url(),
+            homework_page(records, None),
+        )]);
+        let items =
+            fetch_course_homework(&mut transport, &session(), "site-1").expect("short course list");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(transport.calls.len(), 1);
+    }
+
+    #[test]
+    fn homework_course_list_repeated_page_is_a_parse_error() {
+        let records: Vec<Value> = (0..50).map(list_record).collect();
+        let mut transport = scripted(vec![
+            (
+                "POST",
+                homework_list_url(),
+                homework_page(json!(records), Some(100)),
+            ),
+            (
+                "POST",
+                homework_list_url(),
+                homework_page(json!(records), Some(100)),
+            ),
+        ]);
+        let error = fetch_course_homework(&mut transport, &session(), "site-1")
+            .expect_err("repeated page must fail");
+
+        assert_eq!(error.code, 5);
+        assert_eq!(transport.calls.len(), 2);
+    }
+
+    #[test]
+    fn homework_course_walk_paginates_by_total_and_stops_at_thirty_sites() {
+        let first: Vec<Value> = (0..20)
+            .map(|index| json!({"siteId": format!("site-{index:02}"), "siteName": "课程"}))
+            .collect();
+        let mut transport = scripted(vec![
+            (
+                "GET",
+                course_url_sized(1, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(json!(first), Some(21)),
+            ),
+            (
+                "GET",
+                course_url_sized(2, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(json!([{"siteId": "site-20", "siteName": "课程"}]), Some(21)),
+            ),
+        ]);
+        let courses =
+            fetch_all_courses_for_homework(&mut transport, &session()).expect("course walk");
+
+        assert_eq!(courses.len(), 21);
+        assert_eq!(courses.last().unwrap().site_id, "site-20");
+        assert_eq!(transport.calls.len(), 2);
+        assert_eq!(transport.calls[0].url, course_url_sized(1, 30));
+
+        let first_page: Vec<Value> = (0..20)
+            .map(|index| json!({"siteId": format!("site-{index:02}"), "siteName": "课程"}))
+            .collect();
+        let second_page: Vec<Value> = (20..40)
+            .map(|index| json!({"siteId": format!("site-{index:02}"), "siteName": "课程"}))
+            .collect();
+        let mut capped = scripted(vec![
+            (
+                "GET",
+                course_url_sized(1, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(json!(first_page), Some(100)),
+            ),
+            (
+                "GET",
+                course_url_sized(2, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(json!(second_page), Some(100)),
+            ),
+        ]);
+        let courses =
+            fetch_all_courses_for_homework(&mut capped, &session()).expect("capped course walk");
+
+        assert_eq!(courses.len(), HOMEWORK_SITE_LIMIT);
+        assert_eq!(capped.calls.len(), 2);
+    }
+
+    #[test]
+    fn homework_all_skips_courses_without_a_site_id() {
+        let mut transport = scripted(vec![
+            (
+                "GET",
+                course_url_sized(1, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(
+                    json!([
+                        {"siteId": "", "siteName": "无编号课程"},
+                        {"siteId": "site-1", "siteName": "课程一"}
+                    ]),
+                    Some(2),
+                ),
+            ),
+            (
+                "POST",
+                homework_list_url(),
+                homework_page(
+                    json!([{"activityId": "hw-1", "assignmentTitle": "作业"}]),
+                    Some(1),
+                ),
+            ),
+        ]);
+        let items = fetch_all_homework(&mut transport, &session()).expect("all homework");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].site_name, "课程一");
+        assert_eq!(transport.calls.len(), 2);
+        assert_eq!(transport.calls[1].method, "POST");
+    }
+
+    #[test]
+    fn homework_page_mapping_matches_python_status_and_fallback_rules() {
+        let data = json!({
+            "records": [
+                {
+                    "activityId": "hw-submitted",
+                    "assignmentTitle": "已交",
+                    "assignmentStatus": 0,
+                    "submitTime": "2026-11-15 10:00",
+                    "score": 88,
+                    "assignmentBeginTime": "2026-11-01 08:00",
+                    "assignmentEndTime": "2026-11-20 23:59"
+                },
+                {
+                    "activityId": "",
+                    "id": "fallback-id",
+                    "activityName": "备用标题",
+                    "status": "SUBMITTED",
+                    "siteName": false,
+                    "beginTime": "",
+                    "endTime": null
+                },
+                {
+                    "activityId": "hw-bool",
+                    "assignmentTitle": "布尔状态",
+                    "assignmentStatus": false,
+                    "submitTime": ""
+                }
+            ],
+            "total": 3
+        });
+        let page = parse_homework_page(&data, "site-1").expect("mapped homework page");
+
+        assert_eq!(page.record_count, 3);
+        assert!(page.items[0].is_submitted);
+        assert_eq!(
+            page.items[0].submit_time.as_deref(),
+            Some("2026-11-15 10:00")
+        );
+        assert_eq!(page.items[0].score, Some(88.0));
+        assert_eq!(
+            page.items[0].begin_time.as_deref(),
+            Some("2026-11-01 08:00")
+        );
+        assert_eq!(page.items[0].end_time.as_deref(), Some("2026-11-20 23:59"));
+        assert_eq!(page.items[1].activity_id, "fallback-id");
+        assert_eq!(page.items[1].activity_name, "备用标题");
+        assert!(page.items[1].is_submitted);
+        assert_eq!(page.items[1].site_name, "");
+        assert_eq!(page.items[1].begin_time, None);
+        assert_eq!(page.items[1].end_time, None);
+        assert!(!page.items[2].is_submitted);
+        assert_eq!(page.items[2].activity_id, "hw-bool");
+    }
+
+    #[test]
+    fn homework_list_output_sorts_filters_and_limits_like_python() {
+        let now = now();
+        let result = homework_list_json(
+            homework_items(),
+            "all",
+            ListFilters {
+                undone: false,
+                course: None,
+                new_days: None,
+            },
+            0,
+            now,
+        );
+
+        assert_eq!(result["count"], 4);
+        assert_eq!(result["method"], "all");
+        assert_eq!(result["filters"]["undone"], false);
+        assert_eq!(result["filters"]["course"], Value::Null);
+        assert_eq!(result["filters"]["new_days"], Value::Null);
+        let assignments = result["assignments"].as_array().expect("assignments");
+        let ids: Vec<&str> = assignments
+            .iter()
+            .map(|item| item["id"].as_str().expect("assignment id"))
+            .collect();
+        assert_eq!(
+            ids,
+            ["hw-past", "hw-submitted", "hw-late", "hw-no-deadline"]
+        );
+
+        let submitted = &assignments[1];
+        assert_eq!(submitted["status"], "submitted");
+        assert_eq!(submitted["submitted"], true);
+        assert_eq!(submitted["submitted_at"], "2026-11-15 10:00");
+        assert_eq!(submitted["published_at"], "2026-11-01 08:00:00");
+        assert_eq!(submitted["score"], 88.0);
+        assert_eq!(submitted["course"], "课程一");
+        assert_eq!(submitted["course_id"], "site-1");
+        assert_eq!(submitted["overdue"], false);
+
+        let overdue = &assignments[0];
+        assert_eq!(overdue["status"], "overdue");
+        assert_eq!(overdue["overdue"], true);
+        assert!(
+            overdue["hours_remaining"]
+                .as_f64()
+                .is_some_and(|hours| hours < 0.0)
+        );
+
+        let undated = &assignments[3];
+        assert_eq!(undated["deadline"], Value::Null);
+        assert_eq!(undated["published_at"], Value::Null);
+        assert_eq!(undated["hours_remaining"], Value::Null);
+        assert_eq!(undated["overdue"], false);
+        assert_eq!(undated["status"], "pending");
+
+        let filtered = homework_list_json(
+            homework_items(),
+            "course",
+            ListFilters {
+                undone: true,
+                course: Some("site-1".into()),
+                new_days: None,
+            },
+            1,
+            now,
+        );
+        assert_eq!(filtered["count"], 1);
+        assert_eq!(filtered["method"], "course");
+        assert_eq!(filtered["filters"]["course"], "site-1");
+        assert_eq!(filtered["filters"]["undone"], true);
+        assert_eq!(filtered["assignments"][0]["id"], "hw-past");
+    }
+
+    #[test]
+    fn homework_list_deduplicates_nonempty_ids_and_keeps_empty_ids() {
+        fn item(id: &str, title: &str) -> HomeworkItem {
+            HomeworkItem {
+                activity_id: id.into(),
+                activity_name: title.into(),
+                site_id: Some("site-1".into()),
+                site_name: "课程一".into(),
+                begin_time: None,
+                end_time: None,
+                submit_time: None,
+                is_submitted: false,
+                score: None,
+                raw: Map::new(),
+            }
+        }
+
+        let result = homework_list_json(
+            vec![
+                item("dup", "甲"),
+                item("", "空一"),
+                item("", "空二"),
+                item("dup", "乙"),
+            ],
+            "all",
+            ListFilters {
+                undone: false,
+                course: None,
+                new_days: None,
+            },
+            0,
+            now(),
+        );
+
+        assert_eq!(result["count"], 3);
+        let ids: Vec<&str> = result["assignments"]
+            .as_array()
+            .expect("assignments")
+            .iter()
+            .map(|item| item["id"].as_str().expect("assignment id"))
+            .collect();
+        assert_eq!(ids, ["dup", "", ""]);
+    }
+
+    #[test]
+    fn homework_list_without_user_id_fails_before_transport() {
+        let mut transport = scripted(Vec::new());
+        let session = Session::new("synthetic-access-token".into(), String::new());
+
+        let error =
+            fetch_course_homework(&mut transport, &session, "site-1").expect_err("missing user id");
+        assert_eq!(error.code, 3);
+        assert!(transport.calls.is_empty());
+
+        let error = fetch_all_homework(&mut transport, &session).expect_err("missing user id");
+        assert_eq!(error.code, 3);
+        assert!(transport.calls.is_empty());
+    }
+
+    #[test]
+    fn homework_list_auth_and_malformed_pages_fail_without_retry() {
+        let mut transport = scripted(vec![(
+            "POST",
+            homework_list_url(),
+            json_response(401, json!({"msg": "synthetic unauthorized"})),
+        )]);
+        let error = fetch_course_homework(&mut transport, &session(), "site-1")
+            .expect_err("unauthorized list");
+        assert_eq!(error.code, 3);
+        assert_eq!(transport.calls.len(), 1);
+
+        for data in [
+            json!([]),
+            json!({"records": "not-an-array"}),
+            json!({"records": [7]}),
+            json!({"records": [], "total": "not-a-number"}),
+        ] {
+            let mut transport = scripted(vec![(
+                "POST",
+                homework_list_url(),
+                json_response(200, json!({"code": 200, "data": data})),
+            )]);
+            let error = fetch_course_homework(&mut transport, &session(), "site-1")
+                .expect_err("malformed list page");
+            assert_eq!(error.code, 5, "payload: {data}");
+            assert_eq!(transport.calls.len(), 1);
+        }
     }
 }
