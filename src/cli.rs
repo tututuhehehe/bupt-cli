@@ -100,15 +100,17 @@ fn uses_public_library(name: &str) -> bool {
 
 /// Allow the CAS protocol and the implemented read-only UCloud commands.
 fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
-    matches!(name, "login" | "courses" | "electricity")
-        || (name == "homework"
-            && match arguments.subcommand_name() {
-                Some("show" | "verify" | "download") => true,
-                // Every parent-level list mode is now read-only and routed:
-                // default/all, --course, --undone, and --new.
-                None => true,
-                _ => false,
-            })
+    matches!(
+        name,
+        "login" | "courses" | "electricity" | "schedule" | "exams" | "scores" | "classrooms"
+    ) || (name == "homework"
+        && match arguments.subcommand_name() {
+            Some("show" | "verify" | "download") => true,
+            // Every parent-level list mode is now read-only and routed:
+            // default/all, --course, --undone, and --new.
+            None => true,
+            _ => false,
+        })
 }
 
 const LANES: &[Lane] = &[
@@ -439,6 +441,10 @@ mod tests {
             (&["bupt", "homework", "submit", "1"][..], false),
             (&["bupt", "homework", "download", "1"][..], true),
             (&["bupt", "electricity", "buildings"][..], true),
+            (&["bupt", "schedule", "update"][..], true),
+            (&["bupt", "exams"][..], true),
+            (&["bupt", "scores"][..], true),
+            (&["bupt", "classrooms"][..], true),
             (&["bupt", "notices"][..], false),
             (&["bupt", "status"][..], false),
             (&["bupt", "diagnose"][..], false),

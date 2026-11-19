@@ -1,0 +1,185 @@
+{
+  "code": "1",
+  "Msg": "synthetic ok",
+  "data": [
+    {
+      "semesterId": "2026-2027-1",
+      "week": "1",
+      "date": [
+        {
+          "zc": "1",
+          "mxrq": "2026-08-31",
+          "xqid": "1",
+          "xqmc": "一",
+          "rq": "31"
+        },
+        {
+          "zc": "1",
+          "mxrq": "2026-09-01",
+          "xqid": "2",
+          "xqmc": "二",
+          "rq": "1"
+        },
+        {
+          "zc": "1",
+          "mxrq": "2026-09-02",
+          "xqid": "3",
+          "xqmc": "三",
+          "rq": "2"
+        },
+        {
+          "zc": "1",
+          "mxrq": "2026-09-03",
+          "xqid": "4",
+          "xqmc": "四",
+          "rq": "3"
+        },
+        {
+          "zc": "1",
+          "mxrq": "2026-09-04",
+          "xqid": "5",
+          "xqmc": "五",
+          "rq": "4"
+        },
+        {
+          "zc": "1",
+          "mxrq": "2026-09-05",
+          "xqid": "6",
+          "xqmc": "六",
+          "rq": "5"
+        },
+        {
+          "zc": "1",
+          "mxrq": "2026-09-06",
+          "xqid": "7",
+          "xqmc": "日",
+          "rq": "6"
+        }
+      ],
+      "courses": [
+        {
+          "classWeek": "1-2",
+          "classWeekDetails": "",
+          "classTime": "1030405",
+          "weekDay": "3",
+          "courseName": "数字信号处理",
+          "teacherName": "张老师",
+          "buildingName": "教三",
+          "classroomName": "101",
+          "startTime": "08:00",
+          "endTIme": "09:35",
+          "jx0408id": "course-1",
+          "campus": "西土城"
+        },
+        {
+          "classWeek": "",
+          "classWeekDetails": ",1,2,",
+          "classTime": "",
+          "weekDay": "5",
+          "courseName": "合成实验",
+          "teacherName": "",
+          "buildingName": "教一",
+          "classroomName": "教一101",
+          "startTime": "10:00",
+          "endTime": "11:35",
+          "jx0408id": "course-2",
+          "campus": ""
+        }
+      ],
+      "item": null,
+      "bz": "合成备注"
+    },
+    {
+      "semesterId": "",
+      "week": "2",
+      "date": [
+        {
+          "zc": "2",
+          "mxrq": "2026-09-07",
+          "xqid": "1",
+          "xqmc": "一",
+          "rq": "7"
+        },
+        {
+          "zc": "2",
+          "mxrq": "2026-09-08",
+          "xqid": "2",
+          "xqmc": "二",
+          "rq": "8"
+        },
+        {
+          "zc": "2",
+          "mxrq": "2026-09-09",
+          "xqid": "3",
+          "xqmc": "三",
+          "rq": "9"
+        },
+        {
+          "zc": "2",
+          "mxrq": "2026-09-10",
+          "xqid": "4",
+          "xqmc": "四",
+          "rq": "10"
+        },
+        {
+          "zc": "2",
+          "mxrq": "2026-09-11",
+          "xqid": "5",
+          "xqmc": "五",
+          "rq": "11"
+        },
+        {
+          "zc": "2",
+          "mxrq": "2026-09-12",
+          "xqid": "6",
+          "xqmc": "六",
+          "rq": "12"
+        },
+        {
+          "zc": "2",
+          "mxrq": "2026-09-13",
+          "xqid": "7",
+          "xqmc": "日",
+          "rq": "13"
+        }
+      ],
+      "courses": [
+        {
+          "classWeek": "1-2",
+          "classWeekDetails": "",
+          "classTime": "1030405",
+          "weekDay": "3",
+          "courseName": "数字信号处理",
+          "teacherName": "张老师",
+          "buildingName": "教三",
+          "classroomName": "101",
+          "startTime": "08:00",
+          "endTIme": "09:35",
+          "jx0408id": "course-1",
+          "campus": "西土城"
+        }
+      ],
+      "item": [
+        [
+          [
+            {
+              "classWeek": "2",
+              "classWeekDetails": "",
+              "classTime": "",
+              "weekDay": "1",
+              "courseName": "嵌套课程",
+              "teacherName": "李老师",
+              "buildingName": "",
+              "classroomName": "教四-201",
+              "startTime": "14:00",
+              "endTime": "15:35",
+              "jx0408id": "course-3",
+              "campus": "沙河"
+            }
+          ]
+        ]
+      ],
+      "bz": "合成备注"
+    }
+  ]
+}

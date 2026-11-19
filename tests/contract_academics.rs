@@ -963,6 +963,44 @@ fn graduate_accounts_are_refused_by_undergraduate_jwgl_commands() {
 }
 
 #[test]
+fn undergraduate_mobile_commands_require_a_bound_session_before_network() {
+    let sandbox = Sandbox::new();
+    write_credentials(&sandbox, USER, "undergraduate");
+
+    for args in [
+        &["exams"][..],
+        &["scores"][..],
+        &["classrooms"][..],
+        &["schedule", "update"][..],
+    ] {
+        let command = args[0];
+        let invocation = run(&sandbox, args);
+        assert_eq!(
+            invocation.code(),
+            if cfg!(unix) { 3 } else { 5 },
+            "{command}: a native bound session is required; stdout={:?}; stderr={:?}",
+            String::from_utf8_lossy(&invocation.0.stdout),
+            String::from_utf8_lossy(&invocation.0.stderr)
+        );
+        assert!(invocation.0.stdout.is_empty());
+        let payload = invocation.stderr_json();
+        assert_schema(&payload);
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(
+            payload["error"]["type"],
+            json!(if cfg!(unix) { "auth" } else { "upstream" })
+        );
+        assert!(
+            fs::read_dir(sandbox.root().join("cache"))
+                .expect("read cache dir")
+                .next()
+                .is_none(),
+            "{command}: must not create state before a verified session exists"
+        );
+    }
+}
+
+#[test]
 fn graduate_exams_without_a_session_is_an_auth_error_before_browser() {
     let sandbox = Sandbox::new();
     write_credentials(&sandbox, USER, "graduate");

@@ -222,6 +222,24 @@ fn route(request: &Request) -> Option<Route> {
         ("jwglweixin.bupt.edu.cn", "POST", "/bjyddx/login") if parsed.query().is_none() => {
             Some(Route::MobileLogin)
         }
+        (
+            "jwglweixin.bupt.edu.cn",
+            "GET",
+            "/bjyddx/student/curriculum"
+            | "/bjyddx/kaowu/get_kszc"
+            | "/bjyddx/kaowu/getKsapcx"
+            | "/bjyddx/kaowu/findKcksapcx",
+        ) if parsed.query().is_none() => Some(Route::MobileProbe),
+        ("jwglweixin.bupt.edu.cn", "POST", "/bjyddx/student/termGPA")
+            if parsed.query().is_none() =>
+        {
+            Some(Route::MobileProbe)
+        }
+        ("jwglweixin.bupt.edu.cn", "GET", "/bjyddx/todayClassrooms")
+            if matches!(parsed.query(), Some("campusId=01" | "campusId=04")) =>
+        {
+            Some(Route::MobileProbe)
+        }
         ("app.bupt.edu.cn", "GET", "/buptdf/wap/default/chong") if parsed.query().is_none() => {
             Some(Route::ElectricityLanding)
         }
@@ -574,6 +592,35 @@ mod tests {
         assert!(curl_config(&request).is_err());
         request.method = "GET";
         request.url = "https://fileucloud.bupt.edu.cn.example/attachment.bin".into();
+        assert!(curl_config(&request).is_err());
+    }
+
+    #[test]
+    fn mobile_academic_data_uses_fixed_read_endpoints() {
+        let base = "https://jwglweixin.bupt.edu.cn";
+        let mut request = Request {
+            method: "GET",
+            url: String::new(),
+            headers: vec![("token".into(), "TEST-ONLY".into())],
+            body: vec![],
+        };
+        for path in [
+            "/bjyddx/student/curriculum",
+            "/bjyddx/kaowu/get_kszc",
+            "/bjyddx/kaowu/getKsapcx",
+            "/bjyddx/kaowu/findKcksapcx",
+            "/bjyddx/todayClassrooms?campusId=01",
+            "/bjyddx/todayClassrooms?campusId=04",
+        ] {
+            request.url = format!("{base}{path}");
+            assert!(curl_config(&request).is_ok(), "{path}");
+        }
+        request.url = format!("{base}/bjyddx/todayClassrooms?campusId=01&pwd=TEST");
+        assert!(curl_config(&request).is_err());
+        request.url = format!("{base}/bjyddx/student/termGPA");
+        request.method = "POST";
+        assert!(curl_config(&request).is_ok());
+        request.body = b"pwd=TEST".to_vec();
         assert!(curl_config(&request).is_err());
     }
 

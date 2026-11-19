@@ -1,5 +1,6 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::identity::{self, LocalProfile, Role};
+use crate::transport::Transport;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -11,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 mod graduate;
+pub(crate) mod mobile_jwgl;
 
 use graduate::GradPageSource as _;
 
@@ -108,13 +110,13 @@ pub(crate) fn run(
     match command {
         "schedule" => run_schedule(matches, ctx),
         "exams" => run_exams(ctx),
-        "scores" => run_scores(ctx),
+        "scores" => run_scores(matches, ctx),
         "classrooms" => run_classrooms(matches, ctx),
         _ => Err(CliError::usage("unknown command")),
     }
 }
 
-fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
+fn run_schedule(matches: &ArgMatches, ctx: &mut Context<'_>) -> CliResult<Outcome> {
     if let Some((subcommand, sub)) = matches.subcommand() {
         return match subcommand {
             "update" => update_schedule(ctx),
@@ -180,7 +182,7 @@ fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
     })))
 }
 
-fn update_schedule(ctx: &Context<'_>) -> CliResult<Outcome> {
+fn update_schedule(ctx: &mut Context<'_>) -> CliResult<Outcome> {
     let selected = current_selection(ctx, local_today()?, true)?;
     let snapshot = &selected.snapshot;
     let (start, end) =
@@ -197,9 +199,38 @@ fn update_schedule(ctx: &Context<'_>) -> CliResult<Outcome> {
     })))
 }
 
-fn run_exams(ctx: &Context<'_>) -> CliResult<Outcome> {
-    let mut source = graduate::ChromePageSource::new(&ctx.config_dir, &ctx.cache_dir, ctx.timeout);
-    run_exams_with_source(&ctx.config_dir, &mut source)
+fn run_exams(ctx: &mut Context<'_>) -> CliResult<Outcome> {
+    let account = identity::require_authenticated_profile(&ctx.config_dir)?;
+    match required_role(&account)? {
+        Role::Graduate => {
+            let mut source =
+                graduate::ChromePageSource::new(&ctx.config_dir, &ctx.cache_dir, ctx.timeout);
+            run_exams_with_source(&ctx.config_dir, &mut source)
+        }
+        Role::Undergraduate => {
+            let mut auth = mobile_auth(ctx)?;
+            run_exams_with_mobile(ctx.transport, &mut auth)
+        }
+    }
+}
+
+fn mobile_auth(ctx: &mut Context<'_>) -> CliResult<mobile_jwgl::NativeMobileJwglAuth> {
+    identity::require_mobile_jwgl_token(ctx).map(mobile_jwgl::NativeMobileJwglAuth::new)
+}
+
+fn run_exams_with_mobile(
+    transport: &mut dyn Transport,
+    auth: &mut dyn mobile_jwgl::MobileJwglAuth,
+) -> CliResult<Outcome> {
+    let mut client = mobile_jwgl::MobileJwglClient::new(transport, auth);
+    let weeks = client.exam_weeks()?;
+    let exams = client.exam_schedule()?;
+    let arrangements = client.exam_course_schedule()?;
+    Ok(outcome(mobile_jwgl::exams_payload(
+        &weeks,
+        &exams,
+        &arrangements,
+    )))
 }
 
 fn run_exams_with_source(
@@ -223,19 +254,43 @@ fn run_exams_with_source(
     graduate::parse_exams(&html).map(outcome)
 }
 
-fn run_scores(ctx: &Context<'_>) -> CliResult<Outcome> {
+fn run_scores(matches: &ArgMatches, ctx: &mut Context<'_>) -> CliResult<Outcome> {
     let account = identity::require_authenticated_profile(&ctx.config_dir)?;
     require_undergraduate(required_role(&account)?, "scores")?;
-    Err(pending_remote("本科成绩数据源"))
+    let semester = matches.get_one::<String>("semester").map(String::as_str);
+    let mut auth = mobile_auth(ctx)?;
+    run_scores_with_mobile(ctx.transport, &mut auth, semester)
 }
 
-fn run_classrooms(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
+fn run_scores_with_mobile(
+    transport: &mut dyn Transport,
+    auth: &mut dyn mobile_jwgl::MobileJwglAuth,
+    semester: Option<&str>,
+) -> CliResult<Outcome> {
+    let mut client = mobile_jwgl::MobileJwglClient::new(transport, auth);
+    let report = client.score_report()?;
+    mobile_jwgl::scores_payload(&report, semester).map(outcome)
+}
+
+fn run_classrooms(matches: &ArgMatches, ctx: &mut Context<'_>) -> CliResult<Outcome> {
     let account = identity::require_authenticated_profile(&ctx.config_dir)?;
     require_undergraduate(required_role(&account)?, "classrooms")?;
-    let _campus = matches
+    let campus = matches
         .get_one::<String>("campus")
-        .expect("campus has a validated default");
-    Err(pending_remote("本科空教室数据源"))
+        .expect("campus has a validated default")
+        .clone();
+    let mut auth = mobile_auth(ctx)?;
+    run_classrooms_with_mobile(ctx.transport, &mut auth, &campus)
+}
+
+fn run_classrooms_with_mobile(
+    transport: &mut dyn Transport,
+    auth: &mut dyn mobile_jwgl::MobileJwglAuth,
+    campus: &str,
+) -> CliResult<Outcome> {
+    let mut client = mobile_jwgl::MobileJwglClient::new(transport, auth);
+    let data = client.today_classrooms(campus)?;
+    Ok(outcome(mobile_jwgl::classrooms_payload(campus, &data)))
 }
 
 fn require_undergraduate(role: Role, command: &str) -> CliResult<()> {
@@ -313,43 +368,38 @@ trait TimetableSource {
     fn fetch(&mut self, username: &str, role: Role) -> CliResult<Snapshot>;
 }
 
-struct NativeTimetableSource {
-    config_dir: PathBuf,
-    cache_dir: PathBuf,
-    timeout: Duration,
+struct NativeTimetableSource<'a, 't> {
+    context: &'a mut Context<'t>,
 }
 
-impl NativeTimetableSource {
-    fn new(config_dir: &Path, cache_dir: &Path, timeout: Duration) -> Self {
-        Self {
-            config_dir: config_dir.to_path_buf(),
-            cache_dir: cache_dir.to_path_buf(),
-            timeout,
-        }
-    }
-}
-
-impl TimetableSource for NativeTimetableSource {
+impl TimetableSource for NativeTimetableSource<'_, '_> {
     fn fetch(&mut self, username: &str, role: Role) -> CliResult<Snapshot> {
         match role {
             Role::Graduate => {
                 let mut pages = graduate::ChromePageSource::new(
-                    &self.config_dir,
-                    &self.cache_dir,
-                    self.timeout,
+                    &self.context.config_dir,
+                    &self.context.cache_dir,
+                    self.context.timeout,
                 );
                 let pages =
                     pages.collect(&[graduate::GradPage::Schedule, graduate::GradPage::Calendar])?;
                 graduate::snapshot_from_pages(username, &pages)
             }
-            Role::Undergraduate => Err(pending_remote("本科课表数据源")),
+            Role::Undergraduate => {
+                let mut auth = mobile_auth(self.context)?;
+                let mut source =
+                    mobile_jwgl::MobileTimetableSource::new(self.context.transport, &mut auth);
+                source.fetch(username, role)
+            }
         }
     }
 }
 
-fn current_selection(ctx: &Context<'_>, today: Date, force: bool) -> CliResult<Selected> {
-    let mut source = NativeTimetableSource::new(&ctx.config_dir, &ctx.cache_dir, ctx.timeout);
-    select_snapshot(&ctx.config_dir, &ctx.cache_dir, today, force, &mut source)
+fn current_selection(ctx: &mut Context<'_>, today: Date, force: bool) -> CliResult<Selected> {
+    let config_dir = ctx.config_dir.clone();
+    let cache_dir = ctx.cache_dir.clone();
+    let mut source = NativeTimetableSource { context: ctx };
+    select_snapshot(&config_dir, &cache_dir, today, force, &mut source)
 }
 
 fn select_snapshot(
@@ -681,7 +731,7 @@ fn calendar_payload(selected: &Selected) -> Value {
     })
 }
 
-fn export_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
+fn export_schedule(matches: &ArgMatches, ctx: &mut Context<'_>) -> CliResult<Outcome> {
     let selected = current_selection(ctx, local_today()?, false)?;
     let snapshot = &selected.snapshot;
     let (content, events) = build_ics(snapshot)?;
@@ -1294,13 +1344,31 @@ fn week_arg(text: &str) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::graduate::{GradPage, GradPageSource, GradPages};
+    use super::mobile_jwgl::{MobileJwglAuth, MobileJwglToken, MobileTimetableSource};
     use super::*;
+    use crate::transport::Response;
+    use crate::transport::testing::Scripted;
     use std::collections::VecDeque;
     use tempfile::tempdir;
 
     const USER: &str = "20260001";
     const OTHER_USER: &str = "20260002";
     const SESSION_PASSWORD: &str = "synthetic-test-password";
+    const JWT_TOKEN: &str = "TEST-ONLY-JWGL-TOKEN";
+    const MOBILE_CURRICULUM: &str =
+        include_str!("../tests/fixtures/contracts/academics/mobile_jwgl_curriculum.json");
+    const MOBILE_CURRICULUM_PARTIAL: &str =
+        include_str!("../tests/fixtures/contracts/academics/mobile_jwgl_curriculum_partial.json");
+    const MOBILE_EXAM_WEEKS: &str =
+        include_str!("../tests/fixtures/contracts/academics/mobile_jwgl_exam_weeks.json");
+    const MOBILE_EXAM_SCHEDULE: &str =
+        include_str!("../tests/fixtures/contracts/academics/mobile_jwgl_exam_schedule.json");
+    const MOBILE_EXAM_COURSES: &str =
+        include_str!("../tests/fixtures/contracts/academics/mobile_jwgl_exam_course_schedule.json");
+    const MOBILE_SCORES: &str =
+        include_str!("../tests/fixtures/contracts/academics/mobile_jwgl_scores.json");
+    const MOBILE_CLASSROOMS: &str =
+        include_str!("../tests/fixtures/contracts/academics/mobile_jwgl_classrooms.json");
 
     fn today() -> Date {
         Date::parse("2026-09-23").expect("fixed synthetic Wednesday")
@@ -1409,6 +1477,42 @@ mod tests {
                 .pop_front()
                 .expect("selection fetched more times than the test allowed")
         }
+    }
+
+    struct TestMobileAuth {
+        token: String,
+        calls: usize,
+    }
+
+    impl TestMobileAuth {
+        fn valid() -> Self {
+            Self {
+                token: JWT_TOKEN.to_owned(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl MobileJwglAuth for TestMobileAuth {
+        fn token(&mut self) -> CliResult<MobileJwglToken> {
+            self.calls += 1;
+            Ok(MobileJwglToken::new(
+                self.token.clone(),
+                Some(4_102_444_800.0),
+            ))
+        }
+    }
+
+    fn queue_mobile(scripted: &mut Scripted, method: &'static str, url: &str, body: &str) {
+        scripted.expected.push_back((
+            method,
+            url.to_owned(),
+            Ok(Response {
+                status: 200,
+                headers: Vec::new(),
+                body: body.as_bytes().to_vec(),
+            }),
+        ));
     }
 
     struct FakePageSource {
@@ -2064,5 +2168,189 @@ mod tests {
             (0..8).any(|index| content == format!("payload-{index}")),
             "concurrent writers must leave one complete payload, got {content:?}"
         );
+    }
+
+    #[test]
+    fn mobile_curriculum_refresh_uses_sjd_dates_and_writes_one_complete_snapshot() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        let mut transport = Scripted::default();
+        queue_mobile(
+            &mut transport,
+            "GET",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/student/curriculum",
+            MOBILE_CURRICULUM,
+        );
+        let mut auth = TestMobileAuth::valid();
+        let today = Date::parse("2026-09-01").expect("synthetic Tuesday");
+
+        let selected = {
+            let mut source = MobileTimetableSource::new(&mut transport, &mut auth);
+            select_snapshot(&config, &cache, today, false, &mut source)
+                .expect("complete undergraduate curriculum")
+        };
+
+        assert_eq!(transport.calls.len(), 1);
+        assert_eq!(auth.calls, 1);
+        assert_eq!(transport.calls[0].headers[2].1, JWT_TOKEN);
+        assert!(!selected.from_cache);
+        assert_eq!(selected.snapshot.role, "undergraduate");
+        assert_eq!(selected.snapshot.source, "mobile_jwgl");
+        assert_eq!(selected.snapshot.term, "2026-2027-1");
+        assert_eq!(selected.snapshot.calendar[&1][0], "2026-08-31");
+        assert_eq!(selected.snapshot.courses.len(), 2);
+        assert_eq!(selected.snapshot.courses[0]["name"], json!("数字信号处理"));
+        assert_eq!(selected.snapshot.courses[0]["period_start"], Value::Null);
+        assert_eq!(selected.snapshot.courses[0]["period_end"], Value::Null);
+
+        let written = read_snapshot(&cache_file(&cache)).expect("written mobile snapshot");
+        assert_eq!(written.username, USER);
+        assert_eq!(written.role, "undergraduate");
+        assert_eq!(written.source, "mobile_jwgl");
+        assert_eq!(written.calendar[&2][6], "2026-09-13");
+    }
+
+    #[test]
+    fn mobile_current_week_only_response_never_replaces_the_old_snapshot() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        account(&config);
+        save_snapshot(&cache_file(&cache), &stale()).unwrap();
+        let before = read_bytes(&cache_file(&cache));
+
+        let mut transport = Scripted::default();
+        queue_mobile(
+            &mut transport,
+            "GET",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/student/curriculum",
+            MOBILE_CURRICULUM_PARTIAL,
+        );
+        let mut auth = TestMobileAuth::valid();
+        let today = Date::parse("2026-09-16").expect("synthetic Wednesday in week 3");
+        let error = {
+            let mut source = MobileTimetableSource::new(&mut transport, &mut auth);
+            select_snapshot(&config, &cache, today, false, &mut source)
+                .expect_err("a current-week-only grid must not replace the old term")
+        };
+
+        assert_eq!(error.code, 5);
+        assert!(error.message.contains("第 1 教学周"));
+        assert_eq!(transport.calls.len(), 1);
+        assert_eq!(
+            read_bytes(&cache_file(&cache)),
+            before,
+            "partial dates must leave the old snapshot byte-for-byte intact"
+        );
+    }
+
+    #[test]
+    fn mobile_exam_command_uses_three_reads_and_keeps_raw_rows() {
+        let mut transport = Scripted::default();
+        queue_mobile(
+            &mut transport,
+            "GET",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/kaowu/get_kszc",
+            MOBILE_EXAM_WEEKS,
+        );
+        queue_mobile(
+            &mut transport,
+            "GET",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/kaowu/getKsapcx",
+            MOBILE_EXAM_SCHEDULE,
+        );
+        queue_mobile(
+            &mut transport,
+            "GET",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/kaowu/findKcksapcx",
+            MOBILE_EXAM_COURSES,
+        );
+        let mut auth = TestMobileAuth::valid();
+
+        let outcome = run_exams_with_mobile(&mut transport, &mut auth).expect("exam rows");
+
+        assert_eq!(outcome.data["weeks"][0]["key"], json!("1"));
+        assert_eq!(outcome.data["exams"][0]["kcmc"], json!("合成考试课程"));
+        assert_eq!(
+            outcome.data["course_arrangements"][0]["kcmc"],
+            json!("合成课程安排")
+        );
+        assert_eq!(auth.calls, 1);
+        assert_eq!(transport.calls.len(), 3);
+        assert!(
+            transport
+                .calls
+                .iter()
+                .all(|call| call.headers[2].1 == JWT_TOKEN)
+        );
+    }
+
+    #[test]
+    fn mobile_scores_and_classrooms_commands_preserve_filters_and_campus_query() {
+        let mut score_transport = Scripted::default();
+        queue_mobile(
+            &mut score_transport,
+            "POST",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/student/termGPA",
+            MOBILE_SCORES,
+        );
+        let mut score_auth = TestMobileAuth::valid();
+        let scores =
+            run_scores_with_mobile(&mut score_transport, &mut score_auth, Some("2025-2026-2"))
+                .expect("scores");
+
+        assert_eq!(scores.data["count"], json!(1));
+        assert_eq!(scores.data["student_id"], json!("20260001"));
+        assert_eq!(scores.data["average_score"], json!(87.25));
+        assert_eq!(
+            scores.data["semesters"]["2025-2026-2"][0]["credit"],
+            json!(3.5)
+        );
+        assert_eq!(score_transport.calls.len(), 1);
+        assert_eq!(score_transport.calls[0].method, "POST");
+        assert!(score_transport.calls[0].body.is_empty());
+
+        let mut classroom_transport = Scripted::default();
+        queue_mobile(
+            &mut classroom_transport,
+            "GET",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/todayClassrooms?campusId=01",
+            MOBILE_CLASSROOMS,
+        );
+        let mut classroom_auth = TestMobileAuth::valid();
+        let classrooms =
+            run_classrooms_with_mobile(&mut classroom_transport, &mut classroom_auth, "01")
+                .expect("classrooms");
+
+        assert_eq!(classrooms.data["campus"], json!("01"));
+        assert_eq!(classrooms.data["count"], json!(2));
+        assert_eq!(
+            classrooms.data["periods"][0]["rooms"][0],
+            json!({"name":"教一楼-101","capacity":40})
+        );
+    }
+
+    #[test]
+    fn native_mobile_token_refusal_does_not_retry_or_echo_the_response() {
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "POST",
+            "https://jwglweixin.bupt.edu.cn/bjyddx/student/termGPA".into(),
+            Ok(Response {
+                status: 401,
+                headers: vec![],
+                body: b"synthetic-secret".to_vec(),
+            }),
+        ));
+        let mut auth = mobile_jwgl::NativeMobileJwglAuth::new("TEST-ONLY-TOKEN".into());
+        let error = match run_scores_with_mobile(&mut transport, &mut auth, None) {
+            Ok(_) => panic!("refused token must not succeed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, 3);
+        assert!(!error.message.contains("synthetic-secret"));
+        assert_eq!(transport.calls.len(), 1);
     }
 }
