@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 mod archive;
+mod binary;
 
 const DEFAULT_REPO: &str = "tututuhehehe/bupt-cli";
 const GITHUB_RELEASE_HOST: &str = "github.com";
 const MACOS_ARM64_ASSET: &str = "bupt-macos-arm64.zip";
 const WINDOWS_X64_ASSET: &str = "bupt-windows-x64.zip";
 const USER_AGENT: &str = "bupt-cli";
+const RELEASE_BUILD_MARKER: Option<&str> = option_env!("BUPT_CLI_RELEASE_BUILD");
 const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ASSET_REDIRECTS: usize = 5;
@@ -136,7 +138,7 @@ fn not_installed_outcome(repo: &str, latest: &str, current: &str) -> Outcome {
             "update_available": true,
             "installed_to": null,
             "note": format!(
-                "找到新版本 {latest}，但当前不是独立二进制，未自动安装；请下载 release 附件或运行 ./build.sh 后替换"
+                "找到新版本 {latest}，但当前不是独立二进制，未自动安装；请下载 release 附件，或使用带发布标记的构建手动替换"
             ),
         }),
         code: 0,
@@ -164,15 +166,15 @@ fn release_outcome(
     }
 }
 
+fn is_release_build() -> bool {
+    !cfg!(test) && matches!(RELEASE_BUILD_MARKER, Some("1")) && !cfg!(debug_assertions)
+}
+
 fn running_installed_binary() -> bool {
-    if cfg!(debug_assertions) {
+    if !is_release_build() {
         return false;
     }
-    std::env::current_exe().ok().is_some_and(|path| {
-        !path
-            .components()
-            .any(|component| component.as_os_str().to_str() == Some("target"))
-    })
+    std::env::current_exe().is_ok()
 }
 
 fn update_check_note(os: &str, arch: &str, can_install: bool) -> &'static str {
@@ -233,17 +235,11 @@ fn install_release(
     let target = match target_override {
         Some(path) => verify_install_target(fs, path, false)?,
         None => {
-            if cfg!(debug_assertions) {
+            if !is_release_build() {
                 return Ok(not_installed_outcome(repo, latest, current));
             }
             let path = std::env::current_exe()
                 .map_err(|error| fs_error("cannot resolve the running executable", error))?;
-            if path
-                .components()
-                .any(|component| component.as_os_str().to_str() == Some("target"))
-            {
-                return Ok(not_installed_outcome(repo, latest, current));
-            }
             verify_install_target(fs, &path, true)?
         }
     };
@@ -259,7 +255,7 @@ fn install_release(
             "The downloaded release asset was rejected; no files were changed.",
         )
     })?;
-    if is_python_launcher(&binary) {
+    if binary::is_python_launcher(&binary) {
         return Err(CliError::new(
             5,
             "upstream",
@@ -267,7 +263,7 @@ fn install_release(
             "The downloaded release asset was rejected; no files were changed.",
         ));
     }
-    if binary.is_empty() || !is_native_executable(&binary) {
+    if binary.is_empty() || !binary::is_native_executable(&binary) {
         return Err(CliError::new(
             5,
             "upstream",
@@ -422,7 +418,7 @@ fn verify_install_target(
     path: &Path,
     require_release_build: bool,
 ) -> CliResult<VerifiedTarget> {
-    if require_release_build && cfg!(debug_assertions) {
+    if require_release_build && !is_release_build() {
         return Err(development_build_error());
     }
     if !path.is_absolute() {
@@ -459,10 +455,10 @@ fn verify_install_target(
     let contents = fs
         .read(path)
         .map_err(|error| target_error(format!("cannot read the target: {error}")))?;
-    if is_python_launcher(&contents) {
+    if binary::is_python_launcher(&contents) {
         return Err(target_error("target looks like a Python launcher"));
     }
-    if !is_native_executable(&contents) {
+    if !binary::is_native_executable(&contents) {
         return Err(target_error("target is not a native executable"));
     }
     Ok(VerifiedTarget {
@@ -480,11 +476,13 @@ fn verify_target_unchanged(fs: &dyn UpdateFs, target: &VerifiedTarget) -> CliRes
             "target changed while the update was being prepared",
         ));
     }
-    let prefix = fs
-        .read_prefix(&target.path, 8)
+    let contents = fs
+        .read(&target.path)
         .map_err(|error| target_error(format!("cannot recheck the target: {error}")))?;
-    if !is_native_executable(&prefix) {
-        return Err(target_error("target is no longer a native executable"));
+    if binary::is_python_launcher(&contents) || !binary::is_native_executable(&contents) {
+        return Err(target_error(
+            "target is no longer a verified native executable",
+        ));
     }
     Ok(())
 }
@@ -514,43 +512,6 @@ fn verify_replaced_target(fs: &dyn UpdateFs, path: &Path, expected: &[u8]) -> Re
         return Err("the replaced binary does not match the staged bytes".into());
     }
     Ok(())
-}
-
-fn is_python_launcher(bytes: &[u8]) -> bool {
-    // PyInstaller onefile bootloaders end with this cookie; script launchers
-    // start with a shebang even when their name is `bupt`. Only inspect the
-    // tail so an unrelated marker embedded in a large Rust binary is ignored.
-    if bytes.starts_with(b"#!") {
-        return true;
-    }
-    let tail = &bytes[bytes.len().saturating_sub(256)..];
-    tail.windows(8)
-        .any(|window| window == b"MEI\x0c\x0b\x0a\x0b\x0e")
-}
-
-fn is_native_executable(bytes: &[u8]) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        const MACHO: [&[u8]; 8] = [
-            &[0xfe, 0xed, 0xfa, 0xce],
-            &[0xce, 0xfa, 0xed, 0xfe],
-            &[0xfe, 0xed, 0xfa, 0xcf],
-            &[0xcf, 0xfa, 0xed, 0xfe],
-            &[0xca, 0xfe, 0xba, 0xbe],
-            &[0xbe, 0xba, 0xfe, 0xca],
-            &[0xca, 0xfe, 0xba, 0xbf],
-            &[0xbf, 0xba, 0xfe, 0xca],
-        ];
-        MACHO.iter().any(|magic| bytes.starts_with(magic))
-    }
-    #[cfg(windows)]
-    {
-        bytes.starts_with(b"MZ")
-    }
-    #[cfg(all(not(target_os = "macos"), not(windows)))]
-    {
-        bytes.starts_with(b"\x7fELF")
-    }
 }
 
 fn download_asset(
@@ -727,7 +688,6 @@ impl Drop for BackupGuard<'_> {
 trait UpdateFs {
     fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
-    fn read_prefix(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>>;
     fn create_staging_dir(&self, parent: &Path) -> io::Result<PathBuf>;
     fn write_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>;
     fn copy_new(&self, from: &Path, to: &Path) -> io::Result<()>;
@@ -745,24 +705,6 @@ impl UpdateFs for RealFs {
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs::read(path)
-    }
-
-    fn read_prefix(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-        use std::io::Read;
-
-        let mut file = fs::File::open(path)?;
-        let mut buffer = vec![0u8; limit];
-        let mut read = 0;
-        while read < limit {
-            match file.read(&mut buffer[read..]) {
-                Ok(0) => break,
-                Ok(count) => read += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        buffer.truncate(read);
-        Ok(buffer)
     }
 
     fn create_staging_dir(&self, parent: &Path) -> io::Result<PathBuf> {
@@ -1774,15 +1716,7 @@ mod tests {
     }
 
     fn native_payload(marker: &str) -> Vec<u8> {
-        #[cfg(target_os = "macos")]
-        let mut payload = vec![0xcf, 0xfa, 0xed, 0xfe];
-        #[cfg(windows)]
-        let mut payload = b"MZ".to_vec();
-        #[cfg(all(not(target_os = "macos"), not(windows)))]
-        let mut payload = b"\x7fELF".to_vec();
-        payload.extend_from_slice(marker.as_bytes());
-        payload.extend_from_slice(&[0u8; 64]);
-        payload
+        binary::test_native_payload(marker)
     }
 
     fn test_asset() -> &'static str {
@@ -1874,10 +1808,6 @@ mod tests {
 
         fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             RealFs.read(path)
-        }
-
-        fn read_prefix(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
-            RealFs.read_prefix(path, limit)
         }
 
         fn create_staging_dir(&self, parent: &Path) -> std::io::Result<PathBuf> {
@@ -2618,7 +2548,14 @@ mod tests {
 
     #[test]
     fn update_apply_rejects_scripts_wrong_names_and_non_executables() {
-        for case in ["script", "python-launcher", "wrong-name", "non-executable"] {
+        for case in [
+            "script",
+            "python-launcher",
+            "wrong-arch",
+            "truncated",
+            "wrong-name",
+            "non-executable",
+        ] {
             let root = tempfile::tempdir().expect("create invalid target directory");
             let target = match case {
                 "script" => {
@@ -2632,6 +2569,20 @@ mod tests {
                     let mut launcher = native_payload("old-python");
                     launcher.extend_from_slice(b"MEI\x0c\x0b\x0a\x0b\x0e");
                     fs::write(&target, &launcher).expect("write Python launcher fixture");
+                    make_executable(&target);
+                    target
+                }
+                "wrong-arch" => {
+                    let target = root.path().join(binary_name());
+                    fs::write(&target, binary::test_wrong_arch_payload("old"))
+                        .expect("write wrong-architecture fixture");
+                    make_executable(&target);
+                    target
+                }
+                "truncated" => {
+                    let target = root.path().join(binary_name());
+                    fs::write(&target, binary::test_truncated_payload("old"))
+                        .expect("write truncated fixture");
                     make_executable(&target);
                     target
                 }
@@ -2771,6 +2722,22 @@ mod tests {
                     status: 200,
                     headers: vec![],
                     body: python_archive,
+                }),
+                5,
+            ),
+            (
+                Ok(Response {
+                    status: 200,
+                    headers: vec![],
+                    body: archive::test_stored_zip("bupt", &binary::test_wrong_arch_payload("new")),
+                }),
+                5,
+            ),
+            (
+                Ok(Response {
+                    status: 200,
+                    headers: vec![],
+                    body: archive::test_stored_zip("bupt", &binary::test_truncated_payload("new")),
                 }),
                 5,
             ),

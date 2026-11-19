@@ -48,33 +48,33 @@
 | 只接受同一仓库 `releases/tag/<tag>` 的 HTTPS Location；外来主机、其他仓库、畸形重定向失败关闭 | 合同“校验重定向目标不扩大访问范围” | `release_location_must_name_the_same_repository_tag`、`update_check_rejects_a_foreign_redirect` |
 | 版本按数字段比较，旧 tag/等版本不算升级 | Python `_versions_tuple` | `version_ordering_does_not_promote_older_tags`、`update_check_reports_missing_release_and_no_upgrade` |
 | release 检查区分传输失败=4 network、HTTP=5 upstream、401/403=3 auth，且零文件副作用 | 合同错误分层；`from_campus_error` | `release_check_layers_transport_and_http_failures`、`update_check_reports_a_newer_release_without_side_effects` |
-| 生产 `Offline` transport 下运行时 `update --check` 明确为 network=4，不写状态 | 合同“runtime check blocked on scoped production transport” | `update_check_is_blocked_without_a_scoped_production_transport` |
-| 默认 `update` 先做同样的 release 检查；生产 `Offline` 下明确为 network=4，不写状态 | 合同“非法参数/未接线前不扩大副作用” | `update_apply_is_blocked_at_the_release_check_without_a_production_transport` |
 | 新版本下载固定 asset，经同一 `Transport`；重定向只允许 GitHub 资产主机或同仓库下载路径 | `cmd_update` 的 asset URL；合同“只作用于获准目标” | `update_apply_replaces_a_verified_fixture_target`、`update_apply_download_and_archive_failures_leave_the_target_untouched` |
-| ZIP 只接受一个安全的 `bupt` 普通文件；拒绝路径穿越、符号链接、重复目标、坏 CRC/截断 | 合同“不扩大删除/写入范围”；不搬 Python `zipfile` 的路径行为 | `stored_entry_is_extracted`、`deflated_fixed_and_dynamic_blocks_are_extracted`、`unsafe_or_broken_archives_are_rejected`、`archive_rejects_duplicate_targets`、`truncated_and_mutated_archives_never_panic` |
+| ZIP 由维护中的 `zip` crate 在内存解析，只接受一个安全的 `bupt` 普通文件；拒绝路径穿越、符号链接、重复目标、坏 CRC/截断 | 合同“不扩大删除/写入范围”；不把 ZIP 条目路径写到磁盘 | `stored_entry_is_extracted`、`prefixed_entry_is_extracted`、`deflated_entry_is_extracted`、`corrupt_and_unsafe_archives_are_rejected`、`too_many_entries_are_rejected`、`truncated_and_mutated_archives_never_panic` |
+| 目标/发行物必须是本平台架构的原生可执行文件；ARM64 Mach-O、PE x64、ELF 的头部和 load/segment 边界都要通过 | 合同“拒绝错误平台/架构和截断候选” | `native_payload_is_accepted_and_wrong_arch_is_rejected`、`truncated_native_payload_is_rejected`、`update_apply_rejects_scripts_wrong_names_and_non_executables`、`update_apply_download_and_archive_failures_leave_the_target_untouched` |
 | 发行物或目标若是 Python launcher（shebang/PyInstaller cookie），拒绝安装/替换 | 合同“不信任 Python launcher”；当前发布物可能仍是 Python 版 | `update_apply_rejects_scripts_wrong_names_and_non_executables`、`update_apply_download_and_archive_failures_leave_the_target_untouched` |
-| 目标必须是当前获准的原生可执行文件；脚本、源码、错误文件名、非执行位、符号链接都拒绝；源码/debug 构建诚实返回未安装 | Python `sys.frozen` 之前的目标判定与 `test_update_install_path_from_source_is_honest`；合同“只更新获准目标” | `update_apply_rejects_a_symlinked_target`、`update_apply_rejects_scripts_wrong_names_and_non_executables`、`update_apply_refuses_a_development_build_even_with_a_target`、`update_apply_source_build_reports_not_installed_without_touching_it` |
+| 目标必须是当前获准的原生可执行文件；脚本、源码、错误文件名、非执行位、符号链接都拒绝；源码/debug/未加发布标记的构建诚实返回未安装 | Python `sys.frozen` 之前的目标判定与 `test_update_install_path_from_source_is_honest`；合同“只更新获准目标” | `update_apply_rejects_a_symlinked_target`、`update_apply_rejects_scripts_wrong_names_and_non_executables`、`update_apply_refuses_a_development_build_even_with_a_target`、`update_apply_source_build_reports_not_installed_without_touching_it` |
 | staging 写入/校验通过后才备份；替换前复核目标元数据；替换后校验字节，失败用备份恢复 | `cmd_update` 的备份/替换；`build.sh` 的 staging 原则 | `update_apply_replaces_a_verified_fixture_target`、`update_apply_stage_write_and_backup_failures_preserve_the_target`、`update_apply_failure_after_backup_cleans_the_backup`、`update_apply_replace_failure_cleans_up_the_backup`、`update_apply_corruption_rolls_back_from_the_backup`、`update_apply_restore_failure_keeps_the_backup_and_reports_it` |
 | 已有 `bupt.old` 不覆盖；下载、解包、写入、替换失败都不报告已更新 | 合同“不对跳过/失败项报告完成” | `update_apply_requires_the_backup_path_to_be_free`、`update_apply_download_and_archive_failures_leave_the_target_untouched` |
 | `--check` 的 note 不再承诺 Windows/无发行物/debug 或源码运行可安装 | `cmd_update` 的 `note`；合同“诚实报告未实现” | `update_notes_do_not_promise_unavailable_installs` |
 
 ## 实现（离线与本地路径）
 
-实现文件：`src/lifecycle.rs`、`src/lifecycle/archive.rs`。只使用注入的 `Transport`/`Scripted`、临时目录、合成 JSON 和假发行物名；没有联网，没有扫描或删除真实安装，也没有对真实已安装程序执行 `update`。替换路径只在单元测试里对临时夹具副本执行。
+实现文件：`src/lifecycle.rs`、`src/lifecycle/archive.rs`、`src/lifecycle/binary.rs`。只使用注入的 `Transport`/`Scripted`、临时目录、合成 JSON 和假发行物名；没有联网，没有扫描或删除真实安装，也没有对真实已安装程序执行 `update`。替换路径只在单元测试里对临时夹具副本执行。
 
 ### `update`
 
 - `--check` / `--repo OWNER/REPO` 保留；`--repo` 只接受严格的 `OWNER/REPO`，URL、空值、额外路径段在联网和写状态前以 usage（退出 2）拒绝。
 - `--check` 通过注入的 `Transport` 发起一次 `GET https://github.com/OWNER/REPO/releases/latest`，带 `User-Agent: bupt-cli`；不跟随重定向，不访问 `api.github.com`，不下载 asset。
 - 只有 301/302/303/307/308 且 `Location` 是同一仓库的 `https://github.com/OWNER/REPO/releases/tag/<tag>` 才接受；主机、仓库或路径不符、query/fragment、额外路径段、缺失 Location 都以 upstream（退出 5）失败关闭。`<tag> == latest` 保留 Python 的“无版本号”成功结果。
-- 成功字段沿用 Python：`current`、`repo`、`latest`（去掉前导 `v`）、`update_available`、`note`。`current` 取编译时的 `CARGO_PKG_VERSION`（当前迁移包为 `0.0.0`），不硬编码 Python 的 `__version__`。无 release（404 且无有效 Location）是成功结果（`update_available=false`），不是错误。`--check` 在 debug/源码运行时 note 说明“当前不是独立发行二进制，未自动安装”，不沿用 Python 会承诺安装的文案。
+- 成功字段沿用 Python：`current`、`repo`、`latest`（去掉前导 `v`）、`update_available`、`note`。`current` 取编译时的 `CARGO_PKG_VERSION`（当前迁移包为 `0.0.0`），不硬编码 Python 的 `__version__`。无 release（404 且无有效 Location）是成功结果（`update_available=false`），不是错误。`--check` 在 debug/源码/未设置发布标记的构建中 note 说明“当前不是独立发行二进制，未自动安装”，不沿用 Python 会承诺安装的文案。
 - 版本比较只取前三个数字段，并按 Python 的短元组规则比较，`1.10.0 > 1.9.0`；相等或更旧的 tag 不报告升级。
 - 错误分层：传输失败=4 network；401/403=3 auth；其他 HTTP 状态和畸形/外来重定向=5 upstream。检查不写 config/cache/暂存文件。
 - 默认 `update`（无 `--check`）先执行同一 release 检查。无 release、无版本号、已是最新版本都成功返回且不写文件；有新版本才进入安装路径。生产 `Offline` transport 下默认 `update` 在检查阶段返回 network（退出 4），不创建暂存文件。
 - 发行物按平台选择：macOS Apple Silicon 用 `bupt-macos-arm64.zip`，Windows x64 用 `bupt-windows-x64.zip`。Windows 名称沿用 macOS 的命名习惯，发布工作流尚未确认；这是需要整合者确认的歧义点。
 - 安装路径从 `https://github.com/OWNER/REPO/releases/download/<tag>/<asset>` 下载 asset，仍走注入的 `Transport`，不访问 `api.github.com`。最多跟随 5 次显式 301/302/303/307/308；`Location` 只允许 HTTPS 的 `github.com` 同仓库下载路径，或 `release-assets.githubusercontent.com` / `objects.githubusercontent.com` / `github-releases.githubusercontent.com`；其他主机、路径穿越、query 以外的畸形值都失败关闭。响应体上限 256 MiB。
-- ZIP 不落盘解压，而是在内存内严格解析：只接受 stored/DEFLATE、一个安全的 `bupt` 普通文件，校验压缩/解压大小和 CRC32；拒绝路径穿越、绝对路径、反斜杠、符号链接、目录目标、重复 `bupt`、ZIP64、加密和截断。发行物内若是 shebang/PyInstaller launcher，也在写目标前拒绝；当前若仍发布 Python 版 asset，更新会失败关闭而不是把 Python 包装成 Rust 更新。没有新增 ZIP 依赖；解析器和 DEFLATE 解码器在 `src/lifecycle/archive.rs`。
-- 目标只取当前正在运行的 `bupt` / `bupt.exe`，不扫描 PATH/CWD，不依赖 Python 的 `sys.frozen`。目标必须是绝对路径、普通文件、非空、不超过 256 MiB、文件名匹配、（Unix）有执行位、原生可执行魔数（macOS Mach-O / Windows PE / 其他 Unix ELF），且不能是符号链接。shebang 脚本、PyInstaller onefile cookie 和显式指定的 debug 构建都拒绝；当前运行的是 debug/`target` 构建时，不进入替换路径，而是像 Python 的非 frozen 分支一样成功返回 `installed_to=null` 和“未自动安装”的 note。单元测试通过私有 target/FS 缝只替换临时夹具副本。
+- ZIP 不落盘解压，而是用维护中的 `zip` crate（`9.7.1`，`default-features = false`，仅 `deflate-flate2-zlib-rs`）在内存解析：保留 256 MiB 归档/条目上限、4096 条目上限，只接受 stored/DEFLATE、一个安全的 `bupt` 普通文件；由 `zip` 读取器校验 CRC 和解压大小，本层再检查名称安全性、符号链接、目录目标、重复 `bupt`、加密和条目大小。发行物内若是 shebang/PyInstaller launcher，也在写目标前拒绝；当前若仍发布 Python 版 asset，更新会失败关闭而不是把 Python 包装成 Rust 更新。
+- 目标只取当前正在运行的 `bupt` / `bupt.exe`，不扫描 PATH/CWD，不依赖 Python 的 `sys.frozen`。目标必须是绝对路径、普通文件、非空、不超过 256 MiB、文件名匹配、（Unix）有执行位、结构完整的本平台原生可执行文件，且不能是符号链接：macOS 要求 ARM64 `MH_EXECUTE` 且 load command/segment 文件范围在候选字节内；Windows 要求 PE32+ x64 和节表范围；其他 Unix 要求对应架构 ELF。错误架构、共享库/非执行文件、截断头部/命令表/段都会拒绝。shebang 脚本、PyInstaller onefile cookie 也拒绝。
+- 只有显式编译期发布标记（构建时设置 `BUPT_CLI_RELEASE_BUILD=1`，且非 debug、非 `cfg(test)`）才允许当前运行的程序自动进入替换路径；macOS 路径上，源码、测试、夹具构建和未设置标记的 release 构建都返回 `installed_to=null` 和“未自动安装”的 note，不靠文件名或“路径里有没有 target”判断。单元测试通过私有 target/FS 缝只替换临时夹具副本。
 - 替换顺序：在目标同目录创建 staging 目录，写入并读回校验新二进制 → 再次核对目标元数据 → 复制 `bupt.old` 备份并校验字节 → 原子 rename 覆盖目标 → 再次校验目标大小/执行位/字节。任一步失败都保留旧目标；替换后校验失败会用备份恢复；恢复也失败时错误文本明确指出备份位置，不声称已更新。成功时保留 `bupt.old`，显式清理暂存目录（清理失败写进 note，不伪装成已清理），输出 `installed_to`、`backup` 和 `已更新到 <version>` note，与 Python `cmd_update` 的成功字段一致。源码/非独立构建返回 `installed_to=null`，不报告已安装。
 - 备份路径固定为目标的 `bupt.old`。若该路径已存在（普通文件、目录或符号链接），更新拒绝覆盖并要求先移动/删除；这是对 Python 会覆盖旧备份的有意保守变化，目的是不碰无关文件。重复更新前需要先处理旧备份。
 - Windows 运行时 `.exe` 原位替换仍未实现：`update --check` 的 note 明确说明未自动安装，默认 `update` 在下载前返回 upstream（退出 5）且不改文件。macOS 的实际替换路径已按上述规则接好，等待生产 transport 和真实 release asset 验收。
@@ -92,13 +92,13 @@
 
 ```sh
 cargo test --locked --offline --lib
-# 215 passed（lifecycle::tests 35 个，lifecycle::archive::tests 6 个）
+# 218 passed（lifecycle::tests 35 个，lifecycle::archive::tests 6 个，lifecycle::binary::tests 3 个）
 
 cargo test --locked --offline --test contract_lifecycle
-# 25 passed; 0 failed
+# 23 passed; 0 failed
 ```
 
-新增/相关的单元用例：`repo_must_be_owner_slash_repo`、`release_assets_are_selected_per_supported_platform`、`only_a_regular_bupt_executable_is_a_target`、`removal_plans_only_the_given_executable`、`dry_run_plans_without_removing_the_executable`、`owned_data_requires_recognized_payloads`、`timetable_ownership_requires_known_shape`、`logged_out_credentials_remain_recognizable`、`dry_run_keeps_the_vetted_directory`、`mixed_directory_is_rejected_before_removal`、`late_unknown_file_survives_execution`、`changed_owned_file_survives_execution`、`replaced_directory_survives_execution`、`uninstall_note_distinguishes_completion_from_skips_and_keep_data`、`dangerous_roots_are_refused_without_following_aliases`、`update_check_reports_a_newer_release_without_side_effects`、`update_check_reports_missing_release_and_no_upgrade`、`update_check_reports_a_redirect_without_a_version`、`release_location_must_name_the_same_repository_tag`、`update_check_rejects_a_foreign_redirect`、`release_check_layers_transport_and_http_failures`、`version_ordering_does_not_promote_older_tags`、`update_apply_replaces_a_verified_fixture_target`、`update_apply_rejects_a_symlinked_target`、`update_apply_rejects_scripts_wrong_names_and_non_executables`、`update_apply_refuses_a_development_build_even_with_a_target`、`update_apply_requires_the_backup_path_to_be_free`、`update_apply_download_and_archive_failures_leave_the_target_untouched`、`update_apply_stage_write_and_backup_failures_preserve_the_target`、`update_apply_failure_after_backup_cleans_the_backup`、`update_apply_replace_failure_cleans_up_the_backup`、`update_apply_corruption_rolls_back_from_the_backup`、`update_apply_restore_failure_keeps_the_backup_and_reports_it`、`update_apply_source_build_reports_not_installed_without_touching_it`、`update_notes_do_not_promise_unavailable_installs`、`stored_entry_is_extracted`、`prefixed_entry_is_extracted`、`deflated_fixed_and_dynamic_blocks_are_extracted`、`unsafe_or_broken_archives_are_rejected`、`archive_rejects_duplicate_targets`、`truncated_and_mutated_archives_never_panic`。
+新增/相关的单元用例：`repo_must_be_owner_slash_repo`、`release_assets_are_selected_per_supported_platform`、`only_a_regular_bupt_executable_is_a_target`、`removal_plans_only_the_given_executable`、`dry_run_plans_without_removing_the_executable`、`owned_data_requires_recognized_payloads`、`timetable_ownership_requires_known_shape`、`logged_out_credentials_remain_recognizable`、`dry_run_keeps_the_vetted_directory`、`mixed_directory_is_rejected_before_removal`、`late_unknown_file_survives_execution`、`changed_owned_file_survives_execution`、`replaced_directory_survives_execution`、`uninstall_note_distinguishes_completion_from_skips_and_keep_data`、`dangerous_roots_are_refused_without_following_aliases`、`update_check_reports_a_newer_release_without_side_effects`、`update_check_reports_missing_release_and_no_upgrade`、`update_check_reports_a_redirect_without_a_version`、`release_location_must_name_the_same_repository_tag`、`update_check_rejects_a_foreign_redirect`、`release_check_layers_transport_and_http_failures`、`version_ordering_does_not_promote_older_tags`、`update_apply_replaces_a_verified_fixture_target`、`update_apply_rejects_a_symlinked_target`、`update_apply_rejects_scripts_wrong_names_and_non_executables`、`update_apply_refuses_a_development_build_even_with_a_target`、`update_apply_requires_the_backup_path_to_be_free`、`update_apply_download_and_archive_failures_leave_the_target_untouched`、`update_apply_stage_write_and_backup_failures_preserve_the_target`、`update_apply_failure_after_backup_cleans_the_backup`、`update_apply_replace_failure_cleans_up_the_backup`、`update_apply_corruption_rolls_back_from_the_backup`、`update_apply_restore_failure_keeps_the_backup_and_reports_it`、`update_apply_source_build_reports_not_installed_without_touching_it`、`update_notes_do_not_promise_unavailable_installs`、`stored_entry_is_extracted`、`prefixed_entry_is_extracted`、`deflated_entry_is_extracted`、`corrupt_and_unsafe_archives_are_rejected`、`too_many_entries_are_rejected`、`truncated_and_mutated_archives_never_panic`、`native_payload_is_accepted_and_wrong_arch_is_rejected`、`truncated_native_payload_is_rejected`、`python_launchers_are_not_native_candidates`。
 
 此前因 identity / homework 尚未接入而失败的三条 lane 用例（`status_is_one_compact_json_document_with_schema`、`pretty_changes_layout_without_changing_values`、`homework_uses_the_canonical_default_entry`）在当前基线已通过；本轮 lane 合同测试全绿。
 
@@ -113,7 +113,7 @@ cargo test --locked --offline --test contract_lifecycle
 
 2. **更新 staging / 原子替换 / 失败回滚**
    - Python：`cmd_update`、`test_update_replaces_a_frozen_binary`、`test_update_install_path_from_source_is_honest`；`build.sh` 的“先打包到 staging、冒烟、再原子替换，失败不覆盖旧二进制”。
-   - 已覆盖：注入 transport + FS 下的 asset 下载、重定向限制、严格 ZIP 选择、目标校验、staging 写入/读回、备份、替换后校验、失败清理和恢复。目标始终是临时夹具副本，不碰真实 `bupt`。
+   - 已覆盖：注入 transport + FS 下的 asset 下载、重定向限制、维护中 `zip` crate 的严格选择、原生架构/结构校验、staging 写入/读回、备份、替换后校验、失败清理和恢复。目标始终是临时夹具副本，不碰真实 `bupt`。
    - 仍缺：真实 macOS Apple Silicon release asset 的 zip 形态/权限/`--version` 冒烟和实际替换验收；Windows 运行时 `.exe` 替换；旧 Python 安装的现场迁移策略需要整合者决定。当前实现会拒绝 shebang/PyInstaller 目标和发行物；源码运行会诚实返回 `installed_to=null` 而不是安装，因此发布仓库在切换到 Rust 原生 asset 之前，真实更新应预期失败关闭，不能拿旧 Python release 验收成功。
 
 3. **`update` 的网络/上游错误分层**
@@ -137,9 +137,10 @@ cargo test --locked --offline --test contract_lifecycle
 
 ## 整合者接线要求
 
-- **依赖**：本线没有修改 `Cargo.toml`/`Cargo.lock`，也没有引入 ZIP/flate 依赖；`src/lifecycle/archive.rs` 是自包含的严格 ZIP/DEFLATE 读取器。若整合者更希望使用成熟的 `zip` crate，请明确版本与 features，并保留现有路径穿越、符号链接、重复项、CRC/大小和内存上限检查。
+- **依赖**：本线在 `Cargo.toml`/`Cargo.lock` 增加 `zip = { version = "9.7.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }`；只启用 Rust `zlib-rs` 的 DEFLATE 读写，不启用 AES、bzip2、deflate64、lzma、ppmd、zstd、xz 或 zopfli。`zip` 仍会带入其平台抽象依赖（`libc`/`nix`/`windows-sys` 等），但没有系统压缩库或 C 构建脚本。若整合者要求更低依赖面，需要另行批准替代 crate/feature；本线不自行扩大包集合。
+- **发布构建标记**：只有 `BUPT_CLI_RELEASE_BUILD=1 cargo build --release` 生成的二进制才允许自动替换当前程序；未设置标记的 release、debug、测试和夹具构建都不自动安装；macOS 可用路径返回 `installed_to=null`。
 - **生产 transport 范围**：需要放行且只放行 `GET https://github.com/OWNER/REPO/releases/latest`、`GET https://github.com/OWNER/REPO/releases/download/<tag>/<asset>`，以及这些请求的 301/302/303/307/308 到 `release-assets.githubusercontent.com`、`objects.githubusercontent.com`、`github-releases.githubusercontent.com` 或同一仓库下载路径。不要携带凭据、不要跟随其他主机、响应体上限至少覆盖 256 MiB 的拒绝阈值。
-- **Windows**：需要单独的运行中 `.exe` 替换/退出后 swap 策略和双平台验收；在本轮不能声称已实现。
+- **Windows**：需要单独的运行中 `.exe` 替换/退出后 swap 策略和双平台验收；在本轮不能声称已实现。Windows 候选结构校验已按 PE32+ x64 实现，但没有运行中替换。
 
 ## 历史红测记录
 
@@ -155,5 +156,5 @@ left: 78
 ## 格式与编译
 
 - `cargo test --locked --offline --test contract_lifecycle --no-run`：通过。
-- `cargo fmt --check` 通过（基线已包含共享 harness 的格式修复）。
-- 共享 `tests/contract_support/mod.rs`、`Cargo.toml`、`Cargo.lock`、`src/cli.rs`、`src/transport.rs` 均未修改。
+- `cargo fmt --check` 通过。
+- `Cargo.toml`/`Cargo.lock` 只增加经批准的 `zip` 依赖及其传递依赖；共享 `tests/contract_support/mod.rs`、`src/cli.rs`、`src/transport.rs` 未修改。
