@@ -27,6 +27,7 @@ enum Route {
     ElectricityRead(&'static [&'static str]),
     PublicProbe,
     MobileProbe,
+    MobileLogin,
 }
 
 pub(super) fn exchange(
@@ -96,7 +97,11 @@ fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<V
     let body = std::str::from_utf8(&request.body).map_err(|_| rejected())?;
     let requires_body = matches!(
         route,
-        Route::CasForm | Route::UcloudToken | Route::UcloudHomeworkList | Route::ElectricityRead(_)
+        Route::CasForm
+            | Route::UcloudToken
+            | Route::UcloudHomeworkList
+            | Route::ElectricityRead(_)
+            | Route::MobileLogin
     );
     if body.len() > MAX_REQUEST
         || body.is_empty() == requires_body
@@ -137,6 +142,12 @@ fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<V
         return Err(rejected());
     }
     if probe && matches!(route, Route::UcloudToken) && !valid_ticket_exchange(body) {
+        return Err(rejected());
+    }
+    if matches!(route, Route::MobileLogin)
+        && (!has_header(request, "content-type", "application/x-www-form-urlencoded")
+            || !valid_mobile_login_body(body))
+    {
         return Err(rejected());
     }
     if let Route::ElectricityRead(keys) = route {
@@ -208,6 +219,9 @@ fn route(request: &Request) -> Option<Route> {
         | ("apiucloud.bupt.edu.cn", "GET", "/blade-source/resource/download") => {
             Some(Route::UcloudAttachment)
         }
+        ("jwglweixin.bupt.edu.cn", "POST", "/bjyddx/login") if parsed.query().is_none() => {
+            Some(Route::MobileLogin)
+        }
         ("app.bupt.edu.cn", "GET", "/buptdf/wap/default/chong") if parsed.query().is_none() => {
             Some(Route::ElectricityLanding)
         }
@@ -243,7 +257,10 @@ fn probe_route(request: &Request) -> Option<Route> {
     }
     if let Some(route) = route(request) {
         return match route {
-            Route::CasForm | Route::UcloudLanding | Route::UcloudAttachment => None,
+            Route::CasForm
+            | Route::UcloudLanding
+            | Route::UcloudAttachment
+            | Route::MobileLogin => None,
             Route::CasRead
                 if !matches!(
                     request.url.as_str(),
@@ -303,6 +320,17 @@ fn probe_route(request: &Request) -> Option<Route> {
     }
 }
 
+fn valid_mobile_login_body(body: &str) -> bool {
+    let fields: Vec<_> = url::form_urlencoded::parse(body.as_bytes()).collect();
+    fields.len() == 2
+        && fields
+            .iter()
+            .any(|(key, value)| key == "userNo" && !value.trim().is_empty())
+        && fields
+            .iter()
+            .any(|(key, value)| key == "pwd" && !value.is_empty())
+}
+
 fn valid_ticket_exchange(body: &str) -> bool {
     let fields: Vec<_> = url::form_urlencoded::parse(body.as_bytes()).collect();
     fields.len() == 2
@@ -327,6 +355,7 @@ fn allowed_header(route: Route, name: &str) -> bool {
             Route::CasForm => matches!(name, "cookie" | "content-type"),
             Route::UcloudLanding | Route::UcloudAttachment | Route::PublicProbe => false,
             Route::MobileProbe => matches!(name, "token" | "accept"),
+            Route::MobileLogin => matches!(name, "accept" | "content-type"),
             Route::UcloudToken => matches!(name, "authorization" | "content-type"),
             Route::UcloudRead | Route::UcloudHomeworkList => {
                 matches!(
@@ -546,6 +575,36 @@ mod tests {
         request.method = "GET";
         request.url = "https://fileucloud.bupt.edu.cn.example/attachment.bin".into();
         assert!(curl_config(&request).is_err());
+    }
+
+    #[test]
+    fn mobile_login_is_only_available_on_one_tls_form_route() {
+        let endpoint = "https://jwglweixin.bupt.edu.cn/bjyddx/login";
+        let mut request = Request {
+            method: "POST",
+            url: endpoint.into(),
+            headers: vec![(
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            )],
+            body: b"userNo=TEST-ONLY&pwd=TEST%2BONLY".to_vec(),
+        };
+        assert!(curl_config(&request).is_ok());
+        assert!(curl_probe_config(&request).is_err());
+        request.headers.push(("Cookie".into(), "TEST=ONLY".into()));
+        assert!(curl_config(&request).is_err());
+        request.headers.pop();
+        request.url = endpoint.replace("https:", "http:");
+        assert!(curl_config(&request).is_err());
+        request.url = endpoint.into();
+        for invalid in [
+            "userNo=TEST&pwd=",
+            "userNo=TEST&userNo=ONLY",
+            "userNo=TEST&pwd=ONLY&extra=1",
+        ] {
+            request.body = invalid.as_bytes().to_vec();
+            assert!(curl_config(&request).is_err());
+        }
     }
 
     #[test]

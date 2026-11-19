@@ -45,7 +45,7 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - `locally_valid` 要求至少一个可用的 CAS Cookie：非空 domain、非空 name、字符串 value，且未明确过期。过期或格式不完整的 Cookie 只增加 `cookie_count`，不能单独让状态变成可用；缺失/不可解析的过期时间仍按未知处理。
 - `diagnose` 已实现完整的本地编排：公共端点始终匿名检查，鉴权端点只使用已验证、归属匹配的原生 CAS 会话；没有可用会话时返回 skipped 行，不提交密码、不写会话。详见下文“诊断编排（本轮）”。
 - `logout` 分别 unlink 自己拥有的 `credentials.json` 和 `session.json`，不重写打开的文件；`config.json` 和 `timetable.json` 保持原样。符号链接和非普通文件会被拒绝并报 auth 错误。
-- 本 lane 的 28 个进程测试全部通过；`identity` 模块另有 49 个 lib 单测（4 个 profile/参数 + 17 个原生会话 + 19 个 CAS/UCloud + 9 个诊断编排），全库 lib 共 199 个；待实现场景没有以永远通过或伪造断言的形式保留。
+- 本 lane 的 28 个进程测试全部通过；`identity` 模块另有 58 个 lib 单测（含 5 个新增移动 JWGL 惰性 token 用例），全库 lib 共 302 个；待实现场景没有以永远通过或伪造断言的形式保留。
 
 ## 共享本地 profile API（本轮）
 
@@ -104,6 +104,27 @@ cargo fmt --check -- --config skip_children=true   # 本 lane 通过
 - `require_ucloud_session` 读取时要求 credentials 和 session 都是普通、owner-only（组/其他用户无权限，通常为 `0600`）文件，父目录不是 symlink 且不可被其他用户写，config/cache 属主一致；校验 `version`、username、role、revision 后才接受 Cookie/token。旧 v1 会话仍由公开 `status` 只读兼容，但不会激活原生读取路径。
 - 非 Unix 平台在写入前 fail closed（upstream `5`），不声明 Windows ACL 支持。
 - 17 个新增 lib 单测覆盖：单次 CAS 验证且登录不请求 token、credentials 未知键保留和新 revision、second login 生成新 revision、分离进程从磁盘加载并复用新鲜 token（含 CAS Cookie 已过期）、无密码/错误 revision/外部 Cookie 范围/不安全权限在联网前拒绝、过期 token 惰性刷新并写回、token 刷新 401 时 session 不变、401 和缺少 ticket 时旧字节不变且不重试密码、损坏的普通 credentials/session 在验证成功后修复、symlink/可写目录在密码 POST 前拒绝、非 Unix fail closed。测试只用临时目录、`Scripted` 和合成秘密。
+
+## 移动 JWGL 惰性 token（本轮）
+
+公开给同 crate 其他模块的接口：
+
+```rust
+pub(crate) fn identity::require_mobile_jwgl_token(
+    context: &mut Context<'_>,
+) -> CliResult<String>
+```
+
+- 只允许本科账号。先读取私有的 `credentials.json`，role 不是 `undergraduate`（含缺失/非法 role）在读取会话和发出任何请求前返回 auth `3`；研究生不会提交密码，也不会复用旧的本科 token。
+- 通过原生 session 的 owner-only 文件、`version`、`username`、`role` 和 `session_revision` 绑定校验后，先尝试复用 `mobile_jwgl.token`：显式 `expires_at` 仍有效，或缺失时从 JWT `exp`（移动端可能是毫秒）推导出有效时间，则直接返回，不读取 UCloud/CAS 状态、不写文件、不联网。缺少 expiry 且不是 JWT 时按保守的 30 分钟本地有效期复用。
+- token 缺失或过期时，先验证 cache 目录可安全写入，再从 `credentials.json` 读取密码。整个命令只向固定 URL `https://jwglweixin.bupt.edu.cn/bjyddx/login` 发一次 `POST`，表单字段固定为 `userNo`、`pwd`；不跟随重定向、不重试、不提交 CAS 表单、不使用浏览器。传输仍由注入的 `Transport` 提供。
+- 登录响应必须是 JSON 对象且 `code` 为数字/字符串 `1`，`data.token` 为非空、无空白/控制字符的字符串；移动端 JWT 的 `exp` 若是毫秒会转换为秒，再减去 120 秒刷新缓冲；无 `exp` 的 token 使用 30 分钟保守有效期。
+- 成功时只改原生 session 的 `mobile_jwgl.token`、`mobile_jwgl.expires_at` 和 `updated_at`：其他 `mobile_jwgl` 字段、CAS Cookie、UCloud token、`cas_logins_total`、创建时间及未知顶层字段全部保留。写入沿用私有 `0600` 临时文件 + `rename` 的分阶段路径，失败会删除临时文件并保留旧 session 字节；返回 token 前必须已完成持久化。
+- 失败时旧 `credentials.json`/`session.json` 字节和权限不变，且不会重新提交密码。401/403、`code` 拒绝、缺 token 是 auth `3`；连接/传输失败是 network `4`；其他 HTTP（含 429、3xx）或畸形 JSON/缺 `code` 是 upstream `5`。错误不包含密码、token、响应正文或请求 URL。
+- **兼容性限制（明确）**：移动 JWGL 校验的是 `jwgl.bupt.edu.cn` 的 JWGL 密码，可能与统一身份认证/CAS 密码不同。本迁移只有 `credentials.json` 中的一个密码，不提供第二个 JWGL 密码字段、环境变量或公开参数；如果北邮拒绝该密码，`require_mobile_jwgl_token` 返回 auth 错误并明确提示这一差异，**不会**重试或尝试另一密码。只有 CAS/WJGL 密码相同的本科账号可以自动获取；不同密码的账号本轮无法获得移动 token。
+- `diagnose` 保持只读、无密码：移动行仍只使用缓存 token，不调用本 helper，也不提交 JWGL 登录。
+
+新增 5 个 `Scripted` lib 用例：研究生角色在传输前拒绝；owner/revision 绑定且未过期的 token 在 CAS/UCloud 半损坏时仍复用且零写入；过期 token 只发一次固定 POST 并只更新 mobile 范围、保留其他 session 字段；302/401/403/429/500、非 JSON、缺 code、拒绝 envelope、缺 token 以及网络失败都只发一次请求并保留旧字节；错误 revision 在密码 POST 前拒绝。
 
 ## 诊断编排（本轮）
 
