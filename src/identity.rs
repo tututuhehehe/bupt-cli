@@ -1,7 +1,10 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use clap::{Arg, ArgAction, ArgMatches, Command};
+use cookie_store::CookieExpiration;
 use serde_json::{Map, Value, json};
+use std::fmt;
 use std::fs;
+use std::io::Cursor;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,9 +17,13 @@ const PUBLIC_USER_FIELDS: &[&str] = &["user_id", "user_name", "real_name"];
 const CAS_SERVICE_URL: &str =
     "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fucloud.bupt.edu.cn%2Fuclass";
 
-// The synthetic protocol is not compiled into production until the live-wiring gate is met.
-#[cfg(test)]
+// The protocol and native store are production code with an injected transport.
+// The CLI keeps `Offline` until the parent wires the bounded transport.
 mod cas;
+// The parent read command is wired in a later lane; these helpers are exercised
+// by the identity library tests now.
+#[allow(dead_code)]
+mod session;
 
 const DIAGNOSE_GROUPS: &[&str] = &[
     "public",
@@ -93,7 +100,7 @@ pub(crate) fn run(
     context: &mut Context<'_>,
 ) -> CliResult<Outcome> {
     match name {
-        "login" => run_login(matches),
+        "login" => run_login(matches, context),
         "status" => run_status(context),
         "logout" => run_logout(context),
         "diagnose" => run_diagnose(matches, context),
@@ -121,12 +128,25 @@ impl Role {
     }
 }
 
-/// Read-only local profile metadata; it contains no password or session material.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Read-only local profile metadata; it contains no password, session cookie or
+/// token material. The per-login revision is private and never formatted.
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct LocalProfile {
     username: String,
     role: Option<Role>,
     has_password: bool,
+    session_revision: Option<String>,
+}
+
+impl fmt::Debug for LocalProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalProfile")
+            .field("username", &self.username)
+            .field("role", &self.role)
+            .field("has_password", &self.has_password)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalProfile {
@@ -141,32 +161,76 @@ impl LocalProfile {
     pub(crate) fn has_password(&self) -> bool {
         self.has_password
     }
+
+    fn session_revision(&self) -> Option<&str> {
+        self.session_revision.as_deref()
+    }
 }
 
-fn run_login(matches: &ArgMatches) -> CliResult<Outcome> {
-    let (_username, _password, _role) = login_arguments(matches)?;
-    // Credential verification needs the campus transport. The local
-    // milestone deliberately stops before reading or writing account state.
-    Err(CliError::pending())
+struct LoginRequest {
+    username: String,
+    password: String,
+    role: Role,
 }
 
-fn login_arguments(matches: &ArgMatches) -> CliResult<(String, String, Role)> {
-    let username = matches
-        .get_one::<String>("user")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CliError::usage("login requires --user"))?
-        .to_owned();
-    let password = matches
-        .get_one::<String>("password")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CliError::usage("login requires --password"))?
-        .clone();
+impl fmt::Debug for LoginRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoginRequest")
+            .field("username", &self.username)
+            .field("role", &self.role)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+fn run_login(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
+    let request = login_arguments(matches)?;
+    session::login(context, &request)
+}
+
+fn login_arguments(matches: &ArgMatches) -> CliResult<LoginRequest> {
+    use std::io::{IsTerminal, Write};
+
     let role = matches
         .get_one::<String>("role")
         .and_then(|value| Role::parse(value))
         .ok_or_else(|| CliError::usage("login requires --role graduate or --role undergraduate"))?;
-    Ok((username, password, role))
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    let username = match matches.get_one::<String>("user") {
+        Some(value) => value.trim().to_owned(),
+        None if interactive => {
+            std::io::stderr()
+                .write_all("学号: ".as_bytes())
+                .map_err(|_| CliError::usage("cannot display the login prompt"))?;
+            let mut name = String::new();
+            stdin
+                .read_line(&mut name)
+                .map_err(|_| CliError::usage("cannot read the academic ID"))?;
+            name.trim().to_owned()
+        }
+        None => String::new(),
+    };
+    if username.is_empty() {
+        return Err(CliError::usage("login requires --user"));
+    }
+    let password = match matches.get_one::<String>("password") {
+        Some(value) => value.to_owned(),
+        None if interactive => rpassword::prompt_password("密码（不回显）: ")
+            .map_err(|_| CliError::usage("cannot read a password from the terminal"))?,
+        None => String::new(),
+    };
+    if password.is_empty() {
+        return Err(CliError::usage(
+            "login requires --password in non-interactive mode",
+        ));
+    }
+    Ok(LoginRequest {
+        username,
+        password,
+        role,
+    })
 }
 
 fn run_status(context: &mut Context<'_>) -> CliResult<Outcome> {
@@ -231,10 +295,17 @@ fn load_account(config_dir: &Path) -> CliResult<Option<LocalProfile>> {
         .get("password")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.is_empty());
+    let session_revision = config
+        .get("session_revision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     Ok(Some(LocalProfile {
         username: username.to_owned(),
         role,
         has_password,
+        session_revision,
     }))
 }
 
@@ -260,6 +331,16 @@ pub(crate) fn require_authenticated_profile(config_dir: &Path) -> CliResult<Loca
             "Run `bupt login` to save credentials.json.",
         )),
     }
+}
+
+/// Return `(access_token, user_id)` for a verified native session.
+///
+/// This never submits the account password and never falls back to a password
+/// login. A fresh cached UCloud token is reused; otherwise the persisted CAS
+/// cookies are used lazily for exactly one service-ticket/token exchange.
+#[allow(dead_code)]
+pub(crate) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(String, String)> {
+    session::require_ucloud_session(context)
 }
 
 #[derive(Debug)]
@@ -319,6 +400,17 @@ fn load_session(cache_dir: &Path, account: Option<&LocalProfile>) -> SessionSnap
             SessionSnapshot::empty("the session cache belongs to a different account");
         snapshot.mismatch = true;
         return snapshot;
+    }
+
+    let session_revision = data
+        .get("session_revision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if session_revision != account.session_revision() {
+        return SessionSnapshot::empty(
+            "the session cache is not bound to the current credential revision",
+        );
     }
 
     let version = data.get("version").and_then(Value::as_u64);
@@ -430,6 +522,59 @@ fn cookie_status(cookies: Option<&Value>, now: f64) -> CookieStatus {
     let Some(cookies) = cookies.and_then(Value::as_array) else {
         return CookieStatus::default();
     };
+    // Native sessions use the maintained cookie-store serialization. Older
+    // caches (and the public contract fixtures) use the flat v1/v2 shape; keep
+    // that read-only view so `status` does not regress for existing state.
+    if let Some(mut status) = maintained_cookie_status(cookies, now) {
+        status.total = cookies.len() as u64;
+        return status;
+    }
+    let native_shape = cookies
+        .iter()
+        .any(|cookie| cookie.get("raw_cookie").is_some());
+    if native_shape {
+        return CookieStatus {
+            total: cookies.len() as u64,
+            ..CookieStatus::default()
+        };
+    }
+    legacy_cookie_status(cookies, now)
+}
+
+fn maintained_cookie_status(cookies: &[Value], now: f64) -> Option<CookieStatus> {
+    let bytes = serde_json::to_vec(cookies).ok()?;
+    let store = cookie_store::serde::json::load_all(Cursor::new(bytes)).ok()?;
+    let mut status = CookieStatus {
+        total: cookies.len() as u64,
+        ..CookieStatus::default()
+    };
+    for cookie in store.iter_any() {
+        let expiry = match &cookie.expires {
+            CookieExpiration::AtUtc(value) => Some(value.unix_timestamp() as f64),
+            CookieExpiration::SessionEnd => None,
+        };
+        if let Some(expiry) = expiry {
+            status.earliest_expiry = Some(
+                status
+                    .earliest_expiry
+                    .map_or(expiry, |current| current.min(expiry)),
+            );
+        }
+        let domained = cookie
+            .domain
+            .as_cow()
+            .is_some_and(|value| !value.is_empty());
+        let named = !cookie.name().is_empty();
+        let valued = !cookie.value().is_empty();
+        let expired = expiry.is_some_and(|value| value <= now);
+        if domained && named && valued && !expired {
+            status.usable += 1;
+        }
+    }
+    Some(status)
+}
+
+fn legacy_cookie_status(cookies: &[Value], now: f64) -> CookieStatus {
     let mut status = CookieStatus {
         total: cookies.len() as u64,
         ..CookieStatus::default()
@@ -808,6 +953,9 @@ mod tests {
     const PROFILE_PASSWORD: &str = "TEST-ONLY-PROFILE-PASSWORD-4a7c";
     const PROFILE_COOKIE: &str = "TEST-ONLY-PROFILE-COOKIE-b8d2";
     const PROFILE_TOKEN: &str = "TEST-ONLY-PROFILE-TOKEN-c9e3";
+    const PROFILE_REVISION: &str = "TEST-ONLY-PROFILE-REVISION-d1e4";
+    const LOGIN_USER: &str = "2026000001";
+    const LOGIN_PASSWORD: &str = "TEST-ONLY-LOGIN-PASSWORD-1a2b";
 
     fn write_profile(directory: &Path, value: &Value) {
         let text = serde_json::to_string_pretty(value).expect("serialize profile");
@@ -827,6 +975,7 @@ mod tests {
                 "username": " 2026000001 ",
                 "password": PROFILE_PASSWORD,
                 "role": "研究生",
+                "session_revision": PROFILE_REVISION,
                 "cookie": PROFILE_COOKIE,
                 "access_token": PROFILE_TOKEN,
                 "unrelated": {"nested": "ignored"}
@@ -839,9 +988,15 @@ mod tests {
         assert_eq!(profile.username(), "2026000001");
         assert_eq!(profile.role(), Some(Role::Graduate));
         assert!(profile.has_password());
+        assert_eq!(profile.session_revision(), Some(PROFILE_REVISION));
 
         let debug = format!("{profile:?}");
-        for secret in [PROFILE_PASSWORD, PROFILE_COOKIE, PROFILE_TOKEN] {
+        for secret in [
+            PROFILE_PASSWORD,
+            PROFILE_COOKIE,
+            PROFILE_TOKEN,
+            PROFILE_REVISION,
+        ] {
             assert!(!debug.contains(secret), "Debug output leaked {secret}");
         }
     }
@@ -869,6 +1024,7 @@ mod tests {
             .expect("load missing-role profile")
             .expect("missing-role profile is present");
         assert_eq!(missing_role.role(), None);
+        assert_eq!(missing_role.session_revision(), None);
 
         let invalid_role_dir = tempdir().expect("create invalid-role directory");
         write_profile(
@@ -893,5 +1049,18 @@ mod tests {
                 .expect("load profile")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn login_request_debug_redacts_password() {
+        let request = LoginRequest {
+            username: LOGIN_USER.to_owned(),
+            password: LOGIN_PASSWORD.to_owned(),
+            role: Role::Graduate,
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains(LOGIN_PASSWORD));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains(LOGIN_USER));
     }
 }

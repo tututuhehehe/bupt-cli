@@ -94,6 +94,16 @@ type Run = fn(&str, &ArgMatches, &mut Context<'_>) -> CliResult<Outcome>;
 
 type Lane = (fn() -> Vec<Command>, Run);
 
+fn uses_public_library(name: &str) -> bool {
+    name == "library"
+}
+
+/// Allow the CAS protocol and only the first two read-only UCloud flows.
+fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
+    matches!(name, "login" | "courses")
+        || (name == "homework" && arguments.subcommand().is_none() && arguments.get_flag("undone"))
+}
+
 const LANES: &[Lane] = &[
     (crate::identity::commands, crate::identity::run),
     (crate::homework::commands, crate::homework::run),
@@ -186,7 +196,8 @@ fn run(
     args: &[OsString],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
-    transport: &mut dyn Transport,
+    offline: &mut dyn Transport,
+    public: Option<&mut dyn Transport>,
 ) -> u8 {
     let (command, routes) = command_tree();
     let pretty_on_error = args
@@ -222,6 +233,17 @@ fn run(
                 .get_one::<f64>("timeout")
                 .expect("timeout has a validated default"),
         );
+        let mut library_curl = crate::transport::Curl::new(timeout);
+        let mut campus_curl = crate::transport::CampusCurl::new(timeout);
+        // An injected public transport marks the entire dispatch as a test;
+        // the first injected transport then handles all non-library commands.
+        let transport: &mut dyn Transport = match public {
+            Some(transport) if uses_public_library(name) => transport,
+            Some(_) => offline,
+            None if uses_public_library(name) => &mut library_curl,
+            None if uses_campus_transport(name, arguments) => &mut campus_curl,
+            None => offline,
+        };
         let mut context = Context::from_environment(timeout, transport)?;
         let (_, handler) = routes
             .iter()
@@ -259,11 +281,13 @@ fn run(
 }
 
 pub fn main_entry() -> u8 {
+    let mut offline = Offline;
     run(
         &std::env::args_os().collect::<Vec<_>>(),
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
-        &mut Offline,
+        &mut offline,
+        None,
     )
 }
 
@@ -301,10 +325,74 @@ mod tests {
         let args = ["bupt", "--password=fake-secret"].map(OsString::from);
         let mut out = vec![];
         let mut err = vec![];
-        let mut transport = Scripted::default();
-        assert_eq!(run(&args, &mut out, &mut err, &mut transport), 2);
+        let mut offline = Scripted::default();
+        let mut public = Scripted::default();
+        assert_eq!(
+            run(&args, &mut out, &mut err, &mut offline, Some(&mut public)),
+            2
+        );
         assert!(out.is_empty());
         assert!(!String::from_utf8(err).unwrap().contains("fake-secret"));
-        assert!(transport.calls.is_empty());
+        assert!(offline.calls.is_empty());
+        assert!(public.calls.is_empty());
+    }
+
+    #[test]
+    fn library_search_uses_the_injected_public_transport() {
+        let args = ["bupt", "library", "search", "synthetic"].map(OsString::from);
+        let mut out = vec![];
+        let mut err = vec![];
+        let mut offline = Scripted::default();
+        let mut public = Scripted::default();
+        public.expected.push_back((
+            "POST",
+            "https://opac.bupt.edu.cn/search-full-result.json".into(),
+            Ok(Response {
+                status: 200,
+                headers: vec![],
+                body: br#"{"result":{"code":0},"total":0,"pageNo":1,"totalPage":0,"data":[]}"#
+                    .to_vec(),
+            }),
+        ));
+        assert_eq!(
+            run(&args, &mut out, &mut err, &mut offline, Some(&mut public)),
+            0
+        );
+        assert!(err.is_empty());
+        assert!(offline.calls.is_empty());
+        assert_eq!(public.calls.len(), 1);
+        let document: Value = serde_json::from_slice(&out).expect("parse CLI output");
+        assert_eq!(document["schema"], "bupt.v1");
+        assert_eq!(document["ok"], true);
+        assert_eq!(document["count"], 0);
+    }
+
+    #[test]
+    fn private_transport_is_only_routed_to_the_first_cas_and_read_flows() {
+        for (args, allowed) in [
+            (&["bupt", "login"][..], true),
+            (&["bupt", "courses"][..], true),
+            (&["bupt", "homework", "--undone"][..], true),
+            (&["bupt", "homework"][..], false),
+            (&["bupt", "status"][..], false),
+            (&["bupt", "diagnose"][..], false),
+            (&["bupt", "library", "search", "example"][..], false),
+        ] {
+            let (command, _) = command_tree();
+            let matches = command.try_get_matches_from(args).unwrap();
+            let (name, arguments) = matches.subcommand().unwrap();
+            assert_eq!(uses_campus_transport(name, arguments), allowed);
+        }
+    }
+
+    #[test]
+    fn only_the_library_lane_uses_the_public_network() {
+        let public: Vec<String> = LANES
+            .iter()
+            .flat_map(|(commands, _)| commands())
+            .map(|command| command.get_name().to_string())
+            .filter(|name| uses_public_library(name))
+            .collect();
+        assert_eq!(public, ["library"]);
     }
 }

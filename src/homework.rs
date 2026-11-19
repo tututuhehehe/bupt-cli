@@ -1,5 +1,4 @@
 mod detail;
-#[allow(dead_code)] // Exercised by in-process tests; CLI wiring follows the session adapter.
 mod read;
 mod show;
 mod submit;
@@ -110,8 +109,13 @@ pub(crate) fn run(
 ) -> CliResult<Outcome> {
     match command {
         "courses" => {
-            require_credentials(context)?;
-            Err(unsupported("course listing"))
+            let session = load_read_session(context)?;
+            let courses = read::fetch_courses(context.transport, &session)?;
+            Ok(Outcome {
+                data: read::courses_json(&courses),
+                code: 0,
+                diagnostic: None,
+            })
         }
         "homework" => run_homework(matches, context),
         _ => Err(CliError::pending()),
@@ -127,6 +131,33 @@ fn run_homework(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Ou
         }
         Some(("submit", submit_matches)) => submit::run(submit_matches, context),
         Some(("verify", verify_matches)) => verify::run(verify_matches, context),
+        None if matches.get_flag("undone")
+            && matches.get_one::<String>("course").is_none()
+            && matches.get_one::<u64>("new").is_none() =>
+        {
+            let session = load_read_session(context)?;
+            let now = time::OffsetDateTime::now_local().map_err(|_| {
+                CliError::new(
+                    5,
+                    "upstream",
+                    "cannot determine the local time for homework deadlines",
+                    "",
+                )
+            })?;
+            let overview = read::fetch_undone(context.transport, &session)?;
+            let limit = *matches
+                .get_one::<u64>("limit")
+                .expect("limit has a default");
+            Ok(Outcome {
+                data: read::undone_json(
+                    overview,
+                    limit,
+                    time::PrimitiveDateTime::new(now.date(), now.time()),
+                ),
+                code: 0,
+                diagnostic: None,
+            })
+        }
         _ => {
             require_credentials(context)?;
             Err(unsupported("homework listing"))
@@ -141,6 +172,22 @@ pub(super) fn unsupported(operation: &str) -> CliError {
         format!("{operation} is not implemented in this migration build"),
         "No campus request was made. This batch only covers local argument validation and the submit gate.",
     )
+}
+
+fn load_read_session(context: &mut Context<'_>) -> CliResult<read::Session> {
+    if identity::require_authenticated_profile(&context.config_dir)?
+        .role()
+        .is_none()
+    {
+        return Err(CliError::new(
+            3,
+            "auth",
+            "the saved credentials have no academic role",
+            "Run `bupt login` with an explicit role.",
+        ));
+    }
+    let (access_token, user_id) = identity::require_ucloud_session(context)?;
+    Ok(read::Session::new(access_token, user_id))
 }
 
 pub(super) fn require_credentials(context: &Context<'_>) -> CliResult<()> {
