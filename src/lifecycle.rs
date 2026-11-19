@@ -7,11 +7,22 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+mod archive;
+
 const DEFAULT_REPO: &str = "tututuhehehe/bupt-cli";
 const GITHUB_RELEASE_HOST: &str = "github.com";
 const MACOS_ARM64_ASSET: &str = "bupt-macos-arm64.zip";
 const WINDOWS_X64_ASSET: &str = "bupt-windows-x64.zip";
 const USER_AGENT: &str = "bupt-cli";
+const MAX_ASSET_BYTES: usize = 256 * 1024 * 1024;
+const MAX_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ASSET_REDIRECTS: usize = 5;
+const ASSET_HOSTS: &[&str] = &[
+    GITHUB_RELEASE_HOST,
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
 
 pub(crate) fn commands() -> Vec<Command> {
     vec![
@@ -61,34 +72,86 @@ pub(crate) fn run(
 }
 
 fn update(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
-    let repo = selected_repo(matches)?;
-    if !matches.get_flag("check") {
-        return apply_update(&repo);
-    }
+    update_with_target(matches, context, None, &RealFs)
+}
 
+fn update_with_target(
+    matches: &ArgMatches,
+    context: &mut Context<'_>,
+    target_override: Option<&Path>,
+    fs: &dyn UpdateFs,
+) -> CliResult<Outcome> {
+    let repo = selected_repo(matches)?;
+    let check_only = matches.get_flag("check");
     let release = latest_release(context, &repo)?;
     let current = env!("CARGO_PKG_VERSION");
-    let (latest, update_available, note) = match release {
-        Release::Missing => (
+    match release {
+        Release::Missing => Ok(release_outcome(
+            &repo,
+            current,
             None,
             Some(false),
             format!("{repo} 没有可用的 release（或仓库不存在）；用 --repo 指定仓库"),
-        ),
-        Release::NoVersion => (None, None, "release 跳转里没有版本号".to_owned()),
+        )),
+        Release::NoVersion => Ok(release_outcome(
+            &repo,
+            current,
+            None,
+            None,
+            "release 跳转里没有版本号".to_owned(),
+        )),
         Release::Tag(tag) => {
             let latest = tag.trim_start_matches('v').to_owned();
-            if is_newer(&latest, current) {
-                (
+            let newer = is_newer(&latest, current);
+            if check_only || !newer {
+                let note = if newer {
+                    update_check_note(
+                        std::env::consts::OS,
+                        std::env::consts::ARCH,
+                        running_installed_binary(),
+                    )
+                } else {
+                    "已经是最新版本"
+                };
+                return Ok(release_outcome(
+                    &repo,
+                    current,
                     Some(latest),
-                    Some(true),
-                    "有新版本；去掉 --check 即可安装".to_owned(),
-                )
-            } else {
-                (Some(latest), Some(false), "已经是最新版本".to_owned())
+                    Some(newer),
+                    note.to_owned(),
+                ));
             }
+            install_release(context, &repo, &tag, &latest, current, target_override, fs)
         }
-    };
-    Ok(Outcome {
+    }
+}
+
+#[cfg(not(windows))]
+fn not_installed_outcome(repo: &str, latest: &str, current: &str) -> Outcome {
+    Outcome {
+        data: json!({
+            "current": current,
+            "repo": repo,
+            "latest": latest,
+            "update_available": true,
+            "installed_to": null,
+            "note": format!(
+                "找到新版本 {latest}，但当前不是独立二进制，未自动安装；请下载 release 附件或运行 ./build.sh 后替换"
+            ),
+        }),
+        code: 0,
+        diagnostic: None,
+    }
+}
+
+fn release_outcome(
+    repo: &str,
+    current: &str,
+    latest: Option<String>,
+    update_available: Option<bool>,
+    note: String,
+) -> Outcome {
+    Outcome {
         data: json!({
             "current": current,
             "repo": repo,
@@ -98,12 +161,62 @@ fn update(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome>
         }),
         code: 0,
         diagnostic: None,
+    }
+}
+
+fn running_installed_binary() -> bool {
+    if cfg!(debug_assertions) {
+        return false;
+    }
+    std::env::current_exe().ok().is_some_and(|path| {
+        !path
+            .components()
+            .any(|component| component.as_os_str().to_str() == Some("target"))
     })
 }
 
-/// The apply path still needs download, integrity checks, staging and a safe
-/// replacement. Keep it offline and pending instead of pretending to update.
-fn apply_update(repo: &str) -> CliResult<Outcome> {
+fn update_check_note(os: &str, arch: &str, can_install: bool) -> &'static str {
+    if os == "windows" {
+        "有新版本；Windows 原位替换仍待实现，未自动安装"
+    } else if release_asset(os, arch).is_none() {
+        "有新版本；当前平台没有可用的发行物，未自动安装"
+    } else if !can_install {
+        "有新版本；当前不是独立发行二进制，未自动安装"
+    } else {
+        "有新版本；去掉 --check 即可安装"
+    }
+}
+
+#[cfg(windows)]
+fn install_release(
+    _context: &mut Context<'_>,
+    _repo: &str,
+    _tag: &str,
+    latest: &str,
+    _current: &str,
+    _target_override: Option<&Path>,
+    _fs: &dyn UpdateFs,
+) -> CliResult<Outcome> {
+    Err(CliError::new(
+        5,
+        "upstream",
+        format!(
+            "version {latest} is available, but Windows in-place replacement is not implemented"
+        ),
+        "No files were changed; download the release archive manually.",
+    ))
+}
+
+#[cfg(not(windows))]
+fn install_release(
+    context: &mut Context<'_>,
+    repo: &str,
+    tag: &str,
+    latest: &str,
+    current: &str,
+    target_override: Option<&Path>,
+    fs: &dyn UpdateFs,
+) -> CliResult<Outcome> {
     let asset = release_asset(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
         CliError::new(
             5,
@@ -116,17 +229,637 @@ fn apply_update(repo: &str) -> CliResult<Outcome> {
             "This build targets macOS Apple Silicon and Windows x64.",
         )
     })?;
-    let target = current_verified_executable()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "no verified current executable".into());
+
+    let target = match target_override {
+        Some(path) => verify_install_target(fs, path, false)?,
+        None => {
+            if cfg!(debug_assertions) {
+                return Ok(not_installed_outcome(repo, latest, current));
+            }
+            let path = std::env::current_exe()
+                .map_err(|error| fs_error("cannot resolve the running executable", error))?;
+            if path
+                .components()
+                .any(|component| component.as_os_str().to_str() == Some("target"))
+            {
+                return Ok(not_installed_outcome(repo, latest, current));
+            }
+            verify_install_target(fs, &path, true)?
+        }
+    };
+    let backup = backup_path(&target.path)?;
+    ensure_backup_absent(fs, &backup)?;
+
+    let archive = download_asset(context, repo, tag, asset)?;
+    let binary = archive::extract_bupt(&archive).map_err(|error| {
+        CliError::new(
+            5,
+            "upstream",
+            format!("release archive is invalid: {error}"),
+            "The downloaded release asset was rejected; no files were changed.",
+        )
+    })?;
+    if is_python_launcher(&binary) {
+        return Err(CliError::new(
+            5,
+            "upstream",
+            "release archive contains a Python launcher, not the native Rust binary",
+            "The downloaded release asset was rejected; no files were changed.",
+        ));
+    }
+    if binary.is_empty() || !is_native_executable(&binary) {
+        return Err(CliError::new(
+            5,
+            "upstream",
+            "release archive does not contain a native bupt executable",
+            "The downloaded release asset was rejected; no files were changed.",
+        ));
+    }
+
+    let parent = target
+        .path
+        .parent()
+        .ok_or_else(|| target_error("target has no parent directory"))?;
+    let staging_path = fs
+        .create_staging_dir(parent)
+        .map_err(|error| fs_error("cannot create a staging directory", error))?;
+    let staging = StagingDir {
+        fs,
+        path: staging_path,
+    };
+    let staged = staging.path.join(target_file_name());
+    fs.write_new(&staged, &binary, 0o755)
+        .map_err(|error| fs_error("cannot write the staged binary", error))?;
+    let staged_bytes = fs
+        .read(&staged)
+        .map_err(|error| fs_error("cannot verify the staged binary", error))?;
+    if staged_bytes != binary {
+        return Err(CliError::new(
+            5,
+            "upstream",
+            "the staged binary does not match the verified archive",
+            "No files were changed; check free space and retry.",
+        ));
+    }
+
+    verify_target_unchanged(fs, &target)?;
+    fs.copy_new(&target.path, &backup)
+        .map_err(|error| fs_error("cannot back up the current binary", error))?;
+    let mut backup_guard = BackupGuard {
+        fs,
+        path: backup.clone(),
+        keep: false,
+    };
+    let original = fs
+        .read(&target.path)
+        .map_err(|error| fs_error("cannot verify the current binary", error))?;
+    let backed_up = fs
+        .read(&backup)
+        .map_err(|error| fs_error("cannot verify the backup", error))?;
+    if original != backed_up {
+        return Err(CliError::new(
+            5,
+            "upstream",
+            "the backup does not match the current binary",
+            "No files were replaced; check free space and retry.",
+        ));
+    }
+    verify_target_unchanged(fs, &target)?;
+
+    if let Err(error) = fs.rename(&staged, &target.path) {
+        let cleanup = fs.remove_file(&backup);
+        backup_guard.keep = cleanup.is_err();
+        let message = match cleanup {
+            Ok(()) => format!("cannot replace the current binary: {error}"),
+            Err(cleanup) => format!(
+                "cannot replace the current binary: {error}; the backup remains at {}: {cleanup}",
+                backup.display()
+            ),
+        };
+        return Err(CliError::new(
+            5,
+            "upstream",
+            message,
+            "The current binary was not replaced.",
+        ));
+    }
+
+    if let Err(reason) = verify_replaced_target(fs, &target.path, &binary) {
+        return match fs.rename(&backup, &target.path) {
+            Ok(()) => Err(CliError::new(
+                5,
+                "upstream",
+                format!(
+                    "replacement verification failed: {reason}; the original binary was restored"
+                ),
+                "No update was applied.",
+            )),
+            Err(error) => {
+                backup_guard.keep = true;
+                Err(CliError::new(
+                    5,
+                    "upstream",
+                    format!(
+                        "replacement verification failed: {reason}; the backup remains at {} but restoring it failed: {error}",
+                        backup.display()
+                    ),
+                    "Inspect the backup before running bupt again.",
+                ))
+            }
+        };
+    }
+
+    backup_guard.keep = true;
+    let cleanup_note = match fs.remove_dir_all(&staging.path) {
+        Ok(()) => String::new(),
+        Err(error) => format!("；暂存目录清理失败：{error}"),
+    };
+    Ok(Outcome {
+        data: json!({
+            "current": current,
+            "repo": repo,
+            "latest": latest,
+            "update_available": true,
+            "installed_to": target.path.to_string_lossy(),
+            "backup": backup.to_string_lossy(),
+            "note": format!("已更新到 {latest}，重新运行即可生效{cleanup_note}"),
+        }),
+        code: 0,
+        diagnostic: None,
+    })
+}
+
+fn backup_path(target: &Path) -> CliResult<PathBuf> {
+    let backup = target.with_extension("old");
+    if backup == target {
+        return Err(target_error("target has no usable backup path"));
+    }
+    Ok(backup)
+}
+
+fn ensure_backup_absent(fs: &dyn UpdateFs, backup: &Path) -> CliResult<()> {
+    match fs.symlink_metadata(backup) {
+        Ok(_) => Err(CliError::new(
+            5,
+            "upstream",
+            format!(
+                "refusing to overwrite the existing backup at {}",
+                backup.display()
+            ),
+            "Move or remove that backup, then rerun `bupt update`.",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(fs_error("cannot inspect the backup path", error)),
+    }
+}
+
+fn target_file_name() -> &'static str {
+    if cfg!(windows) { "bupt.exe" } else { "bupt" }
+}
+
+fn verify_install_target(
+    fs: &dyn UpdateFs,
+    path: &Path,
+    require_release_build: bool,
+) -> CliResult<VerifiedTarget> {
+    if require_release_build && cfg!(debug_assertions) {
+        return Err(development_build_error());
+    }
+    if !path.is_absolute() {
+        return Err(target_error("target path is not absolute"));
+    }
+    let metadata = fs
+        .symlink_metadata(path)
+        .map_err(|error| target_error(format!("cannot inspect the target: {error}")))?;
+    if metadata.file_type().is_symlink() {
+        return Err(target_error("target is a symbolic link"));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(target_error("target is not a regular file"));
+    }
+    if metadata.len() == 0 {
+        return Err(target_error("target is empty"));
+    }
+    if metadata.len() > MAX_TARGET_BYTES {
+        return Err(target_error("target is too large to replace safely"));
+    }
+    if path.file_name().and_then(|name| name.to_str()) != Some(target_file_name()) {
+        return Err(target_error(
+            "target does not have the expected binary name",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(target_error("target is not executable"));
+        }
+    }
+    let contents = fs
+        .read(path)
+        .map_err(|error| target_error(format!("cannot read the target: {error}")))?;
+    if is_python_launcher(&contents) {
+        return Err(target_error("target looks like a Python launcher"));
+    }
+    if !is_native_executable(&contents) {
+        return Err(target_error("target is not a native executable"));
+    }
+    Ok(VerifiedTarget {
+        path: path.to_path_buf(),
+        stamp: file_stamp(&metadata),
+    })
+}
+
+fn verify_target_unchanged(fs: &dyn UpdateFs, target: &VerifiedTarget) -> CliResult<()> {
+    let metadata = fs
+        .symlink_metadata(&target.path)
+        .map_err(|error| target_error(format!("cannot recheck the target: {error}")))?;
+    if !metadata.file_type().is_file() || file_stamp(&metadata) != target.stamp {
+        return Err(target_error(
+            "target changed while the update was being prepared",
+        ));
+    }
+    let prefix = fs
+        .read_prefix(&target.path, 8)
+        .map_err(|error| target_error(format!("cannot recheck the target: {error}")))?;
+    if !is_native_executable(&prefix) {
+        return Err(target_error("target is no longer a native executable"));
+    }
+    Ok(())
+}
+
+fn verify_replaced_target(fs: &dyn UpdateFs, path: &Path, expected: &[u8]) -> Result<(), String> {
+    let metadata = fs
+        .symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect the replaced binary: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("the replaced path is not a regular file".into());
+    }
+    if metadata.len() != expected.len() as u64 {
+        return Err("the replaced binary has an unexpected size".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err("the replaced binary is not executable".into());
+        }
+    }
+    let actual = fs
+        .read(path)
+        .map_err(|error| format!("cannot read the replaced binary: {error}"))?;
+    if actual != expected {
+        return Err("the replaced binary does not match the staged bytes".into());
+    }
+    Ok(())
+}
+
+fn is_python_launcher(bytes: &[u8]) -> bool {
+    // PyInstaller onefile bootloaders end with this cookie; script launchers
+    // start with a shebang even when their name is `bupt`. Only inspect the
+    // tail so an unrelated marker embedded in a large Rust binary is ignored.
+    if bytes.starts_with(b"#!") {
+        return true;
+    }
+    let tail = &bytes[bytes.len().saturating_sub(256)..];
+    tail.windows(8)
+        .any(|window| window == b"MEI\x0c\x0b\x0a\x0b\x0e")
+}
+
+fn is_native_executable(bytes: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        const MACHO: [&[u8]; 8] = [
+            &[0xfe, 0xed, 0xfa, 0xce],
+            &[0xce, 0xfa, 0xed, 0xfe],
+            &[0xfe, 0xed, 0xfa, 0xcf],
+            &[0xcf, 0xfa, 0xed, 0xfe],
+            &[0xca, 0xfe, 0xba, 0xbe],
+            &[0xbe, 0xba, 0xfe, 0xca],
+            &[0xca, 0xfe, 0xba, 0xbf],
+            &[0xbf, 0xba, 0xfe, 0xca],
+        ];
+        MACHO.iter().any(|magic| bytes.starts_with(magic))
+    }
+    #[cfg(windows)]
+    {
+        bytes.starts_with(b"MZ")
+    }
+    #[cfg(all(not(target_os = "macos"), not(windows)))]
+    {
+        bytes.starts_with(b"\x7fELF")
+    }
+}
+
+fn download_asset(
+    context: &mut Context<'_>,
+    repo: &str,
+    tag: &str,
+    asset: &str,
+) -> CliResult<Vec<u8>> {
+    let mut url = format!("https://github.com/{repo}/releases/download/{tag}/{asset}");
+    for _ in 0..=MAX_ASSET_REDIRECTS {
+        let response = context.transport.send(Request {
+            method: "GET",
+            url: url.clone(),
+            headers: vec![("User-Agent".into(), USER_AGENT.into())],
+            body: Vec::new(),
+        })?;
+        match response.status {
+            200..=299 => {
+                if response.body.is_empty() {
+                    return Err(CliError::new(
+                        5,
+                        "upstream",
+                        "release asset download returned an empty body",
+                        "No files were changed.",
+                    ));
+                }
+                if response.body.len() > MAX_ASSET_BYTES {
+                    return Err(CliError::new(
+                        5,
+                        "upstream",
+                        "release asset is too large",
+                        "No files were changed.",
+                    ));
+                }
+                return Ok(response.body);
+            }
+            301 | 302 | 303 | 307 | 308 => {
+                let location = header(&response.headers, "location")
+                    .ok_or_else(|| malformed_asset_redirect("redirect has no Location header"))?;
+                url = asset_redirect(location, repo)?;
+            }
+            401 | 403 => {
+                return Err(CliError::new(
+                    3,
+                    "auth",
+                    format!(
+                        "release asset download was rejected (HTTP {})",
+                        response.status
+                    ),
+                    "GitHub refused the release asset request.",
+                ));
+            }
+            status => return Err(asset_http_error(status)),
+        }
+    }
     Err(CliError::new(
         5,
         "upstream",
-        format!("update installation for {repo} is not available in this migration build"),
-        format!(
-            "Would use {asset} and target {target}; downloads, replacement and the Windows runtime swap are pending."
-        ),
+        "release asset download redirected too many times",
+        "No files were changed.",
     ))
+}
+
+fn asset_redirect(location: &str, repo: &str) -> CliResult<String> {
+    let location = location.trim();
+    if location.is_empty()
+        || location
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+        || location.contains('\\')
+        || location.contains('#')
+    {
+        return Err(malformed_asset_redirect(
+            "Location is empty or contains invalid characters",
+        ));
+    }
+    let rest = location
+        .strip_prefix("https://")
+        .ok_or_else(|| malformed_asset_redirect("Location must use HTTPS"))?;
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or_else(|| malformed_asset_redirect("Location has no path"))?;
+    if !ASSET_HOSTS.contains(&host) {
+        return Err(malformed_asset_redirect(
+            "Location must stay on approved GitHub asset hosts",
+        ));
+    }
+    if host == GITHUB_RELEASE_HOST {
+        let prefix = format!("{repo}/releases/download/");
+        let path_without_query = path.split('?').next().unwrap_or("");
+        if !path_without_query
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+        {
+            return Err(malformed_asset_redirect(
+                "Location must name this repository's release download",
+            ));
+        }
+    }
+    if path.is_empty() || path.split('/').any(|segment| matches!(segment, "." | "..")) {
+        return Err(malformed_asset_redirect(
+            "Location has an invalid asset path",
+        ));
+    }
+    Ok(location.to_owned())
+}
+
+fn malformed_asset_redirect(reason: &str) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        format!("release asset download returned an invalid redirect: {reason}"),
+        "No files were changed.",
+    )
+}
+
+fn target_error(message: impl Into<String>) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        message,
+        "Only the verified current bupt executable can be replaced.",
+    )
+}
+
+fn development_build_error() -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        "refusing to replace a development or test build",
+        "Run the installed release binary, or download the release archive manually.",
+    )
+}
+
+fn fs_error(operation: &str, error: io::Error) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        format!("{operation}: {error}"),
+        "No update was applied.",
+    )
+}
+
+struct VerifiedTarget {
+    path: PathBuf,
+    stamp: FileStamp,
+}
+
+struct StagingDir<'a> {
+    fs: &'a dyn UpdateFs,
+    path: PathBuf,
+}
+
+impl Drop for StagingDir<'_> {
+    fn drop(&mut self) {
+        let _ = self.fs.remove_dir_all(&self.path);
+    }
+}
+
+struct BackupGuard<'a> {
+    fs: &'a dyn UpdateFs,
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for BackupGuard<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = self.fs.remove_file(&self.path);
+        }
+    }
+}
+
+trait UpdateFs {
+    fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+    fn read_prefix(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>>;
+    fn create_staging_dir(&self, parent: &Path) -> io::Result<PathBuf>;
+    fn write_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>;
+    fn copy_new(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+}
+
+struct RealFs;
+
+impl UpdateFs for RealFs {
+    fn symlink_metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
+        fs::symlink_metadata(path)
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        fs::read(path)
+    }
+
+    fn read_prefix(&self, path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+        use std::io::Read;
+
+        let mut file = fs::File::open(path)?;
+        let mut buffer = vec![0u8; limit];
+        let mut read = 0;
+        while read < limit {
+            match file.read(&mut buffer[read..]) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        buffer.truncate(read);
+        Ok(buffer)
+    }
+
+    fn create_staging_dir(&self, parent: &Path) -> io::Result<PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..16 {
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".bupt-update-{}-{sequence}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "cannot allocate a unique staging directory",
+        ))
+    }
+
+    fn write_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+        use std::io::Write;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let result = file.write_all(bytes).and_then(|()| file.sync_all());
+        if let Err(error) = result {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = file.metadata()?.permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(path, permissions)?;
+        }
+        let _ = mode;
+        Ok(())
+    }
+
+    fn copy_new(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut source = fs::File::open(from)?;
+        let metadata = source.metadata()?;
+        let mut destination = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)?;
+        let result = io::copy(&mut source, &mut destination).and_then(|written| {
+            if written != metadata.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "backup copy was incomplete",
+                ));
+            }
+            destination.sync_all()
+        });
+        if let Err(error) = result {
+            drop(destination);
+            let _ = fs::remove_file(to);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        {
+            if let Err(error) = fs::set_permissions(to, metadata.permissions()) {
+                let _ = fs::remove_file(to);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(path),
+            Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+            Ok(_) => fs::remove_file(path),
+        }
+    }
 }
 
 enum Release {
@@ -239,6 +972,20 @@ fn upstream_http_error(status: u16) -> CliError {
         5,
         "upstream",
         format!("release check failed with HTTP {status}"),
+        hint,
+    )
+}
+
+fn asset_http_error(status: u16) -> CliError {
+    let hint = if status == 429 {
+        "GitHub is rate limiting release downloads; wait before retrying."
+    } else {
+        "GitHub returned an unexpected response."
+    };
+    CliError::new(
+        5,
+        "upstream",
+        format!("release asset download failed with HTTP {status}"),
         hint,
     )
 }
@@ -369,10 +1116,6 @@ fn uninstall(matches: &ArgMatches, context: &Context<'_>) -> CliResult<Outcome> 
         code: 0,
         diagnostic: None,
     })
-}
-
-fn current_verified_executable() -> Option<PathBuf> {
-    verified_executable(&std::env::current_exe().ok()?)
 }
 
 fn verified_executable(path: &Path) -> Option<PathBuf> {
@@ -1009,7 +1752,7 @@ mod tests {
         paths
     }
 
-    fn expect_error(result: CliResult<Outcome>, message: &str) -> CliError {
+    fn expect_error<T>(result: CliResult<T>, message: &str) -> CliError {
         match result {
             Ok(_) => panic!("{message}"),
             Err(error) => error,
@@ -1020,6 +1763,172 @@ mod tests {
         assert_eq!(error.code, 5, "expected upstream exit: {error:?}");
         assert_eq!(error.kind, "upstream");
         error
+    }
+
+    fn fixture_target(root: &Path) -> PathBuf {
+        let target = root.join(binary_name());
+        let current = std::env::current_exe().expect("resolve the test binary");
+        fs::copy(current, &target).expect("copy the test binary into the fixture");
+        make_executable(&target);
+        target
+    }
+
+    fn native_payload(marker: &str) -> Vec<u8> {
+        #[cfg(target_os = "macos")]
+        let mut payload = vec![0xcf, 0xfa, 0xed, 0xfe];
+        #[cfg(windows)]
+        let mut payload = b"MZ".to_vec();
+        #[cfg(all(not(target_os = "macos"), not(windows)))]
+        let mut payload = b"\x7fELF".to_vec();
+        payload.extend_from_slice(marker.as_bytes());
+        payload.extend_from_slice(&[0u8; 64]);
+        payload
+    }
+
+    fn test_asset() -> &'static str {
+        release_asset(std::env::consts::OS, std::env::consts::ARCH)
+            .expect("the test platform has a release asset")
+    }
+
+    fn script_release(
+        transport: &mut Scripted,
+        repo: &str,
+        tag: &str,
+        asset_response: CliResult<Response>,
+    ) {
+        let release_url = format!("https://github.com/{repo}/releases/latest");
+        let location = format!("https://github.com/{repo}/releases/tag/{tag}");
+        transport.expected.push_back((
+            "GET",
+            release_url,
+            Ok(Response {
+                status: 302,
+                headers: vec![("Location".into(), location)],
+                body: Vec::new(),
+            }),
+        ));
+        let asset_url = format!(
+            "https://github.com/{repo}/releases/download/{tag}/{}",
+            test_asset()
+        );
+        transport
+            .expected
+            .push_back(("GET", asset_url, asset_response));
+    }
+
+    fn script_apply(transport: &mut Scripted, repo: &str, tag: &str, payload: &[u8]) {
+        let archive = archive::test_stored_zip("bupt", payload);
+        script_release(
+            transport,
+            repo,
+            tag,
+            Ok(Response {
+                status: 200,
+                headers: vec![],
+                body: archive,
+            }),
+        );
+    }
+
+    fn run_update(
+        root: &Path,
+        transport: &mut Scripted,
+        args: &[&str],
+        target: Option<&Path>,
+        fs: &dyn UpdateFs,
+    ) -> CliResult<Outcome> {
+        let matches = update_matches(args);
+        let mut context = test_context(root, transport);
+        update_with_target(&matches, &mut context, target, fs)
+    }
+
+    fn no_staging_left(root: &Path) -> bool {
+        !tree_paths(root).iter().any(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".bupt-update-"))
+        })
+    }
+
+    #[derive(Default)]
+    struct FaultFs {
+        fail_staging: bool,
+        fail_write: bool,
+        fail_copy: bool,
+        fail_replace: bool,
+        fail_restore: bool,
+        corrupt_after_replace: bool,
+        mutate_target_after_copy: bool,
+    }
+
+    impl FaultFs {
+        fn stage_rename(&self, from: &Path, to: &Path) -> bool {
+            from.parent() != to.parent()
+        }
+    }
+
+    impl UpdateFs for FaultFs {
+        fn symlink_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
+            RealFs.symlink_metadata(path)
+        }
+
+        fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+            RealFs.read(path)
+        }
+
+        fn read_prefix(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+            RealFs.read_prefix(path, limit)
+        }
+
+        fn create_staging_dir(&self, parent: &Path) -> std::io::Result<PathBuf> {
+            if self.fail_staging {
+                return Err(std::io::Error::other("synthetic staging failure"));
+            }
+            RealFs.create_staging_dir(parent)
+        }
+
+        fn write_new(&self, path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+            if self.fail_write {
+                return Err(std::io::Error::other("synthetic write failure"));
+            }
+            RealFs.write_new(path, bytes, mode)
+        }
+
+        fn copy_new(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self.fail_copy {
+                return Err(std::io::Error::other("synthetic backup failure"));
+            }
+            RealFs.copy_new(from, to)?;
+            if self.mutate_target_after_copy {
+                let mut contents = fs::read(from)?;
+                contents.push(0);
+                fs::write(from, contents)?;
+            }
+            Ok(())
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            let stage_rename = self.stage_rename(from, to);
+            if self.fail_replace && stage_rename {
+                return Err(std::io::Error::other("synthetic replace failure"));
+            }
+            if self.fail_restore && !stage_rename {
+                return Err(std::io::Error::other("synthetic restore failure"));
+            }
+            let result = RealFs.rename(from, to);
+            if result.is_ok() && self.corrupt_after_replace && stage_rename {
+                fs::write(to, b"corrupt").expect("corrupt the replaced target");
+            }
+            result
+        }
+
+        fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+            RealFs.remove_file(path)
+        }
+
+        fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+            RealFs.remove_dir_all(path)
+        }
     }
 
     fn valid_timetable() -> &'static str {
@@ -1627,23 +2536,498 @@ mod tests {
     }
 
     #[test]
-    fn apply_update_remains_pending_without_network_or_files() {
-        let root = tempfile::tempdir().expect("create apply directory");
-        let sentinel = root.path().join("sentinel.json");
-        write(&sentinel, "{}");
-        let before = tree_paths(root.path());
+    fn update_apply_replaces_a_verified_fixture_target() {
+        let root = tempfile::tempdir().expect("create apply test directory");
+        let target = fixture_target(root.path());
+        let original = fs::read(&target).expect("read fixture target");
+        let payload = native_payload("NEW-BINARY");
+        let backup = target.with_extension("old");
+        let target_text = target.to_string_lossy().into_owned();
+        let backup_text = backup.to_string_lossy().into_owned();
+
         let mut transport = Scripted::default();
-        let result = {
-            let mut context = test_context(root.path(), &mut transport);
-            update(
-                &update_matches(&["update", "--repo", "owner/repo"]),
-                &mut context,
-            )
+        script_apply(&mut transport, "owner/repo", "v0.0.1", &payload);
+        let outcome = run_update(
+            root.path(),
+            &mut transport,
+            &["update", "--repo", "owner/repo"],
+            Some(&target),
+            &RealFs,
+        )
+        .expect("apply the fixture update");
+
+        assert_eq!(outcome.code, 0);
+        assert_eq!(outcome.data["latest"], json!("0.0.1"));
+        assert_eq!(outcome.data["update_available"], json!(true));
+        assert_eq!(outcome.data["installed_to"], json!(target_text));
+        assert_eq!(outcome.data["backup"], json!(backup_text));
+        assert!(
+            outcome.data["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("已更新到"))
+        );
+        assert_eq!(fs::read(&target).expect("read replaced target"), payload);
+        assert_eq!(fs::read(&backup).expect("read backup"), original);
+        assert!(no_staging_left(root.path()));
+        assert_eq!(transport.calls.len(), 2);
+        assert_eq!(transport.calls[0].method, "GET");
+        assert_eq!(
+            transport.calls[0].url,
+            "https://github.com/owner/repo/releases/latest"
+        );
+        assert!(
+            transport.calls[1]
+                .url
+                .ends_with(&format!("/releases/download/v0.0.1/{}", test_asset()))
+        );
+    }
+
+    #[test]
+    fn update_apply_rejects_a_symlinked_target() {
+        let root = tempfile::tempdir().expect("create symlink apply directory");
+        let real = root.path().join("real-bupt");
+        write(&real, "not a native binary");
+        let target = root.path().join(binary_name());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &target).expect("create target symlink");
+        #[cfg(not(unix))]
+        fs::copy(&real, &target).expect("copy target on non-Unix");
+
+        let mut transport = Scripted::default();
+        script_apply(
+            &mut transport,
+            "owner/repo",
+            "v0.0.1",
+            &native_payload("new"),
+        );
+        let error = assert_upstream(expect_error(
+            run_update(
+                root.path(),
+                &mut transport,
+                &["update", "--repo", "owner/repo"],
+                Some(&target),
+                &RealFs,
+            ),
+            "a symlinked target must be refused",
+        ));
+        assert_eq!(error.code, 5);
+        assert_eq!(transport.calls.len(), 1);
+        assert!(!target.with_extension("old").exists());
+        assert!(no_staging_left(root.path()));
+    }
+
+    #[test]
+    fn update_apply_rejects_scripts_wrong_names_and_non_executables() {
+        for case in ["script", "python-launcher", "wrong-name", "non-executable"] {
+            let root = tempfile::tempdir().expect("create invalid target directory");
+            let target = match case {
+                "script" => {
+                    let target = root.path().join(binary_name());
+                    write(&target, "#!/bin/sh\nexit 0\n");
+                    make_executable(&target);
+                    target
+                }
+                "python-launcher" => {
+                    let target = root.path().join(binary_name());
+                    let mut launcher = native_payload("old-python");
+                    launcher.extend_from_slice(b"MEI\x0c\x0b\x0a\x0b\x0e");
+                    fs::write(&target, &launcher).expect("write Python launcher fixture");
+                    make_executable(&target);
+                    target
+                }
+                "wrong-name" => {
+                    let target = root.path().join("other");
+                    fs::copy(fixture_target(root.path()), &target).expect("copy wrong-name target");
+                    make_executable(&target);
+                    target
+                }
+                _ => {
+                    let target = fixture_target(root.path());
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+
+                        let mut permissions = fs::metadata(&target)
+                            .expect("read target permissions")
+                            .permissions();
+                        permissions.set_mode(0o644);
+                        fs::set_permissions(&target, permissions)
+                            .expect("remove target execute bit");
+                    }
+                    target
+                }
+            };
+            let original = fs::read(&target).expect("read invalid target");
+            let mut transport = Scripted::default();
+            script_apply(
+                &mut transport,
+                "owner/repo",
+                "v0.0.1",
+                &native_payload("new"),
+            );
+            let error = assert_upstream(expect_error(
+                run_update(
+                    root.path(),
+                    &mut transport,
+                    &["update", "--repo", "owner/repo"],
+                    Some(&target),
+                    &RealFs,
+                ),
+                "an unverified target must be refused",
+            ));
+            assert_eq!(error.code, 5);
+            assert_eq!(transport.calls.len(), 1, "case {case}");
+            assert_eq!(
+                fs::read(&target).expect("read unchanged target"),
+                original,
+                "case {case}"
+            );
+            #[cfg(unix)]
+            assert!(!target.with_extension("old").exists(), "case {case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_apply_refuses_a_development_build_even_with_a_target() {
+        let root = tempfile::tempdir().expect("create development target directory");
+        let target = fixture_target(root.path());
+        let error = expect_error(
+            verify_install_target(&RealFs, &target, true),
+            "a debug build must not be a release target",
+        );
+        assert_eq!(error.code, 5);
+        assert!(error.message.contains("development"));
+    }
+
+    #[test]
+    fn update_apply_requires_the_backup_path_to_be_free() {
+        let root = tempfile::tempdir().expect("create backup collision directory");
+        let target = fixture_target(root.path());
+        let backup = target.with_extension("old");
+        write(&backup, "existing backup");
+        let original = fs::read(&target).expect("read fixture target");
+
+        let mut transport = Scripted::default();
+        script_apply(
+            &mut transport,
+            "owner/repo",
+            "v0.0.1",
+            &native_payload("new"),
+        );
+        let error = assert_upstream(expect_error(
+            run_update(
+                root.path(),
+                &mut transport,
+                &["update", "--repo", "owner/repo"],
+                Some(&target),
+                &RealFs,
+            ),
+            "an existing backup must be preserved",
+        ));
+        assert!(error.message.contains("backup"));
+        assert_eq!(transport.calls.len(), 1);
+        assert_eq!(
+            fs::read(&backup).expect("read existing backup"),
+            b"existing backup"
+        );
+        assert_eq!(fs::read(&target).expect("read unchanged target"), original);
+    }
+
+    #[test]
+    fn update_apply_download_and_archive_failures_leave_the_target_untouched() {
+        let mut python = native_payload("old-python");
+        python.extend_from_slice(b"MEI\x0c\x0b\x0a\x0b\x0e");
+        let python_archive = archive::test_stored_zip("bupt", &python);
+        let cases = [
+            (
+                Err(CliError::new(
+                    4,
+                    "network",
+                    "synthetic transport failure",
+                    "",
+                )),
+                4,
+            ),
+            (Ok(response(500, &[])), 5),
+            (
+                Ok(Response {
+                    status: 200,
+                    headers: vec![],
+                    body: b"not a zip archive".to_vec(),
+                }),
+                5,
+            ),
+            (
+                Ok(Response {
+                    status: 200,
+                    headers: vec![],
+                    body: archive::test_stored_zip("README", b"not the binary"),
+                }),
+                5,
+            ),
+            (
+                Ok(Response {
+                    status: 200,
+                    headers: vec![],
+                    body: python_archive,
+                }),
+                5,
+            ),
+            (
+                Ok(Response {
+                    status: 302,
+                    headers: vec![("Location".into(), "https://evil.example/release.zip".into())],
+                    body: vec![],
+                }),
+                5,
+            ),
+        ];
+
+        for (asset_response, expected_code) in cases {
+            let root = tempfile::tempdir().expect("create failed apply directory");
+            let target = fixture_target(root.path());
+            let original = fs::read(&target).expect("read fixture target");
+            let mut transport = Scripted::default();
+            script_release(&mut transport, "owner/repo", "v0.0.1", asset_response);
+            let error = expect_error(
+                run_update(
+                    root.path(),
+                    &mut transport,
+                    &["update", "--repo", "owner/repo"],
+                    Some(&target),
+                    &RealFs,
+                ),
+                "a failed download must not replace the target",
+            );
+            assert_eq!(error.code, expected_code);
+            assert_eq!(fs::read(&target).expect("read unchanged target"), original);
+            assert!(!target.with_extension("old").exists());
+            assert!(no_staging_left(root.path()));
+        }
+    }
+
+    #[test]
+    fn update_apply_stage_write_and_backup_failures_preserve_the_target() {
+        for fs in [
+            FaultFs {
+                fail_staging: true,
+                ..FaultFs::default()
+            },
+            FaultFs {
+                fail_write: true,
+                ..FaultFs::default()
+            },
+            FaultFs {
+                fail_copy: true,
+                ..FaultFs::default()
+            },
+        ] {
+            let root = tempfile::tempdir().expect("create failed stage directory");
+            let target = fixture_target(root.path());
+            let original = fs::read(&target).expect("read fixture target");
+            let mut transport = Scripted::default();
+            script_apply(
+                &mut transport,
+                "owner/repo",
+                "v0.0.1",
+                &native_payload("new"),
+            );
+            let error = assert_upstream(expect_error(
+                run_update(
+                    root.path(),
+                    &mut transport,
+                    &["update", "--repo", "owner/repo"],
+                    Some(&target),
+                    &fs,
+                ),
+                "a filesystem failure must not replace the target",
+            ));
+            assert_eq!(error.code, 5);
+            assert_eq!(fs::read(&target).expect("read unchanged target"), original);
+            assert!(!target.with_extension("old").exists());
+            assert!(no_staging_left(root.path()));
+        }
+    }
+
+    #[test]
+    fn update_apply_failure_after_backup_cleans_the_backup() {
+        let root = tempfile::tempdir().expect("create post-backup failure directory");
+        let target = fixture_target(root.path());
+        let mut transport = Scripted::default();
+        script_apply(
+            &mut transport,
+            "owner/repo",
+            "v0.0.1",
+            &native_payload("new"),
+        );
+        let fs = FaultFs {
+            mutate_target_after_copy: true,
+            ..FaultFs::default()
         };
-        let error = assert_upstream(expect_error(result, "apply must remain pending"));
-        assert!(error.message.contains("not available"));
-        assert!(transport.calls.is_empty());
-        assert_eq!(tree_paths(root.path()), before);
+        let error = assert_upstream(expect_error(
+            run_update(
+                root.path(),
+                &mut transport,
+                &["update", "--repo", "owner/repo"],
+                Some(&target),
+                &fs,
+            ),
+            "a target changed after backup must not be replaced",
+        ));
+        assert_eq!(error.code, 5);
+        assert!(!target.with_extension("old").exists());
+        assert!(no_staging_left(root.path()));
+    }
+
+    #[test]
+    fn update_apply_replace_failure_cleans_up_the_backup() {
+        let root = tempfile::tempdir().expect("create replace failure directory");
+        let target = fixture_target(root.path());
+        let original = fs::read(&target).expect("read fixture target");
+        let mut transport = Scripted::default();
+        script_apply(
+            &mut transport,
+            "owner/repo",
+            "v0.0.1",
+            &native_payload("new"),
+        );
+        let fs = FaultFs {
+            fail_replace: true,
+            ..FaultFs::default()
+        };
+        let error = assert_upstream(expect_error(
+            run_update(
+                root.path(),
+                &mut transport,
+                &["update", "--repo", "owner/repo"],
+                Some(&target),
+                &fs,
+            ),
+            "a failed replace must leave the target untouched",
+        ));
+        assert!(error.message.contains("cannot replace"));
+        assert_eq!(fs::read(&target).expect("read unchanged target"), original);
+        assert!(!target.with_extension("old").exists());
+        assert!(no_staging_left(root.path()));
+    }
+
+    #[test]
+    fn update_apply_restore_failure_keeps_the_backup_and_reports_it() {
+        let root = tempfile::tempdir().expect("create restore failure directory");
+        let target = fixture_target(root.path());
+        let original = fs::read(&target).expect("read fixture target");
+        let backup = target.with_extension("old");
+        let mut transport = Scripted::default();
+        script_apply(
+            &mut transport,
+            "owner/repo",
+            "v0.0.1",
+            &native_payload("new"),
+        );
+        let fs = FaultFs {
+            corrupt_after_replace: true,
+            fail_restore: true,
+            ..FaultFs::default()
+        };
+        let error = assert_upstream(expect_error(
+            run_update(
+                root.path(),
+                &mut transport,
+                &["update", "--repo", "owner/repo"],
+                Some(&target),
+                &fs,
+            ),
+            "a failed restore must keep the backup",
+        ));
+        assert!(error.message.contains("backup remains"));
+        assert_eq!(fs::read(&backup).expect("read retained backup"), original);
+        assert_eq!(
+            fs::read(&target).expect("read corrupted target"),
+            b"corrupt"
+        );
+        assert!(no_staging_left(root.path()));
+    }
+
+    #[test]
+    fn update_apply_corruption_rolls_back_from_the_backup() {
+        let root = tempfile::tempdir().expect("create rollback directory");
+        let target = fixture_target(root.path());
+        let original = fs::read(&target).expect("read fixture target");
+        let mut transport = Scripted::default();
+        script_apply(
+            &mut transport,
+            "owner/repo",
+            "v0.0.1",
+            &native_payload("new"),
+        );
+        let fs = FaultFs {
+            corrupt_after_replace: true,
+            ..FaultFs::default()
+        };
+        let error = assert_upstream(expect_error(
+            run_update(
+                root.path(),
+                &mut transport,
+                &["update", "--repo", "owner/repo"],
+                Some(&target),
+                &fs,
+            ),
+            "corrupt replacement must be rolled back",
+        ));
+        assert!(error.message.contains("restored"));
+        assert_eq!(fs::read(&target).expect("read restored target"), original);
+        assert!(!target.with_extension("old").exists());
+        assert!(no_staging_left(root.path()));
+    }
+
+    #[test]
+    fn update_apply_source_build_reports_not_installed_without_touching_it() {
+        let root = tempfile::tempdir().expect("create development apply directory");
+        let current = std::env::current_exe().expect("resolve the test binary");
+        let before = fs::metadata(&current).expect("read test binary metadata");
+        let mut transport = Scripted::default();
+        script_apply(
+            &mut transport,
+            "owner/repo",
+            "v0.0.1",
+            &native_payload("new"),
+        );
+        let outcome = run_update(
+            root.path(),
+            &mut transport,
+            &["update", "--repo", "owner/repo"],
+            None,
+            &RealFs,
+        )
+        .expect("a source build must report that it did not install");
+        assert_eq!(outcome.code, 0);
+        assert_eq!(outcome.data["latest"], json!("0.0.1"));
+        assert_eq!(outcome.data["update_available"], json!(true));
+        assert_eq!(outcome.data["installed_to"], json!(null));
+        assert!(
+            outcome.data["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("未自动安装"))
+        );
+        let after = fs::metadata(&current).expect("reread test binary metadata");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(transport.calls.len(), 1);
+        assert!(tree_paths(root.path()).is_empty());
+    }
+
+    #[test]
+    fn update_notes_do_not_promise_unavailable_installs() {
+        assert!(update_check_note("macos", "aarch64", true).contains("去掉 --check"));
+        let source = update_check_note("macos", "aarch64", false);
+        assert!(source.contains("未自动安装"));
+        assert!(!source.contains("去掉 --check"));
+        let windows = update_check_note("windows", "x86_64", true);
+        assert!(windows.contains("Windows"));
+        assert!(!windows.contains("去掉 --check"));
+        let other = update_check_note("linux", "x86_64", true);
+        assert!(other.contains("没有可用的发行物"));
+        assert!(!other.contains("去掉 --check"));
     }
 
     #[test]
