@@ -7,7 +7,7 @@ use crate::transport::{Request, Response, Transport};
 use serde_json::{Map, Value, json};
 
 const ELECTRICITY_BASE: &str = "https://app.bupt.edu.cn/buptdf/wap/default";
-pub(super) const REFERER: &str = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
+pub(super) use crate::transport::electricity_scope::LANDING as REFERER;
 const AUTH_MARKERS: &[&str] = &["未登录", "请先登录", "登录失效", "登录过期"];
 const NOT_FOUND_MARKERS: &[&str] = &["未找到", "不存在", "无数据"];
 

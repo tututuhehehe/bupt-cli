@@ -9,7 +9,7 @@ use url::Url;
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_HEADERS: usize = 64 * 1024;
-const ELECTRICITY_LANDING: &str = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
+use super::electricity_scope::{self, LANDING as ELECTRICITY_LANDING};
 const ANONYMOUS_PORTAL_PROBE: &str =
     "http://my.bupt.edu.cn/list.jsp?totalpage=30&PAGENUM=0&urltype=tree.TreeTempUrl&wbtreeid=1154";
 const UCLOUD_TOKEN_URL: &str = "https://apiucloud.bupt.edu.cn/ykt-basics/oauth/token";
@@ -24,6 +24,7 @@ enum Route {
     UcloudHomeworkList,
     UcloudAttachment,
     ElectricityLanding,
+    ElectricitySignIn,
     ElectricityRead(&'static [&'static str]),
     PortalRead { card: bool },
     PublicProbe,
@@ -257,6 +258,9 @@ fn route(request: &Request) -> Option<Route> {
         ("app.bupt.edu.cn", "GET", "/buptdf/wap/default/chong") if parsed.query().is_none() => {
             Some(Route::ElectricityLanding)
         }
+        ("app.bupt.edu.cn", "GET", _) if electricity_scope::sign_in(raw).is_some() => {
+            Some(Route::ElectricitySignIn)
+        }
         ("app.bupt.edu.cn", "POST", path) if parsed.query().is_none() => {
             let keys: &'static [&'static str] = match path {
                 "/buptdf/wap/default/part" => &["areaid"],
@@ -293,6 +297,7 @@ fn probe_route(request: &Request) -> Option<Route> {
             | Route::UcloudLanding
             | Route::UcloudAttachment
             | Route::MobileLogin
+            | Route::ElectricitySignIn
             | Route::PortalRead { .. } => None,
             Route::CasRead
                 if !matches!(
@@ -380,7 +385,9 @@ fn valid_ticket_exchange(body: &str) -> bool {
 fn allowed_header(route: Route, name: &str) -> bool {
     name == "user-agent"
         || match route {
-            Route::CasRead | Route::ElectricityLanding => name == "cookie",
+            Route::CasRead | Route::ElectricityLanding | Route::ElectricitySignIn => {
+                name == "cookie"
+            }
             Route::ElectricityRead(_) => matches!(
                 name,
                 "cookie" | "referer" | "x-requested-with" | "content-type"

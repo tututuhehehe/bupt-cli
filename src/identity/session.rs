@@ -219,6 +219,14 @@ impl OwnedCasSession {
         self.cas.portal_ticket(transport, service)
     }
 
+    pub(crate) fn electricity_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        login_url: &str,
+    ) -> CliResult<String> {
+        self.cas.electricity_ticket(transport, login_url)
+    }
+
     pub(crate) fn cached_ucloud_credentials(&self) -> Option<(String, String)> {
         self.cas.cached_ucloud_credentials()
     }

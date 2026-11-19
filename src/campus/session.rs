@@ -15,6 +15,7 @@ use super::electricity;
 use super::portal::{self, NoticeType};
 use crate::cli::{CliError, CliResult, Context};
 use crate::identity::{self, OwnedCasSession};
+use crate::transport::electricity_scope::{self, SignIn};
 use crate::transport::{Request, Response, Transport};
 use cookie_store::{Cookie, CookieDomain, CookieStore};
 use url::Url;
@@ -227,6 +228,76 @@ impl<'a, 't> ElectricitySession<'a, 't> {
         retain_app_cookies(&mut self.cookies, &url, &response);
         Ok(response)
     }
+
+    fn get(&mut self, url: &str) -> CliResult<Response> {
+        self.exchange(Request {
+            method: "GET",
+            url: url.into(),
+            headers: vec![],
+            body: vec![],
+        })
+    }
+
+    fn sign_in(&mut self) -> CliResult<()> {
+        let landing = self.get(electricity::REFERER)?;
+        let Some(login) = electricity_redirect(&landing)? else {
+            return check_electricity_landing(landing.status);
+        };
+        let login = electricity_scope::app_redirect(login)
+            .filter(|url| electricity_scope::sign_in(url) == Some(SignIn::Login))
+            .ok_or_else(campus_scope_error)?;
+        let response = self.get(&login)?;
+        let service = electricity_redirect(&response)?
+            .and_then(electricity_scope::app_redirect)
+            .filter(|url| electricity_scope::sign_in(url) == Some(SignIn::Service))
+            .ok_or_else(campus_scope_error)?;
+        let response = self.get(&service)?;
+        let cas_url = electricity_redirect(&response)?.ok_or_else(campus_scope_error)?;
+        let callback_service =
+            electricity_scope::cas_service(cas_url).ok_or_else(campus_scope_error)?;
+        let issued_for = Url::parse(&service).map_err(|_| campus_scope_error())?;
+        if callback_service != issued_for {
+            return Err(campus_scope_error());
+        }
+        let cas = self.cas.as_mut().ok_or_else(campus_scope_error)?;
+        let ticket_url = cas.electricity_ticket(self.context.transport, cas_url)?;
+        let response = self.get(&ticket_url)?;
+        if let Some(next) = electricity_redirect(&response)? {
+            if electricity_scope::app_redirect(next).as_deref() != Some(electricity::REFERER) {
+                return Err(campus_scope_error());
+            }
+        } else {
+            check_electricity_landing(response.status)?;
+        }
+        let landing = self.get(electricity::REFERER)?;
+        if let Some(next) = electricity_redirect(&landing)?
+            && electricity_scope::app_redirect(next)
+                .is_some_and(|url| electricity_scope::sign_in(&url) == Some(SignIn::Login))
+        {
+            return Err(CliError::new(
+                3,
+                "auth",
+                "electricity service did not accept the CAS ticket",
+                "No password was sent.",
+            ));
+        }
+        check_electricity_landing(landing.status)
+    }
+}
+
+fn electricity_redirect(response: &Response) -> CliResult<Option<&str>> {
+    if !matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+        return Ok(None);
+    }
+    let mut locations = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("location"));
+    let (_, value) = locations.next().ok_or_else(campus_scope_error)?;
+    if locations.next().is_some() || value.is_empty() {
+        return Err(campus_scope_error());
+    }
+    Ok(Some(value))
 }
 
 impl SessionDriver for ElectricitySession<'_, '_> {
@@ -249,13 +320,7 @@ impl SessionDriver for ElectricitySession<'_, '_> {
             }
             self.cas = Some(cas);
         }
-        let response = self.exchange(Request {
-            method: "GET",
-            url: electricity::REFERER.to_owned(),
-            headers: vec![],
-            body: vec![],
-        })?;
-        check_electricity_landing(response.status)?;
+        self.sign_in()?;
         self.ready = true;
         Ok(())
     }
@@ -429,6 +494,149 @@ mod tests {
         assert!(Route::portal_detail().accepts(&detail));
         detail.url = "https://example.invalid/2026/a/page.htm".into();
         assert!(!Route::portal_detail().accepts(&detail));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn electricity_reuses_cas_only_at_cas_and_spends_one_ticket_on_the_app() {
+        const ENTRY: &str = electricity::REFERER;
+        const LOGIN: &str = "https://app.bupt.edu.cn/uc/wap/login?redirect=https%3A%2F%2Fapp.bupt.edu.cn%2Fbuptdf%2Fwap%2Fdefault%2Fchong";
+        const SERVICE: &str = "https://app.bupt.edu.cn/a_bupt/api/sso/cas?redirect=https%3A%2F%2Fapp.bupt.edu.cn%2Fbuptdf%2Fwap%2Fdefault%2Fchong&from=wap";
+        const CAS: &str = "https://auth.bupt.edu.cn/authserver/login";
+        const VERIFY: &str = "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fucloud.bupt.edu.cn%2Fuclass";
+        let ticket = format!("{SERVICE}&ticket=ST-TEST-APP");
+        let mut cas = Url::parse(CAS).unwrap();
+        cas.query_pairs_mut()
+            .append_pair("noAutoRedirect", "1")
+            .append_pair("service", SERVICE);
+        let mut tr = Scripted::default();
+        for (method, url, status, headers, body) in [
+            (
+                "GET",
+                CAS,
+                200,
+                vec![],
+                "<input name='execution' value='TEST-ONLY'>",
+            ),
+            (
+                "POST",
+                CAS,
+                302,
+                vec![
+                    ("Location", "https://uc.bupt.edu.cn/"),
+                    ("Set-Cookie", "CASTGC=TEST-ONLY; Secure; Path=/authserver"),
+                ],
+                "",
+            ),
+            (
+                "GET",
+                VERIFY,
+                302,
+                vec![(
+                    "Location",
+                    "https://ucloud.bupt.edu.cn/uclass?ticket=ST-TEST-UCLOUD",
+                )],
+                "",
+            ),
+            (
+                "GET",
+                ENTRY,
+                302,
+                vec![
+                    ("Location", LOGIN),
+                    ("Set-Cookie", "app=INITIAL; Secure; Path=/"),
+                ],
+                "",
+            ),
+            ("GET", LOGIN, 302, vec![("Location", SERVICE)], ""),
+            ("GET", SERVICE, 302, vec![("Location", cas.as_str())], ""),
+            (
+                "GET",
+                cas.as_str(),
+                302,
+                vec![("Location", ticket.as_str())],
+                "",
+            ),
+            (
+                "GET",
+                ticket.as_str(),
+                302,
+                vec![
+                    ("Location", "/buptdf/wap/default/chong"),
+                    ("Set-Cookie", "app=READY; Secure; Path=/"),
+                ],
+                "",
+            ),
+            ("GET", ENTRY, 200, vec![], "electricity landing"),
+        ] {
+            tr.expected.push_back((
+                method,
+                url.into(),
+                Ok(Response {
+                    status,
+                    headers: headers
+                        .into_iter()
+                        .map(|(k, v)| (k.into(), v.into()))
+                        .collect(),
+                    body: body.as_bytes().to_vec(),
+                }),
+            ));
+        }
+        let home = tempfile::tempdir().unwrap();
+        let mut ctx = Context {
+            home_dir: home.path().into(),
+            config_dir: home.path().join("config"),
+            cache_dir: home.path().join("cache"),
+            timeout: std::time::Duration::from_secs(1),
+            transport: &mut tr,
+        };
+        let login = identity::commands()
+            .into_iter()
+            .find(|cmd| cmd.get_name() == "login")
+            .unwrap()
+            .try_get_matches_from([
+                "login",
+                "--user",
+                "20260001",
+                "--password",
+                "TEST-ONLY",
+                "--role",
+                "graduate",
+            ])
+            .unwrap();
+        identity::run("login", &login, &mut ctx).expect("scripted login");
+        let cached = std::fs::read(ctx.cache_dir.join("session.json")).unwrap();
+        let mut session = ElectricitySession::new(&mut ctx);
+        session
+            .ensure(Service::Electricity)
+            .expect("scripted sign-in and ticket callback");
+        session
+            .ensure(Service::Electricity)
+            .expect("in-memory session reuse");
+        assert_eq!(
+            std::fs::read(ctx.cache_dir.join("session.json")).unwrap(),
+            cached
+        );
+        assert!(tr.expected.is_empty());
+        assert_eq!(tr.calls.len(), 9);
+        assert_eq!(tr.calls.iter().filter(|r| r.method == "POST").count(), 1);
+        for (request, expected) in tr.calls[3..].iter().zip([
+            None,
+            Some("app=INITIAL"),
+            Some("app=INITIAL"),
+            Some("CASTGC=TEST-ONLY"),
+            Some("app=INITIAL"),
+            Some("app=READY"),
+        ]) {
+            assert_eq!(
+                request
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, v)| v.as_str()),
+                expected
+            );
+        }
     }
 
     #[test]

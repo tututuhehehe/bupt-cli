@@ -300,6 +300,36 @@ impl CasLogin {
         }
     }
 
+    /// Request the electricity service's ticket without posting a login form.
+    pub(super) fn electricity_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        login_url: &str,
+    ) -> CliResult<String> {
+        use crate::transport::electricity_scope;
+        let service = electricity_scope::cas_service(login_url)
+            .ok_or_else(|| parse_error("unverified electricity CAS service"))?;
+        if !self.has_usable_cookies() {
+            return Err(auth_error("no usable CAS session for electricity"));
+        }
+        let response = send_get(transport, &mut self.cookies, login_url)?;
+        match response.status {
+            301 | 302 | 303 | 307 | 308 => header(&response.headers, "location")
+                .filter(|location| electricity_scope::matches_ticket(location, &service))
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    parse_error("CAS returned an unexpected electricity ticket destination")
+                }),
+            401 | 403 | 200..=299 => Err(auth_error(
+                "CAS did not issue an electricity service ticket",
+            )),
+            status => Err(upstream_http_error(
+                "CAS electricity ticket request",
+                status,
+            )),
+        }
+    }
+
     /// Exchange an already obtained ticket. State stays in memory; callers that
     /// need durability must persist separately.
     pub(super) fn exchange_ucloud_ticket(

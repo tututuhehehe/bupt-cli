@@ -82,7 +82,7 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 - `electricity` 余额的 Python 请求链：静态楼栋 `partmentId`/`areaId`/默认楼层 → `/floor` 精确楼层名匹配 → `/drom` 房间名/房号评分 → `/search` → CLI 字段。楼层推断、沙河 `层` 后缀、房间规范化/精确>后缀>包含、非对象项、缺 `dromNum` 都有离线用例。
 - `notices` / `notices show` / `card` 的本地参数校验、profile 检查和命令编排；`notices show` 的空白/外部 URL 在读取 profile 前以 usage 2 拒绝。受保护命令统一使用 `identity::require_authenticated_profile`，只从临时目录的 `credentials.json` 读取 username 和非空密码，不读取账号环境变量，也不要求 role；无本地 profile 或凭据损坏时返回 auth 3。
 - `SessionDriver` 在联网前调用 `ensure(Service::Portal|Electricity)`，每个请求带 `Route` 标签；`send` 只执行一次交换，`renew` 只在确认 auth 3 后调用一次。门户列表 auth 后重启整个列表；电费只重试失败的 `/post`。这与 Python 的 invalidate-and-retry 行为一致。`Route::accepts` 固定方法、完整 URL/主机、请求头集合和空/非空 body，驱动不得把 `Cookie`/`Authorization` 放进 `Request`。
-- 正式 `run` 为电费和门户分别建立本次调用的会话驱动；`run_with_session` 留给测试注入。两者先验证已绑定的本地身份，校园网真实响应仍待实测。
+- 正式 `run` 为电费和门户分别建立本次调用的会话驱动；`run_with_session` 留给测试注入。两者先验证已绑定的本地身份。电费允许观察到的 HTTPS 流程：入口 → 同站 `/uc/wap/login` → 同站 `/a_bupt/api/sso/cas` → CAS → 带票据的同站回调 → 固定入口。回调只接受固定入口作为 `redirect`，不得将票据发往其他站。现场西土城 `/part` 返回 12 条；沙河返回业务状态 `e=1`；余额仍需要可获准查询的宿舍数据。门户 HTTPS 现场尚未通过。
 
 `SessionDriver` 收到的 route 模板（`Route::accepts` 逐项校验）：
 
@@ -116,6 +116,8 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `dorm_flags_win_over_environment_and_config` | flag > env > config、楼名/room/floor |
 | `building_metadata_matches_the_python_constants` | 学一楼/沙河A/学29楼的 `partmentId`、`areaId`、默认楼层（含 `-1`、`层`、`强电`、空列表） |
 | `buildings_maps_area_count_and_response_items` | `/part` 的 `areaid` 请求、shahe/xitucheng 回显、空列表、楼栋字段原样保留 |
+| `electricity_reuses_cas_only_at_cas_and_spends_one_ticket_on_the_app` | 回放完整 HTTPS 登录，CAS/app Cookie 不串站；一次性票据、不重登、不写会话 |
+| `electricity_sign_in_rejects_other_services_and_malformed_tickets` | 拒绝其他主机、明文、非固定回跳、重复或无效票据 |
 | `balance_maps_fixture_fields_and_response_overrides` | `/search` 表单、响应 `parName/floorName` 覆盖 fallback、余额/价格/剩余量/总用量/时间/阈值/source 映射 |
 | `balance_keeps_empty_and_zero_values_compatible` | 空 surplus、零/空 price、空 `vTotal` 回退 `freeEnd`、空名称/时间、低余额阈值 |
 | `confirmed_login_markers_are_auth_errors` | 四个确认登录标记在 `e != 0` 时映射 auth 3，不把普通错误猜成 auth |
