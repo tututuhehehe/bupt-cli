@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
 mod graduate;
@@ -203,9 +203,9 @@ fn run_exams(ctx: &mut Context<'_>) -> CliResult<Outcome> {
     let account = identity::require_authenticated_profile(&ctx.config_dir)?;
     match required_role(&account)? {
         Role::Graduate => {
-            let mut source =
-                graduate::ChromePageSource::new(&ctx.config_dir, &ctx.cache_dir, ctx.timeout);
-            run_exams_with_source(&ctx.config_dir, &mut source)
+            let config_dir = ctx.config_dir.clone();
+            let mut source = graduate::HttpsPageSource::new(ctx)?;
+            run_exams_with_source(&config_dir, &mut source)
         }
         Role::Undergraduate => {
             let mut auth = mobile_auth(ctx)?;
@@ -376,14 +376,10 @@ impl TimetableSource for NativeTimetableSource<'_, '_> {
     fn fetch(&mut self, username: &str, role: Role) -> CliResult<Snapshot> {
         match role {
             Role::Graduate => {
-                let mut pages = graduate::ChromePageSource::new(
-                    &self.context.config_dir,
-                    &self.context.cache_dir,
-                    self.context.timeout,
-                );
-                let pages =
-                    pages.collect(&[graduate::GradPage::Schedule, graduate::GradPage::Calendar])?;
-                graduate::snapshot_from_pages(username, &pages)
+                let mut source = graduate::HttpsPageSource::new(self.context)?;
+                let collected = source
+                    .collect(&[graduate::GradPage::Schedule, graduate::GradPage::Calendar])?;
+                graduate::snapshot_from_pages(username, &collected)
             }
             Role::Undergraduate => {
                 let mut auth = mobile_auth(self.context)?;
@@ -2036,7 +2032,7 @@ mod tests {
         let mut source = FakePageSource::with(GradPages::default());
 
         let error = match run_exams_with_source(&config, &mut source) {
-            Ok(_) => panic!("undergraduate exams must not use the graduate browser"),
+            Ok(_) => panic!("undergraduate exams must not use the graduate source"),
             Err(error) => error,
         };
 

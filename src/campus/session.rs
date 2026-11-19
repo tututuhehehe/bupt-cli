@@ -587,7 +587,6 @@ mod tests {
             home_dir: home.path().into(),
             config_dir: home.path().join("config"),
             cache_dir: home.path().join("cache"),
-            timeout: std::time::Duration::from_secs(1),
             transport: &mut tr,
         };
         let login = identity::commands()

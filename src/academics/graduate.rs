@@ -1,18 +1,18 @@
 //! Parsers and the page-source boundary for the graduate system (yjxt).
 //!
-//! This module never performs network or browser I/O. It turns already-fetched
+//! This module never performs network I/O. It turns already-fetched
 //! HTML into the same JSON-ready shapes as the Python reference, and exposes a
 //! shallow `GradPageSource` seam so command tests can inject synthetic pages.
-//! A concrete Chrome/CDP source lives in `graduate::browser` and is selected by
-//! the production command wrappers only.
+//! The concrete browserless HTTPS source lives in `graduate::https_source`
+//! and is selected by the production command wrappers only.
 
 use crate::cli::{CliError, CliResult};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
-mod browser;
+mod https_source;
 
-pub(super) use browser::ChromePageSource;
+pub(in crate::academics) use https_source::HttpsPageSource;
 
 pub(super) const WEEKDAYS: [&str; 7] = [
     "星期一",
@@ -58,7 +58,8 @@ pub(super) struct GradPages {
     pub(super) exams: Option<String>,
 }
 
-/// Shallow seam: tests provide synthetic pages; production uses Chrome/CDP.
+/// Shallow seam: tests provide synthetic pages; production uses the
+/// browserless HTTPS source.
 pub(super) trait GradPageSource {
     fn collect(&mut self, wanted: &[GradPage]) -> CliResult<GradPages>;
 }

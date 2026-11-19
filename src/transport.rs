@@ -412,6 +412,7 @@ fn transport_failure() -> CliError {
 
 mod cas_wire;
 pub(crate) mod electricity_scope;
+pub(crate) mod graduate_scope;
 pub(crate) mod portal_scope;
 
 /// Public release metadata and, for installs only, fixed release archives.

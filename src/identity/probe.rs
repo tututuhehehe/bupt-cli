@@ -1795,7 +1795,6 @@ mod tests {
                 home_dir: self.root.path().join("home"),
                 config_dir: self.config_dir(),
                 cache_dir: self.cache_dir(),
-                timeout: Duration::from_secs(20),
                 transport,
             }
         }

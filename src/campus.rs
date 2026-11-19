@@ -445,7 +445,6 @@ mod tests {
             home_dir: dirs.root.clone(),
             config_dir: dirs.config_dir(),
             cache_dir: dirs.cache_dir(),
-            timeout: Duration::from_secs(20),
             transport,
         }
     }

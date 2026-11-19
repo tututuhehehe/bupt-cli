@@ -681,7 +681,6 @@ mod tests {
             home_dir: PathBuf::from("/bupt-test/home"),
             config_dir: PathBuf::from("/bupt-test/config"),
             cache_dir: PathBuf::from("/bupt-test/cache"),
-            timeout: Duration::from_secs(20),
             transport,
         }
     }

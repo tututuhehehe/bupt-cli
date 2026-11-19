@@ -56,12 +56,11 @@ pub(crate) struct Context<'a> {
     pub home_dir: PathBuf,
     pub config_dir: PathBuf,
     pub cache_dir: PathBuf,
-    pub timeout: Duration,
     pub transport: &'a mut dyn Transport,
 }
 
 impl<'a> Context<'a> {
-    fn from_environment(timeout: Duration, transport: &'a mut dyn Transport) -> CliResult<Self> {
+    fn from_environment(transport: &'a mut dyn Transport) -> CliResult<Self> {
         let home_dir =
             std::env::home_dir().ok_or_else(|| CliError::usage("home directory unavailable"))?;
         let default = home_dir.join(".bupt-cli");
@@ -74,7 +73,6 @@ impl<'a> Context<'a> {
             config_dir: directory("BUPT_CLI_CONFIG_DIR"),
             cache_dir: directory("BUPT_CLI_CACHE_DIR"),
             home_dir,
-            timeout,
             transport,
         })
     }
@@ -277,7 +275,7 @@ fn run(
             None if name == "update" => &mut release_curl,
             None => offline,
         };
-        let mut context = Context::from_environment(timeout, transport)?;
+        let mut context = Context::from_environment(transport)?;
         let (_, handler) = routes
             .iter()
             .find(|(key, _)| key == name)

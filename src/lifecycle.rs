@@ -1631,7 +1631,6 @@ mod tests {
             home_dir: root.join("home"),
             config_dir: root.join("config"),
             cache_dir: root.join("cache"),
-            timeout: Duration::from_secs(1),
             transport,
         }
     }

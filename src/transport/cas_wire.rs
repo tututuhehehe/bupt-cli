@@ -1,6 +1,7 @@
 //! Scoped campus requests for a one-exchange system curl executor. All request
 //! strings are written as curl options to stdin, never to argv or a file.
 
+use super::graduate_scope;
 use super::{CurlExec, Request, Response, base_curl_arguments};
 use crate::cli::{CliError, CliResult};
 use std::fmt::Write;
@@ -26,6 +27,7 @@ enum Route {
     ElectricityLanding,
     ElectricitySignIn,
     ElectricityRead(&'static [&'static str]),
+    GraduateRead,
     PortalRead { card: bool },
     PublicProbe,
     MobileProbe,
@@ -208,6 +210,14 @@ fn route(request: &Request) -> Option<Route> {
         ("auth.bupt.edu.cn", "GET", p) if p == "/authserver" || p.starts_with("/authserver/") => {
             Some(Route::CasRead)
         }
+        ("yjxt.bupt.edu.cn", "GET", "/ULogin.aspx")
+            if graduate_scope::ticketed_callback(raw).is_some() =>
+        {
+            Some(Route::GraduateRead)
+        }
+        ("yjxt.bupt.edu.cn", "GET", _p) if graduate_scope::approved_page(raw).is_some() => {
+            Some(Route::GraduateRead)
+        }
         ("ucloud.bupt.edu.cn", "GET", p) if p == "/uclass" || p.starts_with("/uclass/") => {
             Some(Route::UcloudLanding)
         }
@@ -308,6 +318,7 @@ fn probe_route(request: &Request) -> Option<Route> {
             {
                 None
             }
+            Route::GraduateRead => None,
             _ => Some(route),
         };
     }
@@ -388,6 +399,7 @@ fn allowed_header(route: Route, name: &str) -> bool {
             Route::CasRead | Route::ElectricityLanding | Route::ElectricitySignIn => {
                 name == "cookie"
             }
+            Route::GraduateRead => name == "cookie",
             Route::ElectricityRead(_) => matches!(
                 name,
                 "cookie" | "referer" | "x-requested-with" | "content-type"

@@ -12,7 +12,9 @@
 
 use crate::cli::{CliError, CliResult};
 use crate::transport::{Request, Response, Transport};
-use cookie_store::{Cookie, CookieDomain, CookieExpiration, CookieStore};
+#[cfg(test)]
+use cookie_store::CookieExpiration;
+use cookie_store::{Cookie, CookieDomain, CookieStore};
 use serde_json::{Map, Value, json};
 use std::fmt;
 use std::io::Cursor;
@@ -61,53 +63,74 @@ impl CasService {
     }
 }
 
-/// Canonical cookie metadata that may be injected into a CAS browser flow.
+/// Canonical cookie metadata that may be attached to a fixed authenticated
+/// page flow.
 ///
 /// Only cookies applicable to the canonical HTTPS `auth.bupt.edu.cn` login URL
 /// are exported; a school-wide suffix is narrowed to that auth host. The value
 /// is intentionally kept behind an accessor and the manual `Debug`
 /// implementation redacts it. `host_only` is preserved separately so callers
-/// can keep the maintained cookie scope when passing metadata to Chrome.
+/// can keep the maintained cookie scope when building scoped requests.
 pub(crate) struct CasCookie {
     name: String,
     value: String,
-    domain: String,
-    host_only: bool,
     path: String,
-    secure: bool,
     http_only: bool,
+    // Kept only so tests can prove the narrowing contract of the export:
+    // cookies are attached to the auth host, never to a broader suffix.
+    #[cfg(test)]
+    domain: String,
+    #[cfg(test)]
+    host_only: bool,
+    #[cfg(test)]
+    secure: bool,
+    #[cfg(test)]
     expires_at: Option<i64>,
 }
 
 impl CasCookie {
     fn from_cookie(cookie: &Cookie<'_>) -> Option<Self> {
-        let host_only = match &cookie.domain {
-            CookieDomain::HostOnly(domain) if domain.eq_ignore_ascii_case(CAS_HOST) => true,
+        // The domain check is a production filter: cookies scoped anywhere but
+        // the auth host (or the school suffix narrowed to it) are refused.
+        let narrowed = matches!(
+            &cookie.domain,
+            CookieDomain::HostOnly(domain) if domain.eq_ignore_ascii_case(CAS_HOST)
+        ) || matches!(
+            &cookie.domain,
             CookieDomain::Suffix(domain)
                 if domain.eq_ignore_ascii_case(CAS_HOST)
-                    || domain.eq_ignore_ascii_case("bupt.edu.cn") =>
-            {
-                false
-            }
-            _ => return None,
+                    || domain.eq_ignore_ascii_case("bupt.edu.cn")
+        );
+        if !narrowed {
+            return None;
+        }
+        // Recorded only for the narrowing assertions in tests.
+        #[cfg(test)]
+        let host_only = matches!(&cookie.domain, CookieDomain::HostOnly(_));
+        #[cfg(test)]
+        let secure = cookie.secure().unwrap_or(false);
+        #[cfg(test)]
+        let expires_at = match cookie.expires {
+            CookieExpiration::AtUtc(expires) => Some(expires.unix_timestamp()),
+            CookieExpiration::SessionEnd => None,
         };
         let name = cookie.name().to_owned();
         let value = cookie.value().to_owned();
         if name.is_empty() || value.is_empty() {
             return None;
         }
-        let expires_at = match cookie.expires {
-            CookieExpiration::AtUtc(expires) => Some(expires.unix_timestamp()),
-            CookieExpiration::SessionEnd => None,
-        };
         Some(Self {
             name,
             value,
-            domain: CAS_HOST.to_owned(),
-            host_only,
             path: cookie.path.as_ref().to_owned(),
-            secure: cookie.secure().unwrap_or(false),
             http_only: cookie.http_only().unwrap_or(false),
+            #[cfg(test)]
+            domain: CAS_HOST.to_owned(),
+            #[cfg(test)]
+            host_only,
+            #[cfg(test)]
+            secure,
+            #[cfg(test)]
             expires_at,
         })
     }
@@ -120,10 +143,12 @@ impl CasCookie {
         &self.value
     }
 
+    #[cfg(test)]
     pub(crate) fn domain(&self) -> &str {
         &self.domain
     }
 
+    #[cfg(test)]
     pub(crate) fn host_only(&self) -> bool {
         self.host_only
     }
@@ -132,6 +157,7 @@ impl CasCookie {
         &self.path
     }
 
+    #[cfg(test)]
     pub(crate) fn secure(&self) -> bool {
         self.secure
     }
@@ -140,6 +166,7 @@ impl CasCookie {
         self.http_only
     }
 
+    #[cfg(test)]
     pub(crate) fn expires_at(&self) -> Option<i64> {
         self.expires_at
     }
@@ -175,12 +202,8 @@ impl fmt::Debug for CasCookie {
             .debug_struct("CasCookie")
             .field("name", &self.name)
             .field("value", &"<redacted>")
-            .field("domain", &self.domain)
-            .field("host_only", &self.host_only)
             .field("path", &self.path)
-            .field("secure", &self.secure)
             .field("http_only", &self.http_only)
-            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
