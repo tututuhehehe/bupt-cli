@@ -5,7 +5,6 @@ use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const USER: &str = "20260001";
 const OTHER_USER: &str = "20260002";
@@ -14,7 +13,7 @@ const PASSWORD: &str = "synthetic-test-password";
 
 // ---------------------------------------------------------------------------
 // Time helpers. The cache must look current whenever the suite runs, so the
-// fixtures are generated around the UTC day instead of being pinned to a date
+// fixtures are generated around the local day instead of being pinned to a date
 // that will eventually fall outside every teaching week.
 // ---------------------------------------------------------------------------
 
@@ -72,12 +71,13 @@ impl Date {
     }
 }
 
-fn utc_today() -> Date {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
-        .as_secs();
-    Date::from_days((seconds / 86_400) as i64)
+fn local_today() -> Date {
+    let local = time::OffsetDateTime::now_local().expect("the system local offset is available");
+    Date {
+        year: local.year(),
+        month: u32::from(u8::from(local.month())),
+        day: u32::from(local.day()),
+    }
 }
 
 fn monday_of(day: Date) -> Date {
@@ -246,7 +246,7 @@ struct Snapshot {
 }
 
 fn synthetic_snapshot(username: &str, role: &str) -> Snapshot {
-    let today = utc_today();
+    let today = local_today();
     let monday = monday_of(today.add_days(-21));
     let mut calendar = Map::new();
     for week in 1..=8 {

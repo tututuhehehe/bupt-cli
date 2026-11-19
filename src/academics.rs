@@ -115,7 +115,7 @@ fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
         return match subcommand {
             "update" => update_schedule(ctx),
             "calendar" => {
-                let selected = current_selection(ctx, utc_today(), false)?;
+                let selected = current_selection(ctx, local_today()?, false)?;
                 Ok(outcome(calendar_payload(&selected)))
             }
             "export" => export_schedule(sub, ctx),
@@ -125,7 +125,7 @@ fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
         };
     }
 
-    let today = utc_today();
+    let today = local_today()?;
     let selected = current_selection(ctx, today, false)?;
     let snapshot = &selected.snapshot;
     if matches.get_flag("raw") {
@@ -177,7 +177,7 @@ fn run_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
 }
 
 fn update_schedule(ctx: &Context<'_>) -> CliResult<Outcome> {
-    let selected = current_selection(ctx, utc_today(), true)?;
+    let selected = current_selection(ctx, local_today()?, true)?;
     let snapshot = &selected.snapshot;
     let (start, end) =
         term_bounds(snapshot).ok_or_else(|| refresh_failed("刷新结果没有可用的学期日期范围"))?;
@@ -633,7 +633,7 @@ fn calendar_payload(selected: &Selected) -> Value {
 }
 
 fn export_schedule(matches: &ArgMatches, ctx: &Context<'_>) -> CliResult<Outcome> {
-    let selected = current_selection(ctx, utc_today(), false)?;
+    let selected = current_selection(ctx, local_today()?, false)?;
     let snapshot = &selected.snapshot;
     let (content, events) = build_ics(snapshot)?;
     let out = matches
@@ -1188,11 +1188,20 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-// std::time has no local-offset API in this build. today/tomorrow/week use
-// this UTC day for now; DTSTAMP below is intentionally UTC. See the clock item
-// in docs/migration-tests/academics.md for the requested shared date API.
-fn utc_today() -> Date {
-    Date::from_days((unix_seconds() / 86_400) as i64)
+fn local_today() -> CliResult<Date> {
+    let local = time::OffsetDateTime::now_local().map_err(|_| {
+        CliError::new(
+            5,
+            "upstream",
+            "无法确定本机日期，不能确认当前学期",
+            "检查系统时区设置后重试。",
+        )
+    })?;
+    Ok(Date {
+        year: local.year(),
+        month: u32::from(u8::from(local.month())),
+        day: u32::from(local.day()),
+    })
 }
 
 fn utc_stamp() -> String {

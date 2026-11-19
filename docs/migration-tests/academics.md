@@ -13,7 +13,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 1. **课表快照归属与当前学期**：Rust 快照格式为 v2，顶层带 `username` 和 `role`。只有 `username` 等于当前凭据、`role` 等于当前身份、且运行当天落在快照教学周日期的闭区间内，才可直接服务 `schedule` / `schedule calendar` / `schedule export`。v1 没有 `username`，属于“无法确认归属”，不能按 `role` 猜测后继续。归属不符、缺失、损坏或当天不在学期内的快照都走唯一一次自动刷新；刷新失败/不完整/不覆盖当天时保留旧文件但不把它当作当前学期，也不生成日历或导出。
 2. **缓存位置**：沿用旧行为，fixture 写到 `BUPT_CLI_CACHE_DIR/timetable.json`；凭据写到 `BUPT_CLI_CONFIG_DIR/credentials.json`。
 3. **网络隔离边界**：共享 `Sandbox` 只隔离 HOME/config/cache。把 `HTTP(S)_PROXY`/`ALL_PROXY` 指向关闭的本地端口是 best-effort，只对遵守这些环境变量的 HTTP 客户端生效；它不覆盖浏览器/非 HTTP 流量，也不能证明“没有发起网络请求”。真正的 no-calls 断言必须放在后续注入 transport/browser 的场景里（见下）。
-4. **动态日期与时钟**：进程用例的教学周围绕 UTC 当天生成（前后各数周），避免测试在学期结束后因“过期”而误判；实现侧用例使用固定日期 `2026-09-23`，并显式把 `today` 传给 `select_snapshot`。生产路径仍只能用 `std::time` 的 UTC 日，尚无跨平台本地时区 API；这是已记录的运行时限制，不用假数据冒充本地日。
+4. **动态日期与时钟**：进程用例的教学周围绕本机当天生成（前后各数周），避免测试在学期结束后因“过期”而误判；实现侧用例使用固定日期 `2026-09-23`，并显式把 `today` 传给 `select_snapshot`。运行时使用本机日期，无法确定本机日期则报告错误。
 5. **凭据来源**：只用临时目录里的 `credentials.json`；账号环境变量不读取、不覆盖 JSON。role 只用于需要身份路由的教务操作。
 
 ## 用例映射
@@ -104,8 +104,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 6. **课表保存权限**（`test_timetable.py::test_save_and_load_round_trip` 中 `0600`）
    - 当前刷新写缓存与导出写 `.ics` 已统一走同目录 `NamedTempFile` + `sync_all` + `persist`，并拒绝 symlink 目标/同 inode 别名；失败保留旧目标。尚未验证 Unix `0600` 权限，也未在 Windows 实测覆盖已有目标的持久化行为；需要平台验收。
 7. **本周/今天/明天的本地日与时钟边界**
-   - 旧 Python 用 `date.today()`（用户本地日）；当前 Rust 只用 `std::time`，没有本地时区 API，因此选择边界、today/tomorrow/week 暂用 UTC 日，DTSTAMP 按合同保持 UTC。选择函数已经显式接收 `today`，测试可以固定日期，但生产运行时仍是 UTC；这是明确的未决差异，不冒充已修复。
-   - 具体依赖请求：由整合者批准并加入共享依赖 `time`（启用 `local-offset`）或 `jiff`，或提供可注入的共享 clock；在此之前不修改本线 Cargo。跨周（周日/周一）、学期首尾闭区间与学期外 fallback 仍需该 seam 或既有注入日期补足。
+   - 整合版通过现有 `time` 依赖使用本机日期，和 Python `date.today()` 对齐。选择函数仍可注入日期；`DTSTAMP` 保持 UTC。Windows 实机和跨时区仍需独立验收。
 8. **Windows 下打开导出目录失败**
    - 当前 Unix 用 sentinel 证明伪造 `open` 被调用且退出 9 后导出仍成功；Windows 的 explorer 路径与启动失败仍未实测，需在 Windows 验收或实现侧的启动器抽象中覆盖。
 9. **课表/考试页面真实上游结构**
