@@ -103,8 +103,10 @@ fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
     matches!(name, "login" | "courses")
         || (name == "homework"
             && match arguments.subcommand_name() {
-                Some("show" | "verify") => true,
-                None => arguments.get_one::<u64>("new").is_none(),
+                Some("show" | "verify" | "download") => true,
+                // Every parent-level list mode is now read-only and routed:
+                // default/all, --course, --undone, and --new.
+                None => true,
                 _ => false,
             })
 }
@@ -430,9 +432,9 @@ mod tests {
             (&["bupt", "homework", "--course", "site-1"][..], true),
             (&["bupt", "homework", "show", "1"][..], true),
             (&["bupt", "homework", "verify", "1"][..], true),
-            (&["bupt", "homework", "--new", "7"][..], false),
+            (&["bupt", "homework", "--new", "7"][..], true),
             (&["bupt", "homework", "submit", "1"][..], false),
-            (&["bupt", "homework", "download", "1"][..], false),
+            (&["bupt", "homework", "download", "1"][..], true),
             (&["bupt", "status"][..], false),
             (&["bupt", "diagnose"][..], false),
             (&["bupt", "library", "search", "example"][..], false),

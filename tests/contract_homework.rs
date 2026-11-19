@@ -106,21 +106,31 @@ fn legacy_roleless_credentials_cannot_prove_a_verified_login() {
 }
 
 #[test]
-fn deferred_new_filter_stops_before_network() {
+fn new_filter_reaches_the_verified_session_boundary() {
     let sandbox = Sandbox::new();
+    let credentials = sandbox.root().join("config/credentials.json");
     fs::write(
-        sandbox.root().join("config/credentials.json"),
+        &credentials,
         r#"{"username":"2026000096","password":"TEST-ONLY-HOMEWORK-PASSWORD-6a7b","role":"undergraduate"}"#,
     )
     .expect("write synthetic role credentials");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&credentials)
+            .expect("synthetic credentials metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&credentials, permissions).expect("make credentials user-private");
+    }
 
     let invocation = sandbox.run(&["homework", "--new", "7"]);
-    let error = assert_error(&invocation, 5, "upstream");
+    let error = assert_error(&invocation, 3, "auth");
     assert!(
-        error["error"]["message"]
+        error["error"]["hint"]
             .as_str()
-            .is_some_and(|message| message.contains("--new")),
-        "deferred --new should name the missing filter: {error}"
+            .is_some_and(|hint| hint.contains("login")),
+        "--new must reach the verified-session boundary: {error}"
     );
     assert!(!sandbox.root().join("cache/session.json").exists());
 }
@@ -142,6 +152,7 @@ fn read_commands_reach_the_verified_session_boundary() {
         vec!["homework", "--new", "7"],
         vec!["homework", "show", ASSIGNMENT_ID],
         vec!["homework", "verify", ASSIGNMENT_ID],
+        vec!["homework", "download", ASSIGNMENT_ID, "--dir", "downloads"],
     ] {
         let invocation = sandbox.run(&args);
         let error = assert_error(&invocation, 3, "auth");

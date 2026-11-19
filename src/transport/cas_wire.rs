@@ -22,6 +22,7 @@ enum Route {
     UcloudToken,
     UcloudRead,
     UcloudHomeworkList,
+    UcloudAttachment,
     ElectricityLanding,
     ElectricityRead(&'static [&'static str]),
     PublicProbe,
@@ -203,6 +204,10 @@ fn route(request: &Request) -> Option<Route> {
         {
             Some(Route::UcloudHomeworkList)
         }
+        ("fileucloud.bupt.edu.cn", "GET", _)
+        | ("apiucloud.bupt.edu.cn", "GET", "/blade-source/resource/download") => {
+            Some(Route::UcloudAttachment)
+        }
         ("app.bupt.edu.cn", "GET", "/buptdf/wap/default/chong") if parsed.query().is_none() => {
             Some(Route::ElectricityLanding)
         }
@@ -238,7 +243,7 @@ fn probe_route(request: &Request) -> Option<Route> {
     }
     if let Some(route) = route(request) {
         return match route {
-            Route::CasForm | Route::UcloudLanding => None,
+            Route::CasForm | Route::UcloudLanding | Route::UcloudAttachment => None,
             Route::CasRead
                 if !matches!(
                     request.url.as_str(),
@@ -320,7 +325,7 @@ fn allowed_header(route: Route, name: &str) -> bool {
                 "cookie" | "referer" | "x-requested-with" | "content-type"
             ),
             Route::CasForm => matches!(name, "cookie" | "content-type"),
-            Route::UcloudLanding | Route::PublicProbe => false,
+            Route::UcloudLanding | Route::UcloudAttachment | Route::PublicProbe => false,
             Route::MobileProbe => matches!(name, "token" | "accept"),
             Route::UcloudToken => matches!(name, "authorization" | "content-type"),
             Route::UcloudRead | Route::UcloudHomeworkList => {
@@ -511,6 +516,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.status, 429);
+    }
+
+    #[test]
+    fn attachment_sources_receive_neither_account_headers_nor_request_bodies() {
+        let mut request = Request {
+            method: "GET",
+            url: "https://fileucloud.bupt.edu.cn/attachment.bin?signature=TEST".into(),
+            headers: vec![("User-Agent".into(), "bupt-test".into())],
+            body: Vec::new(),
+        };
+        assert!(curl_config(&request).is_ok());
+        assert!(curl_probe_config(&request).is_err());
+        request.url =
+            "https://apiucloud.bupt.edu.cn/blade-source/resource/download?resourceId=TEST".into();
+        assert!(curl_config(&request).is_ok());
+        for secret_header in ["Cookie", "Authorization", "Blade-Auth", "Tenant-Id"] {
+            request
+                .headers
+                .push((secret_header.into(), "TEST-ONLY".into()));
+            assert!(curl_config(&request).is_err());
+            request.headers.pop();
+        }
+        request.body.push(b'x');
+        assert!(curl_config(&request).is_err());
+        request.body.clear();
+        request.method = "POST";
+        assert!(curl_config(&request).is_err());
+        request.method = "GET";
+        request.url = "https://fileucloud.bupt.edu.cn.example/attachment.bin".into();
+        assert!(curl_config(&request).is_err());
     }
 
     #[test]

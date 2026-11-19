@@ -56,7 +56,7 @@
         "json": {
           "code": 200,
           "data": {
-            "previewUrl": "https://files.contract.invalid/ucloud/document/att-1-hash.pdf?response-content-disposition=attachment%3Bfilename%3D%E4%BD%9C%E4%B8%9A%E8%A6%81%E6%B1%82.pdf"
+            "previewUrl": "https://fileucloud.bupt.edu.cn/ucloud/document/att-1-hash.pdf?response-content-disposition=attachment%3Bfilename%3D%E4%BD%9C%E4%B8%9A%E8%A6%81%E6%B1%82.pdf"
           }
         }
       }
@@ -74,7 +74,7 @@
         "json": {
           "code": 200,
           "data": {
-            "previewUrl": "https://files.contract.invalid/ucloud/document/att-2-hash.csv?response-content-disposition=attachment%3Bfilename%3Ddata.csv"
+            "previewUrl": "https://fileucloud.bupt.edu.cn/ucloud/document/att-2-hash.csv?response-content-disposition=attachment%3Bfilename%3Ddata.csv"
           }
         }
       }
@@ -82,7 +82,7 @@
     {
       "request": {
         "method": "GET",
-        "url": "https://files.contract.invalid/ucloud/document/att-1-hash.pdf?response-content-disposition=attachment%3Bfilename%3D%E4%BD%9C%E4%B8%9A%E8%A6%81%E6%B1%82.pdf"
+        "url": "https://fileucloud.bupt.edu.cn/ucloud/document/att-1-hash.pdf?response-content-disposition=attachment%3Bfilename%3D%E4%BD%9C%E4%B8%9A%E8%A6%81%E6%B1%82.pdf"
       },
       "response": {
         "status": 200,
@@ -92,7 +92,7 @@
     {
       "request": {
         "method": "GET",
-        "url": "https://files.contract.invalid/ucloud/document/att-2-hash.csv?response-content-disposition=attachment%3Bfilename%3Ddata.csv"
+        "url": "https://fileucloud.bupt.edu.cn/ucloud/document/att-2-hash.csv?response-content-disposition=attachment%3Bfilename%3Ddata.csv"
       },
       "response": {
         "status": 200,
