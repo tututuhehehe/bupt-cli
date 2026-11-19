@@ -236,15 +236,6 @@ fn local_now() -> CliResult<time::PrimitiveDateTime> {
     Ok(time::PrimitiveDateTime::new(now.date(), now.time()))
 }
 
-pub(super) fn unsupported(operation: &str) -> CliError {
-    CliError::new(
-        5,
-        "upstream",
-        format!("{operation} is not implemented in this migration build"),
-        "No campus request was made. This operation is not wired in this migration batch.",
-    )
-}
-
 fn require_read_profile(context: &Context<'_>) -> CliResult<()> {
     if identity::require_authenticated_profile(&context.config_dir)?
         .role()
@@ -264,8 +255,4 @@ fn load_read_session(context: &mut Context<'_>) -> CliResult<read::Session> {
     require_read_profile(context)?;
     let (access_token, user_id) = identity::require_ucloud_session(context)?;
     Ok(read::Session::new(access_token, user_id))
-}
-
-pub(super) fn require_credentials(context: &Context<'_>) -> CliResult<()> {
-    identity::require_authenticated_profile(&context.config_dir).map(|_| ())
 }

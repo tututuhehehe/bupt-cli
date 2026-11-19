@@ -130,13 +130,13 @@ Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust �
 - 输出沿用 Python：`assignment_id`、`title`、`dir`、`saved[{title,resource_id,path,size,url}]`、`skipped[{title,path,reason}]`、`count_saved`、`count_skipped`。`path`/`dir` 是 canonicalize 后的绝对路径。
 - **生产适配仍由父会话/整合者负责**：`cli.rs::uses_campus_transport` 目前仍不把 `download` 子命令选到 `CampusCurl`；`transport/cas_wire.rs` 也未允许 `fileucloud.bupt.edu.cn`。本批只在进程内用 `Scripted` 验证 handler。生产需要新增窄路由：GET `https://fileucloud.bupt.edu.cn/...`（任意路径/签名 query，无 auth/cookie，需把 `Location` 暴露给 handler）以及 GET `https://apiucloud.bupt.edu.cn/blade-source/resource/download?resourceId=...`（若上游 preview 返回同域下载地址）；重定向仍由 handler 逐跳校验，不能配置 curl 自动跟随。
 
-### submit 路由形状（仅设计，未启用）
+### submit 路由形状（已接生产传输，写路径需确认）
 
-本批不启用写路径，但父会话接线时可复用 `submit.rs` 的请求形状：
+`submit` 的预演与确认写路径共用 `load_read_session`；只有 `--i-confirm-submit` 才会真正发上传与提交请求（`--dry-run` 与确认互斥，无任何 flag 直接退 2）：
 
-- `POST https://apiucloud.bupt.edu.cn/blade-source/resource/upload/biz`：`multipart/form-data`，文件 part 带 filename/MIME，表单字段 `userId`、`bizType=3`；需要 auth headers、独立 body 上限和可信 multipart 编码/流式读取，不能套用当前只允许可打印 ASCII 的 JSON body 策略。
-- `POST https://apiucloud.bupt.edu.cn/ykt-site/work/submit`：JSON `{assignmentId,assignmentType:0,assignmentContent,attachmentIds,userId,groupId:"",commitId:""}`，`Content-Type: application/json`，auth headers。
-- 两者都必须保留确认门禁、失败/响应丢失不自动重发、提交后只读 `verify` 的约束；不要在本批把 `submit` 加入 `uses_campus_transport`。
+- `POST https://apiucloud.bupt.edu.cn/blade-source/resource/upload/biz`：`multipart/form-data`（固定 boundary），文件 part 带 filename/MIME，表单字段 `userId`、`bizType=3`。生产传输把二进制 body 写入 0600 临时文件，用 `--data-binary @path` 传给 curl，body 从不进入 argv 或配置文本；上限 8 MiB+4 KiB。
+- `POST https://apiucloud.bupt.edu.cn/ykt-site/work/submit`：JSON `{assignmentId,assignmentType:0,assignmentContent,attachmentIds,userId,groupId:"",commitId:""}`，`Content-Type: application/json`；body 单独校验（≤512 KiB、7 个固定键、附件 id ≤128 个），允许非 ASCII 正文。
+- 两者都保留确认门禁、失败/响应丢失不自动重发、提交后只读 `verify` 的约束；`diagnose` 探测模式拒绝这两个路由。真实校园网提交验收需用户指定目标作业后单独执行。
 
 ### 源内单元用例（`src/homework/detail.rs`）
 
@@ -224,7 +224,7 @@ Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust �
 
 回执判定只接受肯定证据：显式 `success: true`，或认可的 `code`（0/200）。空对象、缺失/非法指示、互相矛盾的 success/code、2xx 非 JSON、408、5xx、意外重定向以及没有确认响应的 transport failure 都退 6 且 `submitted=null`，并只指向只读 `verify`。明确 4xx（408 除外）、JSON 负回执和 401/403 仍走显式错误（HTTP/上游 5，鉴权 3），不伪装成 unknown。所有分支都不自动重发 submit；transport failure 只说明没有收到确认响应，不回显原始诊断。
 
-读命令（`courses`、默认列表、`--course`、`--undone`、`--new`、`show`、`verify`）共用 `homework::load_read_session` → `identity::require_ucloud_session`；凭据只从 `credentials.json` 读取（username + 非空密码 + role + session revision），不读取账号环境变量。已验证 session 需要 role；roleless/旧凭据在本地退 auth 3，不会创建或重写 session。`submit` 仍走单独的 `homework::load_session`：确认门禁通过后以“submit wiring 未实现”退 5，未接 transport。`download` 已接 handler 和 `load_read_session`，但生产路由仍由父会话放开；它下载时只发 `User-Agent`，不发送 token/Cookie。成功提交但未跑 `--no-verify` 时 helper 仍返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`；提交后的自动核验仍未接上本批的 `verify` helper。
+读命令（`courses`、默认列表、`--course`、`--undone`、`--new`、`show`、`verify`）共用 `homework::load_read_session` → `identity::require_ucloud_session`；凭据只从 `credentials.json` 读取（username + 非空密码 + role + session revision），不读取账号环境变量。已验证 session 需要 role；roleless/旧凭据在本地退 auth 3，不会创建或重写 session。`submit` 的预演与确认写路径也走 `load_read_session`：确认门禁通过后按上面的两条生产路由上传并提交一次；无会话时与预演同样停在 auth 3，不创建 session。`download` 已接 handler、`load_read_session` 与生产路由；它下载时只发 `User-Agent`，不发送 token/Cookie。成功提交但未跑 `--no-verify` 时 helper 仍返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`；提交后的自动核验仍未接上本批的 `verify` helper。
 
 结果里不序列化 detail 原始对象或 session 结构；接受的 `upstream.msg` 和错误文本在输出边界统一脱敏，`Session` 不实现 `Debug`。新增 fixture `homework_submit_echo_token.json` 让上游回显合成 token，供后续进程级 seam 复用；当前对应边界测试已在源内通过。
 

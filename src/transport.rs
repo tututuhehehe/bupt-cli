@@ -25,6 +25,8 @@ const CONNECT_TIMEOUT_SECONDS: u64 = 10;
 
 /// Exchange exactly one request. Retry, authentication, and redirect decisions
 /// belong to the service calling this trait, not the network adapter.
+pub(crate) const HOMEWORK_MULTIPART_BOUNDARY: &str = "----bupt-cli-boundary";
+
 pub(crate) trait Transport {
     fn send(&mut self, request: Request) -> CliResult<Response>;
 }

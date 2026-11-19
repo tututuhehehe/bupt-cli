@@ -7,8 +7,8 @@
 //! streamed file reads; do not treat this renderer as production encoding.
 
 use super::detail;
+use super::load_read_session;
 use super::read::Session;
-use super::{load_read_session, require_credentials};
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::transport::{Request, Response, Transport};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 const UCLOUD_API: &str = "https://apiucloud.bupt.edu.cn";
 const UPLOAD_PATH: &str = "/blade-source/resource/upload/biz";
 const SUBMIT_PATH: &str = "/ykt-site/work/submit";
-const MULTIPART_BOUNDARY: &str = "----bupt-cli-boundary";
+use crate::transport::HOMEWORK_MULTIPART_BOUNDARY as MULTIPART_BOUNDARY;
 
 pub(super) fn command() -> Command {
     Command::new("submit")
-        .about("Preview an assignment submission (uploads and submissions not enabled)")
+        .about("Upload files/text and submit an assignment (gated)")
         .arg(Arg::new("id").value_name("ID").required(true))
         .arg(
             Arg::new("file")
@@ -69,12 +69,8 @@ pub(super) fn command() -> Command {
 pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     let request = SubmitRequest::from_matches(matches)?;
     request.ensure_gate()?;
-    // The production CLI can preview the plan, but cannot reach the
-    // fixture-only upload and submission flow, even with confirmation.
-    if !request.dry_run {
-        require_credentials(context)?;
-        return Err(super::unsupported("homework submit wiring"));
-    }
+    // The preview and the confirmed write share the read session; only the
+    // confirmation flag decides whether the upload and submit requests run.
     let session = load_read_session(context)?;
     execute_submit(&request, &session, context.transport)
 }

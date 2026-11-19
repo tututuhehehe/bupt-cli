@@ -291,7 +291,7 @@ fn homework_subcommands_accept_documented_flags_before_credentials() {
 
 #[cfg(unix)]
 #[test]
-fn submit_preview_uses_the_read_session_and_confirmed_writes_remain_disabled() {
+fn submit_preview_and_confirmed_submit_both_stop_at_the_read_session_without_writes() {
     use std::os::unix::fs::PermissionsExt;
 
     let sandbox = Sandbox::new();
@@ -308,7 +308,10 @@ fn submit_preview_uses_the_read_session_and_confirmed_writes_remain_disabled() {
     assert_error(&sandbox.run(&preview), 3, "auth");
     let mut confirmed = base.to_vec();
     confirmed.push("--i-confirm-submit");
-    assert_error(&sandbox.run(&confirmed), 5, "upstream");
+    // A confirmed submit now reaches the same read-session boundary; without
+    // a cached UCloud session it stops with auth instead of attempting any
+    // upload or submit, and never writes session state.
+    assert_error(&sandbox.run(&confirmed), 3, "auth");
     assert!(!sandbox.root().join("cache/session.json").exists());
 }
 

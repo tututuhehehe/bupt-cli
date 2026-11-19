@@ -10,6 +10,8 @@ use url::Url;
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_HEADERS: usize = 64 * 1024;
+const MAX_UPLOAD_BYTES: usize = 8 * 1024 * 1024 + 4096;
+const MAX_SUBMIT_BYTES: usize = 512 * 1024;
 use super::electricity_scope::{self, LANDING as ELECTRICITY_LANDING};
 const ANONYMOUS_PORTAL_PROBE: &str =
     "http://my.bupt.edu.cn/list.jsp?totalpage=30&PAGENUM=0&urltype=tree.TreeTempUrl&wbtreeid=1154";
@@ -24,6 +26,8 @@ enum Route {
     UcloudRead,
     UcloudHomeworkList,
     UcloudAttachment,
+    UcloudUpload,
+    UcloudSubmit,
     ElectricityLanding,
     ElectricitySignIn,
     ElectricityRead(&'static [&'static str]),
@@ -65,6 +69,18 @@ fn exchange_with_policy(
         curl_config(request)?
     };
     let mut args = base_curl_arguments(timeout);
+    // A homework upload body is binary multipart: it is staged to a private
+    // temporary file and passed as `--data-binary @path`, never through
+    // argv content or the curl configuration text.
+    let mut upload_body = None;
+    if !probe && route(request).is_some_and(|tag| matches!(tag, Route::UcloudUpload)) {
+        let staged = stage_upload_body(&request.body)?;
+        args.extend([
+            "--data-binary".into(),
+            format!("@{}", staged.path().display()).into(),
+        ]);
+        upload_body = Some(staged);
+    }
     if probe && request.url == ANONYMOUS_PORTAL_PROBE {
         let proto = args
             .iter()
@@ -74,6 +90,7 @@ fn exchange_with_policy(
     }
     args.extend(["--config".into(), "-".into()]);
     let output = exec.exec(&args, &input).map_err(|_| network_failure())?;
+    drop(upload_body);
     if !output.success {
         return Err(network_failure());
     }
@@ -98,18 +115,33 @@ fn curl_probe_config(request: &Request) -> CliResult<Vec<u8>> {
 }
 
 fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<Vec<u8>> {
-    let body = std::str::from_utf8(&request.body).map_err(|_| rejected())?;
+    if matches!(route, Route::UcloudUpload) {
+        return upload_config(request);
+    }
     let requires_body = matches!(
         route,
         Route::CasForm
             | Route::UcloudToken
+            | Route::UcloudSubmit
             | Route::UcloudHomeworkList
             | Route::ElectricityRead(_)
             | Route::MobileLogin
     );
-    if body.len() > MAX_REQUEST
-        || body.is_empty() == requires_body
-        || !body.bytes().all(|b| matches!(b, 0x21..=0x7e))
+    // Bodies reaching this point are printable ASCII (the JSON submission
+    // body is validated separately and never contains control characters).
+    let body = match std::str::from_utf8(&request.body) {
+        Ok(body) if !matches!(route, Route::UcloudSubmit) => body,
+        _ => "",
+    };
+    if !matches!(route, Route::UcloudSubmit)
+        && (body.len() > MAX_REQUEST
+            || body.is_empty() == requires_body
+            || !body.bytes().all(|b| matches!(b, 0x21..=0x7e)))
+    {
+        return Err(rejected());
+    }
+    if matches!(route, Route::UcloudSubmit)
+        && (request.body.len() > MAX_SUBMIT_BYTES || !valid_submit_body(&request.body))
     {
         return Err(rejected());
     }
@@ -173,9 +205,106 @@ fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<V
     }
     if requires_body {
         option(&mut options, "header", "Expect:");
-        option(&mut options, "data-raw", body);
+        if matches!(route, Route::UcloudSubmit) {
+            let text = std::str::from_utf8(&request.body).map_err(|_| rejected())?;
+            option(&mut options, "data-raw", text);
+        } else {
+            option(&mut options, "data-raw", body);
+        }
     }
     Ok(options.into_bytes())
+}
+
+/// Build the curl configuration for one homework upload. The multipart body
+/// is binary, so it is staged to a private temporary file and passed with
+/// `--data-binary @path` instead of ever entering argv or the config text.
+fn upload_config(request: &Request) -> CliResult<Vec<u8>> {
+    let boundary = super::HOMEWORK_MULTIPART_BOUNDARY;
+    let opening = format!("--{boundary}\r\n");
+    let closing = format!("\r\n--{boundary}--\r\n");
+    let body = &request.body;
+    let opening_bytes = opening.as_bytes();
+    let openings = (0..=body.len().saturating_sub(opening_bytes.len()))
+        .filter(|&at| &body[at..at + opening_bytes.len()] == opening_bytes)
+        .count();
+    if body.len() > MAX_UPLOAD_BYTES
+        || openings != 3
+        || !body.starts_with(opening.as_bytes())
+        || !body.ends_with(closing.as_bytes())
+        || !body
+            .windows(b"name=\"file\"".len())
+            .any(|window| window == b"name=\"file\"")
+    {
+        return Err(rejected());
+    }
+    let mut options = String::from("include\n");
+    option(&mut options, "url", &request.url);
+    option(&mut options, "request", request.method);
+    let mut seen = Vec::new();
+    for (name, value) in &request.headers {
+        let key = name.to_ascii_lowercase();
+        if !allowed_header(Route::UcloudUpload, &key)
+            || seen.contains(&key)
+            || !value.bytes().all(|byte| matches!(byte, 0x20..=0x7e))
+        {
+            return Err(rejected());
+        }
+        seen.push(key);
+        option(&mut options, "header", &format!("{name}: {value}"));
+    }
+    if !has_header(
+        request,
+        "content-type",
+        &format!("multipart/form-data; boundary={boundary}"),
+    ) || seen.len() != 4
+    {
+        return Err(rejected());
+    }
+    Ok(options.into_bytes())
+}
+
+/// Stage the upload body in a private temporary file; it is removed as soon
+/// as curl has consumed it. Never returns the path through error text.
+fn stage_upload_body(body: &[u8]) -> CliResult<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix("bupt-upload-")
+        .rand_bytes(6)
+        .tempfile_in(std::env::temp_dir())
+        .map_err(|_| rejected())?;
+    file.write_all(body).map_err(|_| rejected())?;
+    file.flush().map_err(|_| rejected())?;
+    Ok(file)
+}
+
+/// The fixed submission payload shape; mirrors `homework::submit`.
+fn valid_submit_body(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let string = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+    object.len() == 7
+        && object
+            .get("assignmentType")
+            .and_then(serde_json::Value::as_i64)
+            == Some(0)
+        && string("assignmentId").is_some_and(|text| !text.is_empty() && text.len() <= 64)
+        && string("assignmentContent").is_some_and(|text| text.chars().count() <= 100_000)
+        && string("userId").is_some_and(|text| !text.is_empty() && text.len() <= 64)
+        && string("groupId") == Some("")
+        && string("commitId") == Some("")
+        && object.get("attachmentIds").is_some_and(|ids| {
+            ids.as_array().is_some_and(|items| {
+                items.len() <= 128
+                    && items.iter().all(|id| {
+                        id.as_str()
+                            .is_some_and(|text| !text.is_empty() && text.len() <= 256)
+                    })
+            })
+        })
 }
 
 fn route(request: &Request) -> Option<Route> {
@@ -235,6 +364,14 @@ fn route(request: &Request) -> Option<Route> {
             | "/ykt-site/work/submit-view"
             | "/blade-source/resource/preview-url",
         ) => Some(Route::UcloudRead),
+        ("apiucloud.bupt.edu.cn", "POST", "/blade-source/resource/upload/biz")
+            if parsed.query().is_none() =>
+        {
+            Some(Route::UcloudUpload)
+        }
+        ("apiucloud.bupt.edu.cn", "POST", "/ykt-site/work/submit") if parsed.query().is_none() => {
+            Some(Route::UcloudSubmit)
+        }
         ("apiucloud.bupt.edu.cn", "POST", "/ykt-site/work/student/list")
             if parsed.query().is_none() =>
         {
@@ -318,7 +455,7 @@ fn probe_route(request: &Request) -> Option<Route> {
             {
                 None
             }
-            Route::GraduateRead => None,
+            Route::UcloudUpload | Route::UcloudSubmit | Route::GraduateRead => None,
             _ => Some(route),
         };
     }
@@ -418,6 +555,10 @@ fn allowed_header(route: Route, name: &str) -> bool {
                     "authorization" | "tenant-id" | "blade-auth" | "accept"
                 ) || (matches!(route, Route::UcloudHomeworkList) && name == "content-type")
             }
+            Route::UcloudUpload | Route::UcloudSubmit => matches!(
+                name,
+                "blade-auth" | "tenant-id" | "authorization" | "content-type"
+            ),
         }
 }
 
@@ -732,6 +873,190 @@ mod tests {
             curl_probe_config(&request).is_err(),
             "public mobile login GET is anonymous"
         );
+    }
+
+    #[test]
+    #[test]
+    fn homework_upload_is_staged_to_a_private_file_and_only_our_shape_is_accepted() {
+        use std::sync::Mutex;
+        const UPLOAD: &str = "https://apiucloud.bupt.edu.cn/blade-source/resource/upload/biz";
+        let boundary = super::super::HOMEWORK_MULTIPART_BOUNDARY;
+        let body: Vec<u8> = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"userId\"\r\n\r\nu1\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"bizType\"\r\n\r\n3\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\nPAYLOAD\r\n--{boundary}--\r\n"
+        )
+        .into_bytes();
+        fn upload_request(url: &str, headers: Vec<(String, String)>, body: &[u8]) -> Request {
+            Request {
+                method: "POST",
+                url: url.into(),
+                headers,
+                body: body.to_vec(),
+            }
+        }
+        let headers = || {
+            vec![
+                ("Blade-Auth".into(), "TEST-ONLY".into()),
+                ("Tenant-Id".into(), "000000".into()),
+                (
+                    "Authorization".into(),
+                    "Basic c3dvcmQ6c3dvcmRfc2VjcmV0".into(),
+                ),
+                (
+                    "Content-Type".into(),
+                    format!("multipart/form-data; boundary={boundary}"),
+                ),
+            ]
+        };
+        let request = upload_request(UPLOAD, headers(), &body);
+        assert!(curl_config(&request).is_ok());
+        assert!(curl_probe_config(&request).is_err());
+
+        struct Journal(Mutex<Vec<(Vec<std::ffi::OsString>, Vec<u8>)>>);
+        impl CurlExec for Journal {
+            fn exec(
+                &mut self,
+                args: &[std::ffi::OsString],
+                stdin: &[u8],
+            ) -> CliResult<super::super::CurlOutput> {
+                let position = args
+                    .iter()
+                    .position(|arg| arg == "--data-binary")
+                    .expect("upload uses --data-binary");
+                let raw = args[position + 1].to_string_lossy().into_owned();
+                let path = std::path::PathBuf::from(raw.strip_prefix('@').expect("path arg"));
+                let staged = std::fs::read(&path).expect("the staged body exists during exec");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                    assert_eq!(mode & 0o777, 0o600, "the staged body is user-private");
+                }
+                self.0.lock().unwrap().push((args.to_vec(), staged));
+                let config = String::from_utf8_lossy(stdin);
+                assert!(!config.contains("data-"));
+                assert!(!config.contains("PAYLOAD"));
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| arg.to_string_lossy().contains("PAYLOAD"))
+                );
+                Ok(super::super::CurlOutput {
+                    stdout: b"HTTP/2 200\r\n\r\n{\"success\":true}".to_vec(),
+                    success: true,
+                })
+            }
+        }
+        let mut journal = Journal(Mutex::new(Vec::new()));
+        let response = exchange(&mut journal, Duration::from_secs(1), &request).unwrap();
+        assert_eq!(response.status, 200);
+        let journal = journal.0.into_inner().unwrap();
+        let (args, staged) = &journal[0];
+        assert_eq!(staged, &body);
+        let position = args
+            .iter()
+            .position(|arg| arg == "--data-binary")
+            .expect("data-binary arg");
+        let path = std::path::PathBuf::from(
+            args[position + 1]
+                .to_string_lossy()
+                .strip_prefix('@')
+                .unwrap()
+                .to_string(),
+        );
+        assert!(
+            !path.exists(),
+            "the staged body is removed after the exchange"
+        );
+
+        for (url, headers, body) in [
+            (UPLOAD, headers(), &body[..body.len() - 2]),
+            (
+                UPLOAD,
+                {
+                    let mut other = headers();
+                    other[3].1 = "multipart/form-data; boundary=other".into();
+                    other
+                },
+                &body[..],
+            ),
+            (
+                UPLOAD,
+                vec![("Blade-Auth".into(), "TEST-ONLY".into())],
+                &body[..],
+            ),
+            (&format!("{UPLOAD}?extra=1"), headers(), &body[..]),
+        ] {
+            let invalid = upload_request(url, headers, body);
+            assert!(curl_config(&invalid).is_err(), "accepted an invalid upload");
+        }
+    }
+
+    fn homework_submit_body_is_validated_and_never_probed() {
+        const SUBMIT: &str = "https://apiucloud.bupt.edu.cn/ykt-site/work/submit";
+        let headers = vec![
+            ("Blade-Auth".into(), "TEST-ONLY".into()),
+            ("Tenant-Id".into(), "000000".into()),
+            (
+                "Authorization".into(),
+                "Basic c3dvcmQ6c3dvcmRfc2VjcmV0".into(),
+            ),
+            ("Content-Type".into(), "application/json".into()),
+        ];
+        let body = r#"{"assignmentId":"1","assignmentType":0,"assignmentContent":"作业内容","attachmentIds":["r1"],"userId":"u1","groupId":"","commitId":""}"#.as_bytes().to_vec();
+        fn submit_request(url: &str, headers: Vec<(String, String)>, body: &[u8]) -> Request {
+            Request {
+                method: "POST",
+                url: url.into(),
+                headers,
+                body: body.to_vec(),
+            }
+        }
+        let request = submit_request(SUBMIT, headers.clone(), &body);
+        assert!(curl_config(&request).is_ok());
+        assert!(curl_probe_config(&request).is_err());
+        let config = String::from_utf8(curl_config(&request).unwrap()).unwrap();
+        assert!(config.contains("data-raw"));
+
+        for invalid in [
+            br#"{"assignmentId":"1"}"#.to_vec(),
+            br#"{"assignmentId":"1","assignmentType":1,"assignmentContent":"","attachmentIds":[],"userId":"u1","groupId":"","commitId":""}"#.to_vec(),
+            br#"{"assignmentId":"","assignmentType":0,"assignmentContent":"","attachmentIds":[],"userId":"u1","groupId":"","commitId":""}"#.to_vec(),
+            br#"{"assignmentId":"1","assignmentType":0,"assignmentContent":"","attachmentIds":[],"userId":"u1","groupId":"g","commitId":""}"#.to_vec(),
+            br#"{"assignmentId":"1","assignmentType":0,"assignmentContent":"","attachmentIds":[""],"userId":"u1","groupId":"","commitId":""}"#.to_vec(),
+            br#"not json"#.to_vec(),
+        ] {
+            let bad = submit_request(SUBMIT, headers.clone(), &invalid);
+            assert!(curl_config(&bad).is_err(), "accepted an invalid submit body");
+        }
+        let oversized = format!(
+            "{{\"assignmentId\":\"1\",\"assignmentType\":0,\"assignmentContent\":\"{}\",\"attachmentIds\":[],\"userId\":\"u1\",\"groupId\":\"\",\"commitId\":\"\"}}",
+            "x".repeat(200_000)
+        );
+        assert!(
+            curl_config(&submit_request(
+                SUBMIT,
+                headers.clone(),
+                oversized.as_bytes()
+            ))
+            .is_err()
+        );
+        let wrong_type = submit_request(
+            SUBMIT,
+            vec![
+                ("Blade-Auth".into(), "TEST-ONLY".into()),
+                ("Tenant-Id".into(), "000000".into()),
+                (
+                    "Authorization".into(),
+                    "Basic c3dvcmQ6c3dvcmRfc2VjcmV0".into(),
+                ),
+                ("Content-Type".into(), "text/plain".into()),
+            ],
+            &body,
+        );
+        assert!(curl_config(&wrong_type).is_err());
     }
 
     #[test]
