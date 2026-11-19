@@ -3,7 +3,9 @@ use crate::identity;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 mod dorm;
+mod electricity;
 mod library;
+mod portal;
 
 pub(crate) fn commands() -> Vec<Command> {
     vec![
@@ -211,6 +213,8 @@ fn run_electricity(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult
     let dorm = dorm::resolve_dorm(&flags, &dorm::dorm_env(), &context.config_dir)?;
     let _floor = dorm.floor.as_deref();
     let _source = dorm.source;
+    // The room/floor resolver and authenticated transport are not connected
+    // yet. Response/CLI mapping lives in electricity.rs and is tested offline.
     Err(session_unavailable(
         context,
         &format!("electricity {} {}", dorm.building.name, dorm.room),
@@ -223,54 +227,22 @@ fn run_notices(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Out
             .get_one::<String>("url")
             .map(String::as_str)
             .unwrap_or("");
-        if url.trim().is_empty() {
-            return Err(CliError::new(
-                2,
-                "usage",
-                "notices show URL must not be empty",
-                "pass a notice URL from `bupt notices`",
-            ));
-        }
-        // Pending portal adapter: validate the allowed destination and never
-        // attach campus credentials to an arbitrary notice URL.
+        // Reject other destinations before loading any credentials or session.
+        portal::validate_notice_url(url)?;
+        // The authenticated portal transport remains pending campus verification.
         let _max_chars = *arguments
             .get_one::<usize>("max-chars")
             .expect("max-chars has a default");
         return Err(session_unavailable(context, "notices show"));
     }
 
-    let _types = notice_types(matches.get_one::<String>("type"))?;
+    let _types = portal::resolve_types(matches.get_one::<String>("type").map(String::as_str))?;
     let _count = *matches
         .get_one::<u64>("count")
         .expect("count has a default");
+    // Pending portal session adapter: it supplies `portal::fetch_notices` with
+    // a Transport that carries the campus session over the decided scheme.
     Err(session_unavailable(context, "notices"))
-}
-
-fn notice_types(value: Option<&String>) -> CliResult<Option<Vec<String>>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let mut resolved = Vec::new();
-    for raw in value.split(',') {
-        let key = raw.trim().to_ascii_lowercase();
-        if key.is_empty() {
-            continue;
-        }
-        if !matches!(key.as_str(), "notice" | "news" | "rules" | "ways") {
-            return Err(CliError::new(
-                2,
-                "usage",
-                format!("unknown notice type '{key}'"),
-                "choose from notice, news, rules, ways",
-            ));
-        }
-        resolved.push(key);
-    }
-    Ok(if resolved.is_empty() {
-        None
-    } else {
-        Some(resolved)
-    })
 }
 
 fn run_card(context: &mut Context<'_>) -> CliResult<Outcome> {
