@@ -289,6 +289,29 @@ fn homework_subcommands_accept_documented_flags_before_credentials() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn submit_preview_uses_the_read_session_and_confirmed_writes_remain_disabled() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let credentials = sandbox.root().join("config/credentials.json");
+    fs::write(
+        &credentials,
+        r#"{"username":"2026000097","password":"TEST-ONLY","role":"graduate"}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&credentials, fs::Permissions::from_mode(0o600)).unwrap();
+    let base = ["homework", "submit", ASSIGNMENT_ID, "--text", "synthetic"];
+    let mut preview = base.to_vec();
+    preview.push("--dry-run");
+    assert_error(&sandbox.run(&preview), 3, "auth");
+    let mut confirmed = base.to_vec();
+    confirmed.push("--i-confirm-submit");
+    assert_error(&sandbox.run(&confirmed), 5, "upstream");
+    assert!(!sandbox.root().join("cache/session.json").exists());
+}
+
 #[test]
 fn submit_without_confirmation_is_usage_before_credentials() {
     let sandbox = Sandbox::new();

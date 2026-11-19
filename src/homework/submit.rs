@@ -7,8 +7,8 @@
 //! streamed file reads; do not treat this renderer as production encoding.
 
 use super::detail;
-use super::load_session;
 use super::read::Session;
+use super::{load_read_session, require_credentials};
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::transport::{Request, Response, Transport};
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -23,7 +23,7 @@ const MULTIPART_BOUNDARY: &str = "----bupt-cli-boundary";
 
 pub(super) fn command() -> Command {
     Command::new("submit")
-        .about("Upload files/text and submit an assignment (gated)")
+        .about("Preview an assignment submission (uploads and submissions not enabled)")
         .arg(Arg::new("id").value_name("ID").required(true))
         .arg(
             Arg::new("file")
@@ -69,7 +69,13 @@ pub(super) fn command() -> Command {
 pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     let request = SubmitRequest::from_matches(matches)?;
     request.ensure_gate()?;
-    let session = load_session(context)?;
+    // The production CLI can preview the plan, but cannot reach the
+    // fixture-only upload and submission flow, even with confirmation.
+    if !request.dry_run {
+        require_credentials(context)?;
+        return Err(super::unsupported("homework submit wiring"));
+    }
+    let session = load_read_session(context)?;
     execute_submit(&request, &session, context.transport)
 }
 
@@ -225,8 +231,8 @@ enum ResultCode {
     Invalid,
 }
 
-/// Transport-injected submit flow. Tests use `Scripted` to assert the exact
-/// upload/submit journal; the CLI cannot reach it until `load_session` is wired.
+/// Only preview reaches this function in production. Tests use `Scripted`
+/// to verify the preview reads and the synthetic upload/submit journal.
 fn execute_submit(
     request: &SubmitRequest,
     session: &Session,

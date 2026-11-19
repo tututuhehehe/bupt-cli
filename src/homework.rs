@@ -269,10 +269,3 @@ fn load_read_session(context: &mut Context<'_>) -> CliResult<read::Session> {
 pub(super) fn require_credentials(context: &Context<'_>) -> CliResult<()> {
     identity::require_authenticated_profile(&context.config_dir).map(|_| ())
 }
-
-/// The submit write path stays behind its confirmation gate and is not wired
-/// to a transport in this batch. Read commands use `load_read_session`.
-pub(in crate::homework) fn load_session(context: &Context<'_>) -> CliResult<read::Session> {
-    require_credentials(context)?;
-    Err(unsupported("homework submit wiring"))
-}

@@ -112,8 +112,11 @@ fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
             | "notices"
             | "card"
     ) || (name == "homework"
-        && match arguments.subcommand_name() {
-            Some("show" | "verify" | "download") => true,
+        && match arguments.subcommand() {
+            Some(("show" | "verify" | "download", _)) => true,
+            Some(("submit", submit)) => {
+                submit.get_flag("dry_run") && !submit.get_flag("i_confirm_submit")
+            }
             // Every parent-level list mode is now read-only and routed:
             // default/all, --course, --undone, and --new.
             None => true,
@@ -447,6 +450,22 @@ mod tests {
             (&["bupt", "homework", "verify", "1"][..], true),
             (&["bupt", "homework", "--new", "7"][..], true),
             (&["bupt", "homework", "submit", "1"][..], false),
+            (&["bupt", "homework", "submit", "1", "--dry-run"][..], true),
+            (
+                &["bupt", "homework", "submit", "1", "--i-confirm-submit"][..],
+                false,
+            ),
+            (
+                &[
+                    "bupt",
+                    "homework",
+                    "submit",
+                    "1",
+                    "--dry-run",
+                    "--i-confirm-submit",
+                ][..],
+                false,
+            ),
             (&["bupt", "homework", "download", "1"][..], true),
             (&["bupt", "electricity", "buildings"][..], true),
             (&["bupt", "schedule", "update"][..], true),
