@@ -7,11 +7,13 @@
 - `tests/test_homework_show.py`
 - `tests/test_verify.py`
 
-测试分三层（源内单元层按 read / detail / show / verify / submit / text 拆分）：
+测试分层（源内单元层按 read / detail / show / verify / new / download / submit / text 拆分）：
 
 - `tests/contract_homework.rs`：当前**可运行**的公开进程 CLI 契约用例，只使用共享 `Sandbox`（隔离家目录/配置/缓存）。覆盖解析器、无凭据鉴权边界、参数门禁，不访问上游。
 - `src/homework/read.rs` 的 `#[cfg(test)]` 单元用例：当前**可运行**的只读进程内缝，使用共享 `transport::testing::Scripted` 和合成 session。覆盖课程分页/去重/终止、默认 all 与 `--course` 作业分页、作业字段映射/排序/过滤/`--limit`、undone 映射、空 undone、未授权/畸形响应和缺 `user_id`；不读取真实凭据，不回退到网络。公开 `courses` / 默认列表 / `show` / `verify` 已改用真实 `identity::require_ucloud_session` 接线。
-- `src/homework/detail.rs` 的 `#[cfg(test)]` 单元用例：共享的详情 / submit-view / 学生列表 / 附件 / preview filename 解析。`show`、`verify` 与 `submit` 的提交前读取都走这一层，避免三套字段和错误语义漂移。
+- `src/homework/detail.rs` 的 `#[cfg(test)]` 单元用例：共享的详情 / submit-view / 学生列表 / 附件 / preview filename 解析。`show`、`verify`、`download` 与 `submit` 的详情读取都走这一层，避免多套字段和错误语义漂移。
+- `src/homework/new.rs` 的 `#[cfg(test)]` 单元用例：`--new` 的列表发布时间、30 次详情预算、失败不消耗预算、auth 传播、note/`unknown_publish_time`/`truncated` 和发布时间倒序；使用合成 session + `Scripted`，不读真实凭据。
+- `src/homework/download.rs` 的 `#[cfg(test)]` 单元用例：保存目录、`--force`、无 URL 跳过、文件名/路径清洗、绝对 HTTPS 源与重定向 allowlist、下载请求不携带 token/Cookie、临时文件原子落盘和失败不覆盖旧文件；临时目录 + `Scripted`，不访问真实 CDN。
 - `src/homework/show.rs` 的 `#[cfg(test)]` 单元用例：组装 `homework show` 的详情、submit-view、附件 URL、学生列表提交时间和状态；所有失败路径都证明零 upload/submit。
 - `src/homework/verify.rs` 的 `#[cfg(test)]` 单元用例：纯校验算法（注入 `VerifyReader`、sleep）与命令级只读路径；覆盖附件集合、正文归一化、失败 / 错误退出语义和零写入。
 - `src/homework/submit.rs` 的 `#[cfg(test)]` 单元用例：当前**可运行**的进程内缝，使用共享 `transport::testing::Scripted`、合成 session 和临时文件。覆盖提交门禁、零次/一次/未知 upload/submit 结果和确认回执分类；不读取真实凭据，不回退到网络。命令规格与本地校验保留在较小的 `src/homework.rs`。
@@ -35,8 +37,8 @@
 | `environment_only_credentials_are_ignored` | 只有合成 `BUPT_USERNAME` / `BUPT_PASSWORD` / `BUPT_ROLE`、没有 `credentials.json` 时仍为 auth 3；账号环境变量不构成登录 |
 | `malformed_saved_credentials_are_an_auth_error` | 损坏的 `credentials.json` 报 auth 3，提示指向登录，不回显文件内容 |
 | `legacy_roleless_credentials_cannot_prove_a_verified_login` | 只有 username + password、没有 role 的旧凭据不能打开已验证 session（auth 3），且不创建 `cache/session.json` |
-| `read_commands_reach_the_verified_session_boundary` | 同一份 roleless 凭据下，`courses`、默认 `homework`、`--undone`、`--course`、`--limit`、`--new`、`show`、`verify` 都进入已验证 session 边界（auth 3）；其中 `show` / `verify` 已不再是 unsupported |
-| `deferred_new_filter_stops_before_network` | 有 role 的合成凭据 + `--new 7` 仍退 upstream 5，不创建 session，证明 `--new` 延期而非静默降级 |
+| `read_commands_reach_the_verified_session_boundary` | 同一份 roleless 凭据下，`courses`、默认 `homework`、`--undone`、`--course`、`--limit`、`--new`、`show`、`verify`、`download` 都进入已验证 session 边界（auth 3）；其中 `show` / `verify` / `download` 已不再是 unsupported |
+| `new_filter_reaches_the_verified_session_boundary` | 有 role 的合成凭据 + `--new 7` 现在进入已验证 session 边界（回退为 auth 3，缺少缓存 session），不再提前退 unsupported；证明 `--new` 已接线 |
 | `homework_defaults_to_the_list_command` | 无凭据时 `homework` 已进入会话层（auth，退出 3），不是“需要子命令” |
 | `explicit_homework_list_alias_is_rejected_as_usage` | `homework list` 在凭据/网络前退 2 |
 | `default_homework_accepts_the_list_flags` | 默认列表接受 `--undone` / `--limit` / `--course` / `--new`（继续到 auth 层） |
@@ -87,6 +89,7 @@
 | `homework_list_without_user_id_fails_before_transport` | 默认 all 和 `--course` 在缺 `user_id` 时退 auth 3，transport 零调用 |
 | `homework_list_auth_and_malformed_pages_fail_without_retry` | 学生列表 401 退 auth 3 且只请求一次；缺 records、坏 records、坏 total 退 parse 5 |
 | `undone_cli_output_sorts_deduplicates_and_preserves_null_values` | undone 输出排序、去重、缺失 `hours_remaining` 为 null、overdue/pending 三态 |
+| `timestamp_parser_accepts_python_date_and_iso_shapes` | 日期、带/不带小数秒、`T`/`Z`/时区偏移与非法/哨兵值 |
 
 与 Python `cmd_courses` 对齐的分页规则：`size=50`、最多 10 页、按页序拼接、只对非空 `siteId` 去重、空页/短页/整页无新 id 时停止。`get_courses` 本身不按 `total` 终止，但 Python 解析器会拒绝畸形 total，这里同样校验。课程 `siteId` / `siteName` 按 Python `_first_present(record, ...) or ""` 映射：显式 `0`/`false` 是 present，随后变成空值，**不能**被通用的 `id` / `className` 回退替换；只有 `null` 或空字符串继续尝试下一个键。
 
@@ -99,11 +102,11 @@
 - 列表先按非空 `activityId` 去重（空 id 全部保留），再按 `--course` / `--undone` 过滤，按截止时间升序（无截止时间排最后，再按标题），最后应用 `--limit`（0 = 全部）。
 - 输出沿用 Python `assignment_dict`：`id/title/course/course_id/published_at/deadline/begin_time/status/submitted/submitted_at/score/hours_remaining/overdue`，并带 `count/method/filters`。`published_at` 先查列表行的 `assignmentBeginTime`、`beginTime`、`publishTime` 等键，再回退 `begin_time`；取不到就是 null。
 - `method` 为 `all` / `course` / `undone`；`--course --undone` 的 `method` 仍是 `course`。
-- `--new DAYS` 本批**未接线**：正常列表已能输出列表行自带的 `published_at`，但详情补查、30 次预算、`failed`/`unknown`/`unknown_publish_time`、note、按发布时间倒序和 `truncated` 都尚未实现；当前在本地凭据检查后直接退 upstream 5，不发起网络请求。
+- `--new DAYS` 已接线，按 Python `_resolve_publish_times` 实现：先对 `--course` / `--undone` 过滤后的候选处理；列表行已有发布时间直接使用，不查详情；缺失行按 Python 的逆序截止时间顺序（无截止时间排前，保持 Python 稳定排序细节）花最多 30 次详情 GET，成功消耗预算，失败计入 `failed` 但不消耗预算；auth 错误直接传播 auth 3，不伪装 unknown。输出 `publish_time{looked_up,resolved,unknown,failed,lookup_limit}`、`unknown_publish_time`（候选顺序）、`note`、按发布时间倒序的 assignments，窗口外/无法定日期的行不返回；`--limit` 截断时输出 `truncated:true`。`published_at` 优先列表时间，缺失时使用详情 `assignmentBeginTime`/`publishTime`/`createTime`。空上游、过滤后为空、窗口为空分别有可区分的 note；note 的“没有落在时间窗口内”按 Python 原样在 `resolved > 0 && unknown == 0` 时追加。
 
 错误分层按 Python `errors.from_campus_error` 的公开行为切分：`transport.send` 的 network failure 保持 4；实际 HTTP 401/403 退鉴权 3；实际 HTTP 4xx/5xx（含 503）退 upstream 5；两者都只请求一次、不重试。JSON API envelope 的 `code` 非 0/200 走另一条基线（`_request` 抛 `CampusNetworkError`），仍退网络 4，不因 envelope code 是 5xx 就升级为 upstream 5。
 
-与 Python `get_undone` 对齐的映射规则：GET `/ykt-site/site/student/undone?userId=...`，`activityId`/`id` 与 `activityName`/`assignmentTitle` 依次回退，`siteId=0` 视为缺失，`is_submitted` 固定 false，`siteNum` / `undoneNum` 默认值分别为 0 / 列表长度。undone 的回退语义保持不变。**课程富化暂不实现**：真实非空 undone 可能出现 `siteId=-1` 和空 `siteName`，Python 的 `_enrich_undone_courses` 需要再扫全部课程作业并按 activity id 回填；本批没有真实非空 undone 证据，也没有接上 `get_all_homework`，因此明确延期，不声称 parity，`-1` 与空名称保持原样。
+与 Python `get_undone` 对齐的映射规则：GET `/ykt-site/site/student/undone?userId=...`，`activityId`/`id` 与 `activityName`/`assignmentTitle` 依次回退，`siteId=0` 视为缺失，`is_submitted` 固定 false，`siteNum` / `undoneNum` 默认值分别为 0 / 列表长度。undone 的回退语义保持不变。**课程富化暂不实现**：真实非空 undone 可能出现 `siteId=-1` 和空 `siteName`，Python 的 `_enrich_undone_courses` 需要再扫全部课程作业并按 activity id 回填；本批没有真实非空 undone 证据，`_enrich_undone_courses` 的调用仍未接线，因此明确延期，不声称 parity，`-1` 与空名称保持原样。
 
 Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust 这里没有身份 lane 的续期适配器，因此只请求一次并退鉴权 3。重试/续期必须等真实 session 适配器接入后单独验证；当前“不循环”的行为已由测试固定。
 
@@ -113,10 +116,27 @@ Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust �
 
 `verify` 先用详情做 best-effort 课程名缩窄（失败则扫所有站点），然后每轮读 submit-view 和学生列表；默认两轮，第二轮前等待 5 秒（测试注入 0 秒 sleep）。附件集合只在传入 `--resource-id` 时严格比较；正文只在 `--text` 非空白时比较，并先做 HTML 去标签 + 空白归一化。最终状态取最后一轮：有 `failed` → 退出 6，只有 `error` → 退出 7，全通过 → 退出 0。submit-view 的 HTTP 401/403 在这里是校验 `error`（退出 7），不是命令级 auth 3；只有详情请求的 401/403 会被缩窄逻辑吞掉。`verified`、`submitted_at`、`verification.checks` 字段与 Python 保持同名；错误文本先脱敏再截断。所有路径都不发 upload/submit。
 
-`show`、`verify` 与 `submit` 的提交前 detail / submit-view 读取共用 `src/homework/detail.rs`；只有 `submit` 的 upload / submit 写入和回执分类留在 `submit.rs`。
-公开 CLI 的 `show::run` / `verify::run` 现在调用 `homework::load_read_session`，后者走 `identity::require_ucloud_session` 的已验证原生 session，不再返回 “session wiring 未实现”。但 `cli.rs::uses_campus_transport` 和 `transport/cas_wire.rs` 的 allowlist 仍由父会话/整合者维护；在这两处放开之前，正式二进制仍会给这些命令 `Offline`，所以本批的成功路径证据仍是进程内 helper 测试，真实校园网验收未运行。
+`show`、`verify`、`download` 与 `submit` 的详情读取共用 `src/homework/detail.rs`；只有 `submit` 的 upload / submit 写入和回执分类留在 `submit.rs`。公开 CLI 的 `show::run` / `verify::run` / `download::run` 都调用 `homework::load_read_session`，后者走 `identity::require_ucloud_session` 的已验证原生 session。base `621238f` 已把 `courses`、默认列表、`--undone`、`--course`、`show`、`verify` 及详情/preview/学生列表路由接入 `CampusCurl`；本批只额外放开了 `--new`（复用已允许的详情 GET），`download` 的 CDN 生产适配仍留给父会话。
 
-`show`、`verify` 与 `submit` 的提交前 detail / submit-view 读取共用 `src/homework/detail.rs`；只有 `submit` 的 upload / submit 写入和回执分类留在 `submit.rs`。
+### `download` 的保存与网络安全语义
+
+`homework download ID [--dir DIR] [--force]` 的公开 handler 已接到注入式 `context.transport`：
+
+- 先读详情，再对缺失 URL 的附件走 preview（best effort），然后逐附件处理。标题为空时用 `attachment-N`；文件名会替换 `/`、`\`、控制字符和 Windows 非法字符，去掉末尾空格/点，拒绝 `.`/`..`，并按 UTF-8 字节上限截断；结果只能是单个路径分量，写入前再校验 `dest.parent() == 已 canonicalize 的输出目录`。
+- `--dir` 支持 `~`/`~/...`；目录会 `create_dir_all` 后 canonicalize，输出绝对路径。`--dir ""` 视为当前目录。`--timeout` 仍是全局参数，下载与 API 读取共用。
+- 源 URL 必须是绝对 HTTPS、无 userinfo/fragment、无显式端口；host 只允许 `fileucloud.bupt.edu.cn`（任意路径，已知 `/ucloud/document/...`）或 `apiucloud.bupt.edu.cn` 的精确 `/blade-source/resource/download`。初始源不满足时直接退 upstream 5，不发请求、不写文件。
+- 重定向最多跟随 5 次；`Location` 可以是相对路径，但解析后的每一跳都要重新满足上述绝对 HTTPS allowlist，否则退 upstream 5。下载请求和重定向都不带 `Blade-Auth`、`Authorization`、`Cookie` 或 tenant header，只带兼容 UA。错误信息不包含签名 URL。
+- 每个文件先写入目标目录内的 `NamedTempFile`，完整写入并 flush 后才 `persist_noclobber`（无 `--force`）或 `persist`（`--force`）。下载失败、校验失败或持久化失败不会留下半份文件；`--force` 下载失败也不会覆盖旧文件。已存在且无 `--force` 的附件计入 `skipped.reason="exists"`（`path` 为目标路径），无 URL 计入 `"no_url"`（`path: null`，与 Python 一致）。
+- 输出沿用 Python：`assignment_id`、`title`、`dir`、`saved[{title,resource_id,path,size,url}]`、`skipped[{title,path,reason}]`、`count_saved`、`count_skipped`。`path`/`dir` 是 canonicalize 后的绝对路径。
+- **生产适配仍由父会话/整合者负责**：`cli.rs::uses_campus_transport` 目前仍不把 `download` 子命令选到 `CampusCurl`；`transport/cas_wire.rs` 也未允许 `fileucloud.bupt.edu.cn`。本批只在进程内用 `Scripted` 验证 handler。生产需要新增窄路由：GET `https://fileucloud.bupt.edu.cn/...`（任意路径/签名 query，无 auth/cookie，需把 `Location` 暴露给 handler）以及 GET `https://apiucloud.bupt.edu.cn/blade-source/resource/download?resourceId=...`（若上游 preview 返回同域下载地址）；重定向仍由 handler 逐跳校验，不能配置 curl 自动跟随。
+
+### submit 路由形状（仅设计，未启用）
+
+本批不启用写路径，但父会话接线时可复用 `submit.rs` 的请求形状：
+
+- `POST https://apiucloud.bupt.edu.cn/blade-source/resource/upload/biz`：`multipart/form-data`，文件 part 带 filename/MIME，表单字段 `userId`、`bizType=3`；需要 auth headers、独立 body 上限和可信 multipart 编码/流式读取，不能套用当前只允许可打印 ASCII 的 JSON body 策略。
+- `POST https://apiucloud.bupt.edu.cn/ykt-site/work/submit`：JSON `{assignmentId,assignmentType:0,assignmentContent,attachmentIds,userId,groupId:"",commitId:""}`，`Content-Type: application/json`，auth headers。
+- 两者都必须保留确认门禁、失败/响应丢失不自动重发、提交后只读 `verify` 的约束；不要在本批把 `submit` 加入 `uses_campus_transport`。
 
 ### 源内单元用例（`src/homework/detail.rs`）
 
@@ -130,6 +150,34 @@ Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust �
 | `submit_view_sentinels_and_attachment_lists_are_not_fabricated` | `assignmentId=-1` / `"-1"` / `null` / 空串且无附件时没有提交；数值 `0` 或非空附件表示可见提交 |
 | `preview_filename_handles_encoded_and_quoted_dispositions` | `response-content-disposition` 的百分号编码、`filename*` RFC 5987 变体和缺失参数 |
 | `attachment_normalization_keeps_explicit_values_and_placeholders` | 附件标题/URL/resource id/size 映射；空对象使用 `attachment-N` 占位，不发明 URL |
+
+### 源内单元用例（`src/homework/new.rs`）
+
+| 用例 | 覆盖点 |
+|---|---|
+| `new_keeps_recent_list_times_and_sorts_newest_first` | 列表自带发布时间、7 天窗口、发布时间倒序、零详情请求；note 保持 Python 原样 |
+| `new_detail_failures_do_not_consume_the_budget` | 30 次失败后仍可继续成功解析，`looked_up=40`、`failed=30`、`unknown=30`、note 含详情失败 |
+| `new_reports_the_budget_and_unknown_rows` | `lookup_limit=30`、30 次成功补查后剩余 10 条进入 `unknown_publish_time` |
+| `new_uses_detail_only_for_rows_that_pass_the_filters` | 先应用 `--undone` 再花详情预算，只请求目标行 |
+| `new_filter_with_no_candidates_does_not_lookup` | 过滤后无候选时零详情请求，note 说明过滤条件 |
+| `new_auth_failure_is_not_reported_as_unknown` | 详情 401 直接退 auth 3，不伪装 unknown |
+| `new_empty_and_empty_window_notes_are_distinguishable` | 空上游与“全部有日期但窗口为空” note 可区分 |
+| `new_limit_sets_truncated_after_the_time_filter` | 发布时间过滤后再应用 `--limit`，设置 `truncated=true` |
+| `detail_failure_text_is_redacted_and_bounded` | note 中的详情错误先脱敏、单行、≤200 字符 |
+
+### 源内单元用例（`src/homework/download.rs`）
+
+| 用例 | 覆盖点 |
+|---|---|
+| `download_saves_preview_urls_and_skips_missing_urls` | 预览 URL、无 URL 跳过、保存附件内容、输出绝对路径、文件名清洗、下载无 token/Cookie |
+| `download_skips_existing_files_without_force_and_overwrites_with_force` | 无 `--force` 不覆盖；`--force` 覆盖旧文件 |
+| `download_follows_relative_and_absolute_allowlisted_redirects_without_auth` | 相对/绝对 allowlisted 重定向逐跳跟随，全程只带 UA |
+| `download_rejects_a_redirect_off_the_allowlist_without_writing` | 重定向到外部 host 退 5，零写入 |
+| `download_rejects_a_redirect_loop_without_writing` | 超过 5 次重定向退 5，零写入 |
+| `download_rejects_relative_non_https_and_credentialed_sources` | 相对 URL、HTTP、userinfo、外部 host、fragment、显式端口都在请求前拒绝 |
+| `download_allows_only_the_exact_api_download_path_without_auth` | 仅允许 `apiucloud.../blade-source/resource/download`；preview URL 不能当下载源；API 源也只带 UA |
+| `download_does_not_keep_a_partial_or_old_file_when_a_download_fails` | 下载失败不留下半份文件，也不覆盖 `--force` 下的旧文件 |
+| `safe_filename_keeps_a_single_safe_component` | `../`、绝对路径、非法字符、`.`/`..`、空标题和超长 UTF-8 文件名的路径清洗 |
 
 ### 源内单元用例（`src/homework/show.rs`）
 
@@ -176,7 +224,7 @@ Python 的 UCloud `_request` 在 401 时会 invalidate 并重试一次；Rust �
 
 回执判定只接受肯定证据：显式 `success: true`，或认可的 `code`（0/200）。空对象、缺失/非法指示、互相矛盾的 success/code、2xx 非 JSON、408、5xx、意外重定向以及没有确认响应的 transport failure 都退 6 且 `submitted=null`，并只指向只读 `verify`。明确 4xx（408 除外）、JSON 负回执和 401/403 仍走显式错误（HTTP/上游 5，鉴权 3），不伪装成 unknown。所有分支都不自动重发 submit；transport failure 只说明没有收到确认响应，不回显原始诊断。
 
-读命令（`courses`、默认列表、`--course`、`--undone`、`show`、`verify`）共用 `homework::load_read_session` → `identity::require_ucloud_session`；凭据只从 `credentials.json` 读取（username + 非空密码 + role + session revision），不读取账号环境变量。已验证 session 需要 role；roleless/旧凭据在本地退 auth 3，不会创建或重写 session。`submit` 仍走单独的 `homework::load_session`：确认门禁通过后以“submit wiring 未实现”退 5，未接 transport；`download` 仍退 5；`--new` 在本地凭据检查后退 5。成功提交但未跑 `--no-verify` 时 helper 仍返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`；提交后的自动核验仍未接上本批的 `verify` helper。
+读命令（`courses`、默认列表、`--course`、`--undone`、`--new`、`show`、`verify`）共用 `homework::load_read_session` → `identity::require_ucloud_session`；凭据只从 `credentials.json` 读取（username + 非空密码 + role + session revision），不读取账号环境变量。已验证 session 需要 role；roleless/旧凭据在本地退 auth 3，不会创建或重写 session。`submit` 仍走单独的 `homework::load_session`：确认门禁通过后以“submit wiring 未实现”退 5，未接 transport。`download` 已接 handler 和 `load_read_session`，但生产路由仍由父会话放开；它下载时只发 `User-Agent`，不发送 token/Cookie。成功提交但未跑 `--no-verify` 时 helper 仍返回 6 且 `verification.status=not_run`，明确表示未核验，不伪造 `verified=true`；提交后的自动核验仍未接上本批的 `verify` helper。
 
 结果里不序列化 detail 原始对象或 session 结构；接受的 `upstream.msg` 和错误文本在输出边界统一脱敏，`Session` 不实现 `Debug`。新增 fixture `homework_submit_echo_token.json` 让上游回显合成 token，供后续进程级 seam 复用；当前对应边界测试已在源内通过。
 
@@ -206,7 +254,7 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 
 ## 草稿覆盖矩阵
 
-以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。其中 `courses` 分页/去重/终止、默认 all / `--course` 分页/排序/过滤/`--limit` 和空 undone 已由上面的 `read.rs` 源内 helper 用例覆盖；提交门禁、dry-run、确认一次写入、响应丢失四类已有 `submit.rs` 源内覆盖。草稿仍保留为后续完整进程级录制验收。
+以下用例名都指 `tests/homework_replay/cases.rs` 中的草稿，**尚未运行**。其中 `courses` 分页/去重/终止、默认 all / `--course` 分页/排序/过滤/`--limit`、空 undone、`--new` 预算/排序/note 以及 download 的保存/skip/重定向 allowlist 已由上面的 `read.rs` / `new.rs` / `download.rs` 源内 helper 用例覆盖；提交门禁、dry-run、确认一次写入、响应丢失四类已有 `submit.rs` 源内覆盖。草稿仍保留为后续完整进程级录制验收。
 
 ### courses
 
@@ -272,25 +320,22 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 - 固定 5 秒重试等待只通过注入 sleep 验证“重试一次”的次数；没有墙钟等待断言。
 - 上传失败、submit-view 401 后的续期、真实校园网上游验收未运行。真实提交/上传不在本阶段执行，校园网验收需用户单独确认。
 - 真实非空 undone 的课程富化（`_enrich_undone_courses`）仍延期：`get_all_homework` 已实现，但尚未把全部课程作业按 activity id 回填到 `siteId=-1`/空 `siteName` 的 undone 行；需要真实样本和预算语义后再声称 parity。
-- `--new DAYS` 延期（见上）：详情补查、30 次预算、`publish_time` 统计、`unknown_publish_time`、note、发布时间倒序和 `truncated` 均未实现；不做“只看列表自带发布时间”的半套过滤，以免静默丢掉无法定日期的作业。
-- `download` 延期：详情/preview URL 读取层已有，但保存目录、`--force`、无 URL 跳过计数、文件名来源、CDN 下载 host 策略（不带 Blade-Auth）和零写入断言尚未接公开 CLI。
-- 公开 `show` / `verify` / 默认列表 / `--course` 仍需父会话在 `cli.rs::uses_campus_transport` 与 `transport/cas_wire.rs` 放开路由；本 worktree 不修改这两个共享文件。
+- `download` 的生产适配仍延期到父会话：handler 已实现并通过 `Scripted` 验证，但 `cli.rs` 尚未把 `download` 子命令选到 `CampusCurl`，`cas_wire` 也未允许 `fileucloud.bupt.edu.cn` 或 `/blade-source/resource/download`。在父会话完成窄路由前，公开二进制仍不会把下载请求发到真实 CDN。
+- `--new` 的 `_enrich_undone_courses` 前置步骤仍沿用“undone 不富化”的既有延期；即 `--undone --new` 只按 undone 行自带的 `siteId`/`siteName` 和 activity id 工作，不先扫全部课程作业回填。
 - Python UCloud 401 invalidate+retry 一次的续期行为延期到 identity session 适配器；当前只读 helper 明确只请求一次并退鉴权 3。
 - 用户提供的真实只读基线（本 worktree 未重跑）显示课程首屏 11 行且 site id 唯一；自动化只用合成 fixture，真实校园网读取验收仍需用户单独确认。
 
 ## 下一批接线顺序
 
-1. 父会话/整合者放开共享路由：`cli.rs::uses_campus_transport` 允许 `homework` 的默认列表、`show`、`verify`、`--course`；`transport/cas_wire.rs` 增加 GET `/ykt-site/work/detail`、`/ykt-site/work/submit-view`、`/blade-source/resource/preview-url`，以及 POST `/ykt-site/work/student/list`（允许 JSON body + `Content-Type: application/json`）。现有 `/ykt-site/site/list/student/current`、`/ykt-site/site/student/undone`、`/ykt-basics/oauth/token` 不变。
-2. 接 `--new`：先按列表自带 publish time 分类；对缺失行按“截止时间新到旧”花最多 30 次详情查询，失败不消耗预算；输出 `publish_time{looked_up,resolved,unknown,failed,lookup_limit}`、`unknown_publish_time`、note、发布时间倒序和 `truncated`；auth 错误必须保持 auth 3。
-3. 接 `download`：复用 detail/preview 读取，补保存目录/`--force`/跳过计数和 CDN host 策略；下载失败不得写半份文件。
-4. 把提交 helper 接到 fixture/进程级 seam（含 `homework_submit_echo_token.json`），提交后自动核验复用本批 `verify` helper，不能复制第三套读取逻辑。
-5. 真实非空 undone 富化、401 续期、真实校园网读取/提交和双平台验收单独执行，需用户确认。
+1. 父会话/整合者放开 `download` 的生产路由：`cli.rs::uses_campus_transport` 选择 `download` 子命令到 `CampusCurl`；`transport/cas_wire.rs` 增加 GET `fileucloud.bupt.edu.cn`（任意路径/签名 query，无 auth/cookie，保留 `Location`）和 GET `apiucloud.bupt.edu.cn/blade-source/resource/download`。不要让 curl 自动跟随重定向；handler 会在每一跳重新校验 allowlist。
+2. 把提交 helper 接到 fixture/进程级 seam（含 `homework_submit_echo_token.json`），按上面的 upload/submit 路由形状做窄适配，并保留确认、不自动重发和提交后只读 `verify` 的约束。
+3. 真实非空 undone 富化、401 续期、真实校园网读取/下载/提交和双平台验收单独执行，需用户确认。
 
 ## 当前验证状态
 
 - `cargo fmt --check`：通过。
-- `cargo test --locked --offline --lib`：151 个通过（含 31 个 homework 只读 helper、11 个 homework 提交 helper、6 个 detail、9 个 show、6 个 verify、3 个 text，以及 identity/transport/CAS 等其它 lane）。
+- `cargo test --locked --offline --lib`：208 个通过（homework 源内：32 read、11 submit、9 show、9 download、9 new、6 detail、6 verify、3 text；其余为 identity/transport/CAS/academics/campus/lifecycle 等）。
 - `cargo test --locked --offline --test contract_homework`：16 个通过。
-- `cargo test --locked --offline`：全绿；151 单元 + 25 academics + 33 campus + 16 homework + 28 identity + 23 lifecycle 契约用例全部通过。
+- `cargo test --locked --offline`：全绿；208 单元 + 30 academics + 34 campus + 16 homework + 28 identity + 23 lifecycle 契约用例全部通过。
 - `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此 30 个草稿全部不可运行，也没有伪装通过。
-- 本批仍是 synthetic-only slice：公开读命令已接真实 `require_ucloud_session`，但只在进程内用合成 session/`Scripted` 验证；`--new`、`download`、`submit` 写入仍未接；未运行真实校园网、浏览器会话、上传或提交，也没有新增环境变量回放开关。
+- 本批仍是 synthetic-only slice：`--new` 与 `download` handler 只在进程内用合成 session/`Scripted` 验证；`download` 生产 CDN 路由和 `submit` 写入仍未接；未运行真实校园网、浏览器会话、真实下载、上传或提交，也没有新增环境变量回放开关。
