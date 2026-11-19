@@ -17,6 +17,7 @@ enum Route {
     UcloudLanding,
     UcloudToken,
     UcloudRead,
+    UcloudHomeworkList,
 }
 
 pub(super) fn exchange(
@@ -49,8 +50,12 @@ fn network_failure() -> CliError {
 fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
     let route = route(request).ok_or_else(rejected)?;
     let body = std::str::from_utf8(&request.body).map_err(|_| rejected())?;
+    let requires_body = matches!(
+        route,
+        Route::CasForm | Route::UcloudToken | Route::UcloudHomeworkList
+    );
     if body.len() > MAX_REQUEST
-        || (!body.is_empty() && !matches!(route, Route::CasForm | Route::UcloudToken))
+        || body.is_empty() == requires_body
         || !body.bytes().all(|b| matches!(b, 0x21..=0x7e))
     {
         return Err(rejected());
@@ -73,10 +78,16 @@ fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
             return Err(rejected());
         }
     }
-    if matches!(route, Route::CasForm | Route::UcloudToken) {
-        if body.is_empty() {
-            return Err(rejected());
-        }
+    if matches!(route, Route::UcloudHomeworkList)
+        && (!valid_homework_list_body(body)
+            || !request
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "application/json"))
+    {
+        return Err(rejected());
+    }
+    if requires_body {
         option(&mut options, "header", "Expect:");
         option(&mut options, "data-raw", body);
     }
@@ -121,8 +132,17 @@ fn route(request: &Request) -> Option<Route> {
         (
             "apiucloud.bupt.edu.cn",
             "GET",
-            "/ykt-site/site/list/student/current" | "/ykt-site/site/student/undone",
+            "/ykt-site/site/list/student/current"
+            | "/ykt-site/site/student/undone"
+            | "/ykt-site/work/detail"
+            | "/ykt-site/work/submit-view"
+            | "/blade-source/resource/preview-url",
         ) => Some(Route::UcloudRead),
+        ("apiucloud.bupt.edu.cn", "POST", "/ykt-site/work/student/list")
+            if parsed.query().is_none() =>
+        {
+            Some(Route::UcloudHomeworkList)
+        }
         _ => None,
     }
 }
@@ -134,11 +154,31 @@ fn allowed_header(route: Route, name: &str) -> bool {
             Route::CasForm => matches!(name, "cookie" | "content-type"),
             Route::UcloudLanding => false,
             Route::UcloudToken => matches!(name, "authorization" | "content-type"),
-            Route::UcloudRead => matches!(
-                name,
-                "authorization" | "tenant-id" | "blade-auth" | "accept"
-            ),
+            Route::UcloudRead | Route::UcloudHomeworkList => {
+                matches!(
+                    name,
+                    "authorization" | "tenant-id" | "blade-auth" | "accept"
+                ) || (matches!(route, Route::UcloudHomeworkList) && name == "content-type")
+            }
         }
+}
+
+fn valid_homework_list_body(body: &str) -> bool {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str(body) else {
+        return false;
+    };
+    object.len() == 4
+        && ["siteId", "userId"].into_iter().all(|key| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+        && object
+            .get("current")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|page| page > 0)
+        && object.get("size").and_then(serde_json::Value::as_u64) == Some(50)
 }
 
 fn option(config: &mut String, name: &'static str, value: &str) {
@@ -279,6 +319,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.status, 429);
+    }
+
+    #[test]
+    fn homework_transport_allows_only_the_expected_read_routes_and_json_shape() {
+        let base = "https://apiucloud.bupt.edu.cn";
+        let mut request = Request {
+            method: "POST",
+            url: format!("{base}/ykt-site/work/student/list"),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: br#"{"siteId":"site-1","userId":"TEST-ONLY-USER","current":1,"size":50}"#
+                .to_vec(),
+        };
+        assert!(curl_config(&request).is_ok());
+        let valid_body = request.body.clone();
+        for invalid in [
+            "{}",
+            "{\"password\":\"TEST-ONLY\"}",
+            "{\"siteId\":\"site-1\",\"userId\":\"TEST-ONLY-USER\",\"current\":0,\"size\":50}",
+        ] {
+            request.body = invalid.as_bytes().to_vec();
+            assert!(curl_config(&request).is_err());
+        }
+        request.body = valid_body;
+        request.headers.clear();
+        assert!(curl_config(&request).is_err());
+        request
+            .headers
+            .push(("Content-Type".into(), "application/json".into()));
+        for path in [
+            "/ykt-site/work/student/list?test=1",
+            "/ykt-site/work/student/submit",
+            "/blade-source/resource/upload",
+            "/ykt-site/work/detail",
+        ] {
+            request.url = format!("{base}{path}");
+            assert!(curl_config(&request).is_err());
+        }
+        request.headers = vec![("Blade-Auth".into(), "TEST-ONLY-TOKEN".into())];
+        request.body.clear();
+        request.method = "GET";
+        for path in [
+            "/ykt-site/work/detail?assignmentId=1",
+            "/ykt-site/work/submit-view?assignmentId=1",
+            "/blade-source/resource/preview-url?resourceId=1",
+        ] {
+            request.url = format!("{base}{path}");
+            assert!(curl_config(&request).is_ok());
+        }
+        request.url = "https://outside.example/ykt-site/work/detail?assignmentId=1".into();
+        assert!(curl_config(&request).is_err());
     }
 
     #[test]

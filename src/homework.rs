@@ -1,6 +1,9 @@
-#[allow(dead_code)] // Exercised by in-process tests; CLI wiring follows the session adapter.
+mod detail;
 mod read;
+mod show;
 mod submit;
+mod text;
+mod verify;
 
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::identity;
@@ -106,8 +109,13 @@ pub(crate) fn run(
 ) -> CliResult<Outcome> {
     match command {
         "courses" => {
-            require_credentials(context)?;
-            Err(unsupported("course listing"))
+            let session = load_read_session(context)?;
+            let courses = read::fetch_courses(context.transport, &session)?;
+            Ok(Outcome {
+                data: read::courses_json(&courses),
+                code: 0,
+                diagnostic: None,
+            })
         }
         "homework" => run_homework(matches, context),
         _ => Err(CliError::pending()),
@@ -116,24 +124,97 @@ pub(crate) fn run(
 
 fn run_homework(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     match matches.subcommand() {
-        Some(("show", _)) => {
-            require_credentials(context)?;
-            Err(unsupported("homework show"))
-        }
+        Some(("show", show_matches)) => show::run(show_matches, context),
         Some(("download", _)) => {
             require_credentials(context)?;
             Err(unsupported("homework download"))
         }
         Some(("submit", submit_matches)) => submit::run(submit_matches, context),
-        Some(("verify", _)) => {
-            require_credentials(context)?;
-            Err(unsupported("homework verify"))
-        }
-        _ => {
-            require_credentials(context)?;
-            Err(unsupported("homework listing"))
-        }
+        Some(("verify", verify_matches)) => verify::run(verify_matches, context),
+        None => run_homework_list(matches, context),
+        Some((command, _)) => Err(CliError::usage(format!(
+            "unknown homework command: {command}"
+        ))),
     }
+}
+
+fn run_homework_list(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
+    let undone = matches.get_flag("undone");
+    let course = matches
+        .get_one::<String>("course")
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let new_days = matches.get_one::<u64>("new").copied();
+    let limit = *matches
+        .get_one::<u64>("limit")
+        .expect("limit has a default");
+
+    // Authenticate locally before any campus request. `--new` still needs the
+    // deferred detail-lookup budget, so it stops here without touching the
+    // network.
+    require_read_profile(context)?;
+    if new_days.is_some() {
+        return Err(unsupported("homework --new publish-time lookup"));
+    }
+
+    let session = load_read_session(context)?;
+    if let Some(course) = course.as_deref() {
+        let items = read::fetch_course_homework(context.transport, &session, course)?;
+        return list_outcome(
+            items,
+            "course",
+            read::ListFilters {
+                undone,
+                course: Some(course.to_owned()),
+                new_days: None,
+            },
+            limit,
+        );
+    }
+    if undone {
+        let overview = read::fetch_undone(context.transport, &session)?;
+        return Ok(Outcome {
+            data: read::undone_json(overview, limit, local_now()?),
+            code: 0,
+            diagnostic: None,
+        });
+    }
+    let items = read::fetch_all_homework(context.transport, &session)?;
+    list_outcome(
+        items,
+        "all",
+        read::ListFilters {
+            undone: false,
+            course: None,
+            new_days: None,
+        },
+        limit,
+    )
+}
+
+fn list_outcome(
+    items: Vec<read::HomeworkItem>,
+    method: &str,
+    filters: read::ListFilters,
+    limit: u64,
+) -> CliResult<Outcome> {
+    Ok(Outcome {
+        data: read::homework_list_json(items, method, filters, limit, local_now()?),
+        code: 0,
+        diagnostic: None,
+    })
+}
+
+fn local_now() -> CliResult<time::PrimitiveDateTime> {
+    let now = time::OffsetDateTime::now_local().map_err(|_| {
+        CliError::new(
+            5,
+            "upstream",
+            "cannot determine the local time for homework deadlines",
+            "",
+        )
+    })?;
+    Ok(time::PrimitiveDateTime::new(now.date(), now.time()))
 }
 
 pub(super) fn unsupported(operation: &str) -> CliError {
@@ -141,10 +222,38 @@ pub(super) fn unsupported(operation: &str) -> CliError {
         5,
         "upstream",
         format!("{operation} is not implemented in this migration build"),
-        "No campus request was made. This batch only covers local argument validation and the submit gate.",
+        "No campus request was made. This operation is not wired in this migration batch.",
     )
+}
+
+fn require_read_profile(context: &Context<'_>) -> CliResult<()> {
+    if identity::require_authenticated_profile(&context.config_dir)?
+        .role()
+        .is_none()
+    {
+        return Err(CliError::new(
+            3,
+            "auth",
+            "the saved credentials have no academic role",
+            "Run `bupt login` with an explicit role.",
+        ));
+    }
+    Ok(())
+}
+
+fn load_read_session(context: &mut Context<'_>) -> CliResult<read::Session> {
+    require_read_profile(context)?;
+    let (access_token, user_id) = identity::require_ucloud_session(context)?;
+    Ok(read::Session::new(access_token, user_id))
 }
 
 pub(super) fn require_credentials(context: &Context<'_>) -> CliResult<()> {
     identity::require_authenticated_profile(&context.config_dir).map(|_| ())
+}
+
+/// The submit write path stays behind its confirmation gate and is not wired
+/// to a transport in this batch. Read commands use `load_read_session`.
+pub(in crate::homework) fn load_session(context: &Context<'_>) -> CliResult<read::Session> {
+    require_credentials(context)?;
+    Err(unsupported("homework submit wiring"))
 }

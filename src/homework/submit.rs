@@ -6,17 +6,17 @@
 //! connected, replace them with a vetted multipart encoder and bounded or
 //! streamed file reads; do not treat this renderer as production encoding.
 
-use super::{require_credentials, unsupported};
+use super::detail;
+use super::load_session;
+use super::read::Session;
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::transport::{Request, Response, Transport};
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const UCLOUD_API: &str = "https://apiucloud.bupt.edu.cn";
-const DETAIL_PATH: &str = "/ykt-site/work/detail";
-const SUBMIT_VIEW_PATH: &str = "/ykt-site/work/submit-view";
 const UPLOAD_PATH: &str = "/blade-source/resource/upload/biz";
 const SUBMIT_PATH: &str = "/ykt-site/work/submit";
 const MULTIPART_BOUNDARY: &str = "----bupt-cli-boundary";
@@ -71,18 +71,6 @@ pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<
     request.ensure_gate()?;
     let session = load_session(context)?;
     execute_submit(&request, &session, context.transport)
-}
-
-/// First-batch seam: the identity lane owns real session creation. Until that
-/// adapter lands, a configured account stops here before any campus request.
-fn load_session(context: &Context<'_>) -> CliResult<Session> {
-    require_credentials(context)?;
-    Err(unsupported("homework session wiring"))
-}
-
-struct Session {
-    access_token: String,
-    user_id: String,
 }
 
 struct SubmitRequest {
@@ -174,11 +162,6 @@ impl SubmitRequest {
     }
 }
 
-struct Detail {
-    title: String,
-    submitted: bool,
-}
-
 struct PlannedFile {
     path: PathBuf,
     name: String,
@@ -261,9 +244,9 @@ fn execute_submit_inner(
     transport: &mut dyn Transport,
 ) -> CliResult<Outcome> {
     request.ensure_gate()?;
-    let detail = fetch_detail(transport, session, &request.assignment_id)?;
-    let submit_view = fetch_submit_view(transport, session, &request.assignment_id)?;
-    let existing_ids = submit_view_ids(&submit_view);
+    let detail = detail::fetch_detail(transport, session, &request.assignment_id)?;
+    let submit_view = detail::fetch_submit_view(transport, session, &request.assignment_id)?;
+    let existing_ids = detail::submit_view_ids(&submit_view);
     let planned_files = planned_files(request)?;
     let planned = json!({
         "assignment_id": request.assignment_id,
@@ -357,7 +340,7 @@ fn execute_submit_inner(
 
 fn ambiguous_submit(
     request: &SubmitRequest,
-    detail: &Detail,
+    detail: &detail::Detail,
     uploaded: Vec<UploadedFile>,
     attachment_ids: Vec<String>,
     reason: String,
@@ -407,112 +390,6 @@ fn planned_files(request: &SubmitRequest) -> CliResult<Vec<PlannedFile>> {
         });
     }
     Ok(planned)
-}
-
-fn fetch_detail(
-    transport: &mut dyn Transport,
-    session: &Session,
-    assignment_id: &str,
-) -> CliResult<Detail> {
-    let payload = send_json(
-        transport,
-        "UCloud assignment detail",
-        Request {
-            method: "GET",
-            url: query_url(DETAIL_PATH, "assignmentId", assignment_id),
-            headers: auth_headers(&session.access_token),
-            body: Vec::new(),
-        },
-    )?;
-    let data = payload.get("data").ok_or_else(|| {
-        CliError::new(
-            5,
-            "parse",
-            "UCloud assignment detail response missing data",
-            "",
-        )
-    })?;
-    let object = data.as_object().ok_or_else(|| {
-        CliError::new(
-            5,
-            "parse",
-            "UCloud assignment detail returned malformed data",
-            "",
-        )
-    })?;
-    if object.is_empty() {
-        return Err(CliError::new(
-            5,
-            "not_found",
-            format!("assignment detail not found for id {assignment_id}"),
-            "",
-        ));
-    }
-    if object
-        .get("submitInfo")
-        .is_some_and(|value| !value.is_null() && !value.is_object())
-    {
-        return Err(CliError::new(
-            5,
-            "parse",
-            "UCloud assignment detail returned malformed submitInfo",
-            "",
-        ));
-    }
-    let submit_info = object.get("submitInfo").and_then(Value::as_object);
-    let title = object
-        .get("assignmentTitle")
-        .or_else(|| object.get("title"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let submitted = submit_info
-        .and_then(|info| info.get("isSubmit"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || object
-            .get("isSubmit")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        || is_submitted_status(object.get("assignmentStatus"));
-    Ok(Detail { title, submitted })
-}
-
-fn fetch_submit_view(
-    transport: &mut dyn Transport,
-    session: &Session,
-    assignment_id: &str,
-) -> CliResult<Value> {
-    let payload = send_json(
-        transport,
-        "UCloud submit-view",
-        Request {
-            method: "GET",
-            url: query_url(SUBMIT_VIEW_PATH, "assignmentId", assignment_id),
-            headers: auth_headers(&session.access_token),
-            body: Vec::new(),
-        },
-    )?;
-    let data = payload
-        .get("data")
-        .ok_or_else(|| CliError::new(5, "parse", "UCloud submit-view response missing data", ""))?;
-    Ok(data
-        .as_object()
-        .map(|object| Value::Object(object.clone()))
-        .unwrap_or_else(|| Value::Object(Map::new())))
-}
-
-fn submit_view_ids(view: &Value) -> Vec<String> {
-    view.get("attachmentIds")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(value_as_string)
-                .filter(|id| !id.trim().is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn upload_file(
@@ -687,11 +564,6 @@ fn classify_submit_reply(payload: &Value) -> SubmitAttempt {
     }
 }
 
-fn send_json(transport: &mut dyn Transport, operation: &str, request: Request) -> CliResult<Value> {
-    let response = transport.send(request)?;
-    response_json(response, operation)
-}
-
 fn response_json(response: Response, operation: &str) -> CliResult<Value> {
     if response.status == 401 || response.status == 403 {
         return Err(CliError::new(
@@ -813,26 +685,6 @@ fn auth_headers(access_token: &str) -> Vec<(String, String)> {
     ]
 }
 
-fn query_url(path: &str, key: &str, value: &str) -> String {
-    format!(
-        "{UCLOUD_API}{path}?{key}={}",
-        percent_encode(value.as_bytes())
-    )
-}
-
-fn percent_encode(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity(bytes.len());
-    for byte in bytes {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(*byte));
-        } else {
-            encoded.push('%');
-            encoded.push_str(&format!("{byte:02X}"));
-        }
-    }
-    encoded
-}
-
 /// SCAFFOLD ONLY: fixed boundary and a full in-memory body. Production must
 /// replace this with a vetted encoder and bounded/streamed file reads.
 fn multipart_body(user_id: &str, file: &PlannedFile, bytes: &[u8]) -> Vec<u8> {
@@ -895,14 +747,6 @@ fn value_as_string(value: &Value) -> Option<String> {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
         _ => None,
-    }
-}
-
-fn is_submitted_status(value: Option<&Value>) -> bool {
-    match value {
-        Some(Value::Number(number)) => number.as_i64() == Some(0),
-        Some(Value::String(text)) => text == "0",
-        _ => false,
     }
 }
 
@@ -976,11 +820,11 @@ mod tests {
     }
 
     fn detail_url(assignment_id: &str) -> String {
-        query_url(DETAIL_PATH, "assignmentId", assignment_id)
+        format!("{UCLOUD_API}/ykt-site/work/detail?assignmentId={assignment_id}")
     }
 
     fn submit_view_url(assignment_id: &str) -> String {
-        query_url(SUBMIT_VIEW_PATH, "assignmentId", assignment_id)
+        format!("{UCLOUD_API}/ykt-site/work/submit-view?assignmentId={assignment_id}")
     }
 
     fn session() -> Session {

@@ -281,15 +281,21 @@ pub(super) fn cas_login(
             "refusing a CAS redirect that would replay the credential POST",
         ));
     }
-    let (post, final_url) =
-        follow_get_redirects(transport, &mut cookies, post, CAS_LOGIN_URL.to_owned())?;
-    ensure_http_ok(&post, "CAS login")?;
-
-    let final_text = String::from_utf8_lossy(&post.body);
-    if is_login_page(&final_url, &final_text) {
-        return Err(auth_error(
-            "BUPT CAS login failed: invalid username or password",
-        ));
+    // The ordinary form hands browsers off to the campus portal. The CLI
+    // needs no portal page or cookies: only CAS issuing a ticket proves login.
+    let portal_landing = post.status == 302
+        && header(&post.headers, "location")
+            .and_then(|location| location.split(['?', '#', ';']).next())
+            == Some("https://uc.bupt.edu.cn/");
+    if !portal_landing {
+        let (post, final_url) =
+            follow_get_redirects(transport, &mut cookies, post, CAS_LOGIN_URL.to_owned())?;
+        ensure_http_ok(&post, "CAS login")?;
+        if is_login_page(&final_url, &String::from_utf8_lossy(&post.body)) {
+            return Err(auth_error(
+                "BUPT CAS login failed: invalid username or password",
+            ));
+        }
     }
 
     let ticket = request_cas_service_ticket(transport, &mut cookies)?;
@@ -1238,6 +1244,54 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn cas_portal_landing_is_not_fetched_and_does_not_prove_login() {
+        for ticket in [true, false] {
+            let mut transport = Scripted::default();
+            transport
+                .expected
+                .push_back(("GET", CAS_LOGIN_URL.into(), Ok(login_page())));
+            enqueue(
+                &mut transport,
+                "POST",
+                CAS_LOGIN_URL,
+                302,
+                &[
+                    ("Location", "https://uc.bupt.edu.cn/?test=opaque"),
+                    (
+                        "Set-Cookie",
+                        "CASTGC=TEST-ONLY-PORTAL; Path=/authserver; Secure; HttpOnly",
+                    ),
+                ],
+                "",
+            );
+            if ticket {
+                enqueue(
+                    &mut transport,
+                    "GET",
+                    super::super::CAS_SERVICE_URL,
+                    302,
+                    &[("Location", TICKET_URL)],
+                    "",
+                );
+            } else {
+                transport.expected.push_back((
+                    "GET",
+                    super::super::CAS_SERVICE_URL.into(),
+                    Ok(login_page()),
+                ));
+            }
+            assert_eq!(
+                cas_login(&mut transport, USERNAME, PASSWORD).is_ok(),
+                ticket
+            );
+            assert_eq!(transport.calls.len(), 3);
+            assert_eq!(transport.calls[2].url, super::super::CAS_SERVICE_URL);
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
+        }
     }
 
     #[test]

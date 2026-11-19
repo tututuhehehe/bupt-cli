@@ -190,21 +190,42 @@ fn run_login(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outco
 }
 
 fn login_arguments(matches: &ArgMatches) -> CliResult<LoginRequest> {
-    let username = matches
-        .get_one::<String>("user")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CliError::usage("login requires --user"))?
-        .to_owned();
-    let password = matches
-        .get_one::<String>("password")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| CliError::usage("login requires --password"))?
-        .clone();
+    use std::io::{IsTerminal, Write};
+
     let role = matches
         .get_one::<String>("role")
         .and_then(|value| Role::parse(value))
         .ok_or_else(|| CliError::usage("login requires --role graduate or --role undergraduate"))?;
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    let username = match matches.get_one::<String>("user") {
+        Some(value) => value.trim().to_owned(),
+        None if interactive => {
+            std::io::stderr()
+                .write_all("学号: ".as_bytes())
+                .map_err(|_| CliError::usage("cannot display the login prompt"))?;
+            let mut name = String::new();
+            stdin
+                .read_line(&mut name)
+                .map_err(|_| CliError::usage("cannot read the academic ID"))?;
+            name.trim().to_owned()
+        }
+        None => String::new(),
+    };
+    if username.is_empty() {
+        return Err(CliError::usage("login requires --user"));
+    }
+    let password = match matches.get_one::<String>("password") {
+        Some(value) => value.to_owned(),
+        None if interactive => rpassword::prompt_password("密码（不回显）: ")
+            .map_err(|_| CliError::usage("cannot read a password from the terminal"))?,
+        None => String::new(),
+    };
+    if password.is_empty() {
+        return Err(CliError::usage(
+            "login requires --password in non-interactive mode",
+        ));
+    }
     Ok(LoginRequest {
         username,
         password,
