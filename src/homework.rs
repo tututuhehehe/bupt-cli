@@ -1,4 +1,6 @@
 mod detail;
+mod download;
+mod new;
 mod read;
 mod show;
 mod submit;
@@ -125,10 +127,7 @@ pub(crate) fn run(
 fn run_homework(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     match matches.subcommand() {
         Some(("show", show_matches)) => show::run(show_matches, context),
-        Some(("download", _)) => {
-            require_credentials(context)?;
-            Err(unsupported("homework download"))
-        }
+        Some(("download", download_matches)) => download::run(download_matches, context),
         Some(("submit", submit_matches)) => submit::run(submit_matches, context),
         Some(("verify", verify_matches)) => verify::run(verify_matches, context),
         None => run_homework_list(matches, context),
@@ -149,57 +148,77 @@ fn run_homework_list(matches: &ArgMatches, context: &mut Context<'_>) -> CliResu
         .get_one::<u64>("limit")
         .expect("limit has a default");
 
-    // Authenticate locally before any campus request. `--new` still needs the
-    // deferred detail-lookup budget, so it stops here without touching the
-    // network.
-    require_read_profile(context)?;
-    if new_days.is_some() {
-        return Err(unsupported("homework --new publish-time lookup"));
-    }
-
     let session = load_read_session(context)?;
+    let now = local_now()?;
     if let Some(course) = course.as_deref() {
         let items = read::fetch_course_homework(context.transport, &session, course)?;
-        return list_outcome(
-            items,
-            "course",
-            read::ListFilters {
-                undone,
-                course: Some(course.to_owned()),
-                new_days: None,
-            },
-            limit,
-        );
+        let filters = read::ListFilters {
+            undone,
+            course: Some(course.to_owned()),
+            new_days,
+        };
+        return finish_list(items, "course", filters, limit, now, &session, context);
     }
     if undone {
         let overview = read::fetch_undone(context.transport, &session)?;
-        return Ok(Outcome {
-            data: read::undone_json(overview, limit, local_now()?),
-            code: 0,
-            diagnostic: None,
-        });
+        if new_days.is_none() {
+            return Ok(Outcome {
+                data: read::undone_json(overview, limit, now),
+                code: 0,
+                diagnostic: None,
+            });
+        }
+        let filters = read::ListFilters {
+            undone: true,
+            course: None,
+            new_days,
+        };
+        return finish_list(
+            overview.items,
+            "undone",
+            filters,
+            limit,
+            now,
+            &session,
+            context,
+        );
     }
     let items = read::fetch_all_homework(context.transport, &session)?;
-    list_outcome(
-        items,
-        "all",
-        read::ListFilters {
-            undone: false,
-            course: None,
-            new_days: None,
-        },
-        limit,
-    )
+    let filters = read::ListFilters {
+        undone: false,
+        course: None,
+        new_days,
+    };
+    finish_list(items, "all", filters, limit, now, &session, context)
 }
 
-fn list_outcome(
+fn finish_list(
     items: Vec<read::HomeworkItem>,
     method: &str,
     filters: read::ListFilters,
     limit: u64,
+    now: time::PrimitiveDateTime,
+    session: &read::Session,
+    context: &mut Context<'_>,
 ) -> CliResult<Outcome> {
+    if let Some(days) = filters.new_days {
+        return Ok(Outcome {
+            data: new::execute(
+                items,
+                method,
+                filters,
+                limit,
+                days,
+                now,
+                session,
+                context.transport,
+            )?,
+            code: 0,
+            diagnostic: None,
+        });
+    }
     Ok(Outcome {
-        data: read::homework_list_json(items, method, filters, limit, local_now()?),
+        data: read::homework_list_json(items, method, filters, limit, now),
         code: 0,
         diagnostic: None,
     })

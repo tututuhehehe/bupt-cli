@@ -401,15 +401,104 @@ fn transport_failure() -> CliError {
 
 mod cas_wire;
 
+/// Public release metadata only: read the redirect without following it.
+pub(crate) struct ReleaseMetadataCurl {
+    timeout: Duration,
+}
+
+impl ReleaseMetadataCurl {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Transport for ReleaseMetadataCurl {
+    fn send(&mut self, request: Request) -> CliResult<Response> {
+        let args = release_metadata_arguments(&request, self.timeout)?;
+        let mut exec = SystemCurl {
+            program: system_curl_program(),
+        };
+        let network = || {
+            CliError::new(
+                4,
+                "network",
+                "GitHub release metadata request failed",
+                "Check the connection and retry `bupt update --check`.",
+            )
+        };
+        let output = exec.exec(&args, &[]).map_err(|_| network())?;
+        if !output.success {
+            return Err(network());
+        }
+        cas_wire::parse_response(&output.stdout)
+            .map_err(|_| CliError::new(5, "upstream", "GitHub returned malformed HTTP headers", ""))
+    }
+}
+
+fn release_metadata_arguments(request: &Request, timeout: Duration) -> CliResult<Vec<OsString>> {
+    let rejected = || {
+        CliError::new(
+            5,
+            "upstream",
+            "request is outside the release metadata policy",
+            "",
+        )
+    };
+    let valid_segment = |part: &str| {
+        !part.is_empty()
+            && !matches!(part, "." | "..")
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    let parts: Vec<_> = request
+        .url
+        .strip_prefix("https://github.com/")
+        .ok_or_else(rejected)?
+        .split('/')
+        .collect();
+    if request.url.len() > MAX_URL_BYTES
+        || request.method != "GET"
+        || !request.body.is_empty()
+        || timeout.is_zero()
+        || !matches!(parts.as_slice(), [owner, repo, "releases", "latest"] if valid_segment(owner) && valid_segment(repo))
+        || !matches!(request.headers.as_slice(), [(name, value)] if name.eq_ignore_ascii_case("user-agent") && value == "bupt-cli")
+    {
+        return Err(rejected());
+    }
+    let mut args = base_curl_arguments(timeout);
+    args.extend([
+        "--include".into(),
+        "--request".into(),
+        "GET".into(),
+        "--user-agent".into(),
+        "bupt-cli".into(),
+        "--url".into(),
+        request.url.clone().into(),
+    ]);
+    Ok(args)
+}
+
 /// Separate from public-library transport: CAS cookies and UCloud credentials
 /// are supplied to the trusted executable only through stdin.
 pub(crate) struct CampusCurl {
     timeout: Duration,
+    diagnostic: bool,
 }
 
 impl CampusCurl {
     pub(crate) fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            diagnostic: false,
+        }
+    }
+
+    pub(crate) fn for_diagnose(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            diagnostic: true,
+        }
     }
 }
 
@@ -428,7 +517,11 @@ impl Transport for CampusCurl {
         let mut exec = SystemCurl {
             program: PathBuf::from("/usr/bin/curl"),
         };
-        cas_wire::exchange(&mut exec, self.timeout, &request)
+        if self.diagnostic {
+            cas_wire::exchange_probe(&mut exec, self.timeout, &request)
+        } else {
+            cas_wire::exchange(&mut exec, self.timeout, &request)
+        }
     }
 }
 
@@ -470,6 +563,39 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Cursor;
     use std::rc::Rc;
+
+    #[test]
+    fn release_metadata_requests_are_read_only_and_never_follow_redirects() {
+        let mut request = Request {
+            method: "GET",
+            url: "https://github.com/owner/project/releases/latest".into(),
+            headers: vec![("User-Agent".into(), "bupt-cli".into())],
+            body: vec![],
+        };
+        let args = release_metadata_arguments(&request, Duration::from_secs(3)).unwrap();
+        assert_eq!(args.first().unwrap(), "--disable");
+        assert!(args.iter().any(|arg| arg == "--include"));
+        assert!(!args.iter().any(|arg| arg == "--location"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--max-redirs" && pair[1] == "0")
+        );
+        for invalid in [
+            "http://github.com/owner/project/releases/latest",
+            "https://github.com@outside.example/owner/project/releases/latest",
+            "https://github.com/../project/releases/latest",
+            "https://github.com/owner/project/releases/latest?foo=1",
+            "https://github.com/owner/project/releases/download/v1/bupt.zip",
+        ] {
+            request.url = invalid.into();
+            assert!(release_metadata_arguments(&request, Duration::from_secs(3)).is_err());
+        }
+        request.url = "https://github.com/owner/project/releases/latest".into();
+        request
+            .headers
+            .push(("Cookie".into(), "TEST-ONLY-COOKIE".into()));
+        assert!(release_metadata_arguments(&request, Duration::from_secs(3)).is_err());
+    }
 
     #[derive(Default)]
     struct Journal {

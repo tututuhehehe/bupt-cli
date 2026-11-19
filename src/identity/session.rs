@@ -7,6 +7,7 @@
 //! environment; `credentials.json` is the sole persisted account source.
 
 use super::*;
+use crate::transport::Transport;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -53,15 +54,7 @@ pub(super) fn login(context: &mut Context<'_>, request: &LoginRequest) -> CliRes
 /// used lazily for one service-ticket/token exchange. The password is never
 /// submitted.
 pub(super) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(String, String)> {
-    ensure_supported_platform()?;
-    let account = load_native_account(&context.config_dir)?;
-    validate_owner_relationship(&context.config_dir, &context.cache_dir)?;
-    let mut data = load_native_session(&context.cache_dir)?;
-    validate_binding(&account, &data)?;
-
-    let empty_cookies = Value::Array(Vec::new());
-    let cookies = data.get("cookies").unwrap_or(&empty_cookies);
-    let mut cas_session = cas::CasLogin::from_persisted(cookies, data.get("ucloud"))?;
+    let (mut data, mut cas_session) = load_bound_session(context)?;
 
     // A fresh token is already a usable verified session and does not need the
     // CAS cookie jar. Only a token refresh requires usable CAS cookies.
@@ -102,6 +95,80 @@ pub(super) fn require_ucloud_session(context: &mut Context<'_>) -> CliResult<(St
     }
 
     Ok((access_token, user_id))
+}
+
+/// An owned, verified native CAS session for read-only protocol consumers.
+///
+/// It can request tickets only for `CasService` values; it has no password and
+/// never performs the login form POST. All cookie/ticket state is in memory.
+pub(crate) struct OwnedCasSession {
+    cas: cas::CasLogin,
+    data: Map<String, Value>,
+}
+
+impl OwnedCasSession {
+    pub(crate) fn ticket_for(
+        &mut self,
+        transport: &mut dyn Transport,
+        service: cas::CasService,
+    ) -> CliResult<String> {
+        self.cas.ticket_for(transport, service)
+    }
+
+    pub(crate) fn has_usable_cookies(&self) -> bool {
+        self.cas.has_usable_cookies()
+    }
+
+    pub(crate) fn cached_ucloud_credentials(&self) -> Option<(String, String)> {
+        self.cas.cached_ucloud_credentials()
+    }
+
+    pub(crate) fn exchange_ucloud_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        ticket: &str,
+    ) -> CliResult<()> {
+        self.cas.exchange_ucloud_ticket(transport, ticket)?;
+        Ok(())
+    }
+
+    pub(super) fn cookie_header_for(&self, url: &str) -> Option<String> {
+        self.cas.cookie_header_for_authenticated(url)
+    }
+
+    pub(super) fn mobile_token(&self) -> Option<(String, Option<f64>)> {
+        let mobile = self.data.get("mobile_jwgl")?.as_object()?;
+        let token = mobile
+            .get("token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())?
+            .to_owned();
+        let expires_at = mobile.get("expires_at").and_then(number_value);
+        Some((token, expires_at))
+    }
+}
+
+/// Load only the current owner's native, revision-bound CAS session.
+///
+/// Public callers get no password, no legacy v1 activation and no login path.
+pub(crate) fn load_owned_cas_session(context: &Context<'_>) -> CliResult<OwnedCasSession> {
+    let (data, cas_session) = load_bound_session(context)?;
+    Ok(OwnedCasSession {
+        cas: cas_session,
+        data,
+    })
+}
+
+fn load_bound_session(context: &Context<'_>) -> CliResult<(Map<String, Value>, cas::CasLogin)> {
+    ensure_supported_platform()?;
+    let account = load_native_account(&context.config_dir)?;
+    validate_owner_relationship(&context.config_dir, &context.cache_dir)?;
+    let data = load_native_session(&context.cache_dir)?;
+    validate_binding(&account, &data)?;
+    let empty_cookies = Value::Array(Vec::new());
+    let cookies = data.get("cookies").unwrap_or(&empty_cookies);
+    let cas_session = cas::CasLogin::from_persisted(cookies, data.get("ucloud"))?;
+    Ok((data, cas_session))
 }
 
 fn login_outcome(context: &Context<'_>, request: &LoginRequest) -> Outcome {

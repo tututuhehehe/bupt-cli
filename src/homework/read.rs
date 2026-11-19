@@ -90,7 +90,7 @@ pub(super) struct HomeworkItem {
 }
 
 impl HomeworkItem {
-    fn parsed_end_time(&self) -> Option<time::PrimitiveDateTime> {
+    pub(super) fn parsed_end_time(&self) -> Option<time::PrimitiveDateTime> {
         self.end_time.as_deref().and_then(local_timestamp)
     }
 }
@@ -138,30 +138,7 @@ pub(super) fn homework_list_json(
     limit: u64,
     now: time::PrimitiveDateTime,
 ) -> Value {
-    let mut seen = HashSet::new();
-    let mut selected: Vec<HomeworkItem> = items
-        .into_iter()
-        .filter(|item| item.activity_id.is_empty() || seen.insert(item.activity_id.clone()))
-        .collect();
-    if let Some(course) = filters
-        .course
-        .as_deref()
-        .filter(|course| !course.is_empty())
-    {
-        selected.retain(|item| item.site_id.as_deref() == Some(course));
-    }
-    if filters.undone {
-        selected.retain(|item| !item.is_submitted);
-    }
-    selected.sort_by(|left, right| {
-        let left_due = left.parsed_end_time();
-        let right_due = right.parsed_end_time();
-        left_due
-            .is_none()
-            .cmp(&right_due.is_none())
-            .then(left_due.cmp(&right_due))
-            .then(left.activity_name.cmp(&right.activity_name))
-    });
+    let (_, mut selected) = select_items(items, &filters);
     if limit != 0 {
         selected.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     }
@@ -181,7 +158,42 @@ pub(super) fn homework_list_json(
     })
 }
 
-fn assignment_json(item: &HomeworkItem, now: time::PrimitiveDateTime) -> Value {
+/// Deduplicate and filter rows once so `--new` can inspect the same selection
+/// that the normal list would display. Returns the deduplicated total before
+/// `--course` / `--undone`, matching Python's `items_total` note input.
+pub(super) fn select_items(
+    items: Vec<HomeworkItem>,
+    filters: &ListFilters,
+) -> (usize, Vec<HomeworkItem>) {
+    let mut seen = HashSet::new();
+    let mut selected: Vec<HomeworkItem> = items
+        .into_iter()
+        .filter(|item| item.activity_id.is_empty() || seen.insert(item.activity_id.clone()))
+        .collect();
+    let total = selected.len();
+    if let Some(course) = filters
+        .course
+        .as_deref()
+        .filter(|course| !course.is_empty())
+    {
+        selected.retain(|item| item.site_id.as_deref() == Some(course));
+    }
+    if filters.undone {
+        selected.retain(|item| !item.is_submitted);
+    }
+    selected.sort_by(|left, right| {
+        let left_due = left.parsed_end_time();
+        let right_due = right.parsed_end_time();
+        left_due
+            .is_none()
+            .cmp(&right_due.is_none())
+            .then(left_due.cmp(&right_due))
+            .then(left.activity_name.cmp(&right.activity_name))
+    });
+    (total, selected)
+}
+
+pub(super) fn assignment_json(item: &HomeworkItem, now: time::PrimitiveDateTime) -> Value {
     let due = item.parsed_end_time();
     let overdue = due.is_some_and(|due| now > due);
     let status = if item.is_submitted {
@@ -209,22 +221,48 @@ fn assignment_json(item: &HomeworkItem, now: time::PrimitiveDateTime) -> Value {
     })
 }
 
-fn publish_time(item: &HomeworkItem) -> Option<time::PrimitiveDateTime> {
+pub(super) fn publish_time(item: &HomeworkItem) -> Option<time::PrimitiveDateTime> {
     for key in PUBLISH_TIME_KEYS {
-        if let Some(parsed) = item
-            .raw
-            .get(*key)
-            .and_then(Value::as_str)
-            .and_then(local_timestamp)
-        {
+        if let Some(parsed) = item.raw.get(*key).and_then(value_timestamp) {
             return Some(parsed);
         }
     }
     item.begin_time.as_deref().and_then(local_timestamp)
 }
 
-fn local_timestamp(text: &str) -> Option<time::PrimitiveDateTime> {
+/// Parse a raw publish timestamp using the same accepted shapes as Python
+/// `parse_datetime`: local date/time, ISO `T`/`Z`/offset, and epoch numbers.
+pub(super) fn value_timestamp(value: &Value) -> Option<time::PrimitiveDateTime> {
+    match value {
+        Value::String(text) => local_timestamp(text),
+        Value::Number(number) => {
+            let raw = number.as_f64()?;
+            if !raw.is_finite() {
+                return None;
+            }
+            let seconds = if raw > 1e11 { raw / 1000.0 } else { raw };
+            let nanos = (seconds * 1_000_000_000.0).round();
+            if !nanos.is_finite() || nanos < i128::MIN as f64 || nanos > i128::MAX as f64 {
+                return None;
+            }
+            let utc = time::OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok()?;
+            Some(to_local(utc))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn local_timestamp(text: &str) -> Option<time::PrimitiveDateTime> {
+    use time::format_description::well_known::Rfc3339;
     use time::macros::format_description;
+    let text = text.trim().replace('/', "-");
+    if text.is_empty() || matches!(text.as_str(), "0" | "-" | "null" | "None") {
+        return None;
+    }
+    if let Ok(parsed) = time::OffsetDateTime::parse(&text, &Rfc3339) {
+        return Some(to_local(parsed));
+    }
+    let text = text.strip_suffix('Z').unwrap_or(&text);
     let text = text.split('.').next()?.trim();
     let text = text.replace('T', " ");
     time::PrimitiveDateTime::parse(
@@ -246,7 +284,13 @@ fn local_timestamp(text: &str) -> Option<time::PrimitiveDateTime> {
     })
 }
 
-fn iso_local_timestamp(value: time::PrimitiveDateTime) -> String {
+fn to_local(value: time::OffsetDateTime) -> time::PrimitiveDateTime {
+    let offset = time::UtcOffset::current_local_offset().unwrap_or_else(|_| value.offset());
+    let local = value.to_offset(offset);
+    time::PrimitiveDateTime::new(local.date(), local.time())
+}
+
+pub(super) fn iso_local_timestamp(value: time::PrimitiveDateTime) -> String {
     format!(
         "{} {:02}:{:02}:{:02}",
         value.date(),
@@ -1958,6 +2002,17 @@ mod tests {
         let error = fetch_all_homework(&mut transport, &session).expect_err("missing user id");
         assert_eq!(error.code, 3);
         assert!(transport.calls.is_empty());
+    }
+
+    #[test]
+    fn timestamp_parser_accepts_python_date_and_iso_shapes() {
+        assert!(local_timestamp("2026-08-01").is_some());
+        assert!(local_timestamp("2026-08-01 12:30:45.123").is_some());
+        assert!(local_timestamp("2026-08-01T12:30:45Z").is_some());
+        assert!(local_timestamp("2026-08-01 12:30:45Z").is_some());
+        assert!(local_timestamp("2026-08-01T12:30:45+08:00").is_some());
+        assert_eq!(local_timestamp("not-a-date"), None);
+        assert_eq!(local_timestamp("0"), None);
     }
 
     #[test]

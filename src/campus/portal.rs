@@ -13,6 +13,7 @@
 //! elements, raw-text elements, and nested elements of the same tag; it does
 //! not implement HTML error recovery, implied end tags, or foreign content.
 
+use super::session::{Route, ScopedTransport, Service, SessionDriver};
 use crate::cli::{CliError, CliResult};
 use crate::transport::{Request, Response, Transport};
 use serde_json::{Value, json};
@@ -152,19 +153,28 @@ fn notice_url_error(message: &str) -> CliError {
 
 /// Fetch the requested categories, merge them, sort by publication date
 /// descending (stable, empty dates last), then cut to `count`.
-#[allow(dead_code)] // exercised offline; wired when the portal session adapter lands
+#[cfg(test)]
 pub(super) fn fetch_notices(
     transport: &mut dyn Transport,
     types: Option<&[NoticeType]>,
     count: u64,
 ) -> CliResult<Value> {
+    collect_notices(types, count, |kind| {
+        get_page(transport, &list_url(kind), "notice list")
+    })
+}
+
+fn collect_notices(
+    types: Option<&[NoticeType]>,
+    count: u64,
+    mut page: impl FnMut(NoticeType) -> CliResult<String>,
+) -> CliResult<Value> {
     let target_types = types.unwrap_or(&DEFAULT_TYPES);
     let mut notices = Vec::new();
     if count > 0 {
         for kind in target_types {
-            let url = list_url(*kind);
-            let page = get_page(transport, &url, "notice list")?;
-            notices.extend(parse_notice_list(&page, *kind)?);
+            let html = page(*kind)?;
+            notices.extend(parse_notice_list(&html, *kind)?);
         }
         notices.sort_by(|left, right| notice_sort_time(right).cmp(notice_sort_time(left)));
         notices.truncate(usize::try_from(count).unwrap_or(usize::MAX));
@@ -176,8 +186,31 @@ pub(super) fn fetch_notices(
     }))
 }
 
+/// Fetch notices through the authenticated session driver. A confirmed auth
+/// failure restarts the whole list once after `renew`, matching Python's
+/// invalidate-and-retry recursion.
+pub(super) fn fetch_notices_with_session(
+    driver: &mut dyn SessionDriver,
+    types: Option<&[NoticeType]>,
+    count: u64,
+) -> CliResult<Value> {
+    let mut renewed = false;
+    loop {
+        let result = collect_notices(types, count, |kind| {
+            let mut transport = ScopedTransport::new(driver, Route::portal_list(kind));
+            get_page(&mut transport, &list_url(kind), "notice list")
+        });
+        match result {
+            Err(error) if !renewed && error.kind == "auth" => {
+                driver.renew(Service::Portal)?;
+                renewed = true;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Fetch one user-supplied notice page and map it to the CLI document.
-#[allow(dead_code)] // exercised offline; wired when the portal session adapter lands
 pub(super) fn fetch_notice_detail(
     transport: &mut dyn Transport,
     url: &str,
@@ -201,6 +234,29 @@ pub(super) fn fetch_notice_detail(
     }))
 }
 
+/// Fetch one notice through the authenticated session driver, renewing once
+/// only after a confirmed auth failure.
+pub(super) fn fetch_notice_detail_with_session(
+    driver: &mut dyn SessionDriver,
+    url: &str,
+    max_chars: usize,
+) -> CliResult<Value> {
+    let mut renewed = false;
+    loop {
+        let result = {
+            let mut transport = ScopedTransport::new(driver, Route::portal_detail());
+            fetch_notice_detail(&mut transport, url, max_chars)
+        };
+        match result {
+            Err(error) if !renewed && error.kind == "auth" => {
+                driver.renew(Service::Portal)?;
+                renewed = true;
+            }
+            result => return result,
+        }
+    }
+}
+
 fn truncate_chars(content: String, max_chars: usize) -> (String, bool) {
     if max_chars == 0 || content.chars().count() <= max_chars {
         return (content, false);
@@ -210,7 +266,6 @@ fn truncate_chars(content: String, max_chars: usize) -> (String, bool) {
 
 /// Fetch the balance widget. The referer and AJAX header are required by the
 /// upstream widget and are the only headers this module sets.
-#[allow(dead_code)] // exercised offline; wired when the portal session adapter lands
 pub(super) fn fetch_card(transport: &mut dyn Transport) -> CliResult<Value> {
     let response = send(
         transport,
@@ -231,6 +286,25 @@ pub(super) fn fetch_card(transport: &mut dyn Transport) -> CliResult<Value> {
         return Err(error);
     }
     parse_card(&text)
+}
+
+/// Fetch the card widget through the authenticated session driver, renewing
+/// once only after a confirmed auth failure.
+pub(super) fn fetch_card_with_session(driver: &mut dyn SessionDriver) -> CliResult<Value> {
+    let mut renewed = false;
+    loop {
+        let result = {
+            let mut transport = ScopedTransport::new(driver, Route::portal_card());
+            fetch_card(&mut transport)
+        };
+        match result {
+            Err(error) if !renewed && error.kind == "auth" => {
+                driver.renew(Service::Portal)?;
+                renewed = true;
+            }
+            result => return result,
+        }
+    }
 }
 
 pub(super) fn list_url(kind: NoticeType) -> String {

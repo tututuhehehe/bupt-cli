@@ -103,8 +103,10 @@ fn uses_campus_transport(name: &str, arguments: &ArgMatches) -> bool {
     matches!(name, "login" | "courses")
         || (name == "homework"
             && match arguments.subcommand_name() {
-                Some("show" | "verify") => true,
-                None => arguments.get_one::<u64>("new").is_none(),
+                Some("show" | "verify" | "download") => true,
+                // Every parent-level list mode is now read-only and routed:
+                // default/all, --course, --undone, and --new.
+                None => true,
                 _ => false,
             })
 }
@@ -240,6 +242,14 @@ fn run(
         );
         let mut library_curl = crate::transport::Curl::new(timeout);
         let mut campus_curl = crate::transport::CampusCurl::new(timeout);
+        let mut diagnose_curl = (name == "diagnose").then(|| {
+            let seconds = arguments.get_one::<f64>("request_timeout").copied();
+            let timeout = seconds.map_or(timeout, |seconds| {
+                Duration::from_secs_f64(seconds.min(120.0)).max(Duration::from_millis(1))
+            });
+            crate::transport::CampusCurl::for_diagnose(timeout)
+        });
+        let mut release_curl = crate::transport::ReleaseMetadataCurl::new(timeout);
         // An injected public transport marks the entire dispatch as a test;
         // the first injected transport then handles all non-library commands.
         let transport: &mut dyn Transport = match public {
@@ -247,6 +257,8 @@ fn run(
             Some(_) => offline,
             None if uses_public_library(name) => &mut library_curl,
             None if uses_campus_transport(name, arguments) => &mut campus_curl,
+            None if name == "diagnose" => diagnose_curl.as_mut().expect("diagnose has a transport"),
+            None if name == "update" && arguments.get_flag("check") => &mut release_curl,
             None => offline,
         };
         let mut context = Context::from_environment(timeout, transport)?;
@@ -373,6 +385,44 @@ mod tests {
     }
 
     #[test]
+    fn release_check_handles_a_redirect_through_the_cli_without_following_it() {
+        let args = ["bupt", "update", "--check", "--repo", "owner/repo"].map(OsString::from);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut scoped = Scripted::default();
+        let mut library = Scripted::default();
+        scoped.expected.push_back((
+            "GET",
+            "https://github.com/owner/repo/releases/latest".into(),
+            Ok(Response {
+                status: 302,
+                headers: vec![(
+                    "location".into(),
+                    "https://github.com/owner/repo/releases/tag/v10.0.0".into(),
+                )],
+                body: Vec::new(),
+            }),
+        ));
+        assert_eq!(
+            run(
+                &args,
+                &mut stdout,
+                &mut stderr,
+                &mut scoped,
+                Some(&mut library)
+            ),
+            0
+        );
+        assert!(stderr.is_empty());
+        assert!(library.calls.is_empty());
+        assert_eq!(scoped.calls.len(), 1);
+        let value: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(value["schema"], "bupt.v1");
+        assert_eq!(value["latest"], "10.0.0");
+        assert_eq!(value["update_available"], true);
+    }
+
+    #[test]
     fn private_transport_is_only_routed_to_the_first_cas_and_read_flows() {
         for (args, allowed) in [
             (&["bupt", "login"][..], true),
@@ -382,9 +432,9 @@ mod tests {
             (&["bupt", "homework", "--course", "site-1"][..], true),
             (&["bupt", "homework", "show", "1"][..], true),
             (&["bupt", "homework", "verify", "1"][..], true),
-            (&["bupt", "homework", "--new", "7"][..], false),
+            (&["bupt", "homework", "--new", "7"][..], true),
             (&["bupt", "homework", "submit", "1"][..], false),
-            (&["bupt", "homework", "download", "1"][..], false),
+            (&["bupt", "homework", "download", "1"][..], true),
             (&["bupt", "status"][..], false),
             (&["bupt", "diagnose"][..], false),
             (&["bupt", "library", "search", "example"][..], false),

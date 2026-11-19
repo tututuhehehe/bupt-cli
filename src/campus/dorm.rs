@@ -6,103 +6,196 @@ use std::path::Path;
 
 const DEFAULT_BUILDING: &str = "学一楼";
 const DEFAULT_ROOM: &str = "101";
+const SHAHE_FLOORS: &[&str] = &["1层", "2层", "3层", "4层", "5层", "6层", "强电"];
+const HAIDIAN_FLOORS: &[&str] = &["1", "2", "3", "4", "5"];
+const HAIDIAN_XUE_1_FLOORS: &[&str] = &["-1", "1", "2", "3", "4", "5"];
+
 #[derive(Clone, Copy)]
 pub(super) struct Building {
     key: &'static str,
     pub(super) name: &'static str,
+    partment_id: &'static str,
+    area_id: i32,
+    default_floors: &'static [&'static str],
+}
+
+impl Building {
+    pub(super) fn partment_id(self) -> &'static str {
+        self.partment_id
+    }
+
+    pub(super) fn area_id(self) -> i32 {
+        self.area_id
+    }
+
+    pub(super) fn default_floors(self) -> &'static [&'static str] {
+        self.default_floors
+    }
+
+    pub(super) fn area(self) -> Area {
+        match self.area_id {
+            2 => Area::Shahe,
+            _ => Area::Xitucheng,
+        }
+    }
 }
 
 const BUILDINGS: &[Building] = &[
     Building {
         key: "SHAHE_A",
         name: "沙河校区雁北园A楼",
+        partment_id: "沙河校区雁北园A楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_B",
         name: "沙河校区雁北园B楼",
+        partment_id: "沙河校区雁北园B楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_C",
         name: "沙河校区雁北园C楼",
+        partment_id: "沙河校区雁北园C楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_D1",
         name: "沙河校区雁北园D1楼",
+        partment_id: "沙河校区雁北园D1楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_D2",
         name: "沙河校区雁北园D2楼",
+        partment_id: "沙河校区雁北园D2楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_E",
         name: "沙河校区雁北园E楼",
+        partment_id: "沙河校区雁北园E楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_S2",
         name: "沙河校区雁南园S2楼",
+        partment_id: "沙河校区雁南园S2楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_S3",
         name: "沙河校区雁南园S3楼",
+        partment_id: "沙河校区雁南园S3楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_S4",
         name: "沙河校区雁南园S4楼",
+        partment_id: "沙河校区雁南园S4楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_S5",
         name: "沙河校区雁南园S5楼",
+        partment_id: "沙河校区雁南园S5楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "SHAHE_S6",
         name: "沙河校区雁南园S6楼",
+        partment_id: "沙河校区雁南园S6楼",
+        area_id: 2,
+        default_floors: SHAHE_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_1",
         name: "学一楼",
+        partment_id: "f8067fcf9c4f48c6b2f8e793d64b7b65",
+        area_id: 1,
+        default_floors: HAIDIAN_XUE_1_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_2",
         name: "学二楼",
+        partment_id: "f2224047ad13475eb7091f910ae27585",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_3",
         name: "学三楼",
+        partment_id: "f69719ee61454796b1574a314d136123",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_4",
         name: "学四楼",
+        partment_id: "c526d2367cd24fcdac2538975d1bec75",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_5",
         name: "学五楼",
+        partment_id: "a3d3473047464fba9196e224659cc377",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_6",
         name: "学六楼",
+        partment_id: "ac3a79c0e22e495096577d3aef1f5532",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_8",
         name: "学八楼",
+        partment_id: "f69719ee61454796b1574a314d136059",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_9",
         name: "学九楼",
+        partment_id: "1c89629ec4fa41ba9773b092e3851c08",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_10",
         name: "学十楼",
+        partment_id: "d5cf9743f0864692a18c25efb02bf16a",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_11",
         name: "学十一楼",
+        partment_id: "85a2e185790440e7978354838afb4f03",
+        area_id: 1,
+        default_floors: HAIDIAN_FLOORS,
     },
     Building {
         key: "HAIDIAN_XUE_29",
         name: "90学二十九楼",
+        partment_id: "90bc4ce8f4084b4f8695ad1fa319b839",
+        area_id: 1,
+        default_floors: &[],
     },
 ];
-
 #[derive(Clone, Copy)]
 pub(super) enum Area {
     Shahe,
@@ -405,6 +498,27 @@ mod tests {
         assert_eq!(configured.room, "202");
         assert_eq!(configured.floor.as_deref(), Some("2"));
         assert_eq!(configured.source, "config");
+    }
+
+    #[test]
+    fn building_metadata_matches_the_python_constants() {
+        let xue1 = resolve_building("学一楼").unwrap();
+        assert_eq!(xue1.area_id(), 1);
+        assert_eq!(xue1.partment_id(), "f8067fcf9c4f48c6b2f8e793d64b7b65");
+        assert_eq!(xue1.default_floors(), &["-1", "1", "2", "3", "4", "5"]);
+
+        let shahe = resolve_building("SHAHE_A").unwrap();
+        assert_eq!(shahe.area_id(), 2);
+        assert_eq!(shahe.partment_id(), "沙河校区雁北园A楼");
+        assert_eq!(
+            shahe.default_floors(),
+            &["1层", "2层", "3层", "4层", "5层", "6层", "强电"]
+        );
+
+        let xue29 = resolve_building("学29楼").unwrap();
+        assert_eq!(xue29.name, "90学二十九楼");
+        assert_eq!(xue29.partment_id(), "90bc4ce8f4084b4f8695ad1fa319b839");
+        assert!(xue29.default_floors().is_empty());
     }
 
     #[test]
