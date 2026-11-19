@@ -240,6 +240,7 @@ fn run(
         );
         let mut library_curl = crate::transport::Curl::new(timeout);
         let mut campus_curl = crate::transport::CampusCurl::new(timeout);
+        let mut release_curl = crate::transport::ReleaseMetadataCurl::new(timeout);
         // An injected public transport marks the entire dispatch as a test;
         // the first injected transport then handles all non-library commands.
         let transport: &mut dyn Transport = match public {
@@ -247,6 +248,7 @@ fn run(
             Some(_) => offline,
             None if uses_public_library(name) => &mut library_curl,
             None if uses_campus_transport(name, arguments) => &mut campus_curl,
+            None if name == "update" && arguments.get_flag("check") => &mut release_curl,
             None => offline,
         };
         let mut context = Context::from_environment(timeout, transport)?;
@@ -370,6 +372,44 @@ mod tests {
         assert_eq!(document["schema"], "bupt.v1");
         assert_eq!(document["ok"], true);
         assert_eq!(document["count"], 0);
+    }
+
+    #[test]
+    fn release_check_handles_a_redirect_through_the_cli_without_following_it() {
+        let args = ["bupt", "update", "--check", "--repo", "owner/repo"].map(OsString::from);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut scoped = Scripted::default();
+        let mut library = Scripted::default();
+        scoped.expected.push_back((
+            "GET",
+            "https://github.com/owner/repo/releases/latest".into(),
+            Ok(Response {
+                status: 302,
+                headers: vec![(
+                    "location".into(),
+                    "https://github.com/owner/repo/releases/tag/v10.0.0".into(),
+                )],
+                body: Vec::new(),
+            }),
+        ));
+        assert_eq!(
+            run(
+                &args,
+                &mut stdout,
+                &mut stderr,
+                &mut scoped,
+                Some(&mut library)
+            ),
+            0
+        );
+        assert!(stderr.is_empty());
+        assert!(library.calls.is_empty());
+        assert_eq!(scoped.calls.len(), 1);
+        let value: Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(value["schema"], "bupt.v1");
+        assert_eq!(value["latest"], "10.0.0");
+        assert_eq!(value["update_available"], true);
     }
 
     #[test]

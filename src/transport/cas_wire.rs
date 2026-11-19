@@ -192,7 +192,7 @@ fn option(config: &mut String, name: &'static str, value: &str) {
     config.push_str("\"\n");
 }
 
-fn parse_response(mut stdout: &[u8]) -> CliResult<Response> {
+pub(super) fn parse_response(mut stdout: &[u8]) -> CliResult<Response> {
     for _ in 0..=3 {
         let end = stdout[..stdout.len().min(MAX_HEADERS)]
             .windows(4)

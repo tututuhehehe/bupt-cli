@@ -1,4 +1,5 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
+use crate::transport::Request;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::{Value, json};
 use std::fs;
@@ -7,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 const DEFAULT_REPO: &str = "tututuhehehe/bupt-cli";
+const GITHUB_RELEASE_HOST: &str = "github.com";
 const MACOS_ARM64_ASSET: &str = "bupt-macos-arm64.zip";
 const WINDOWS_X64_ASSET: &str = "bupt-windows-x64.zip";
+const USER_AGENT: &str = "bupt-cli";
 
 pub(crate) fn commands() -> Vec<Command> {
     vec![
@@ -49,7 +52,7 @@ pub(crate) fn run(
     context: &mut Context<'_>,
 ) -> CliResult<Outcome> {
     match name {
-        "update" => update(matches),
+        "update" => update(matches, context),
         "uninstall" => uninstall(matches, context),
         _ => Err(CliError::usage(format!(
             "unknown lifecycle command: {name}"
@@ -57,8 +60,50 @@ pub(crate) fn run(
     }
 }
 
-fn update(matches: &ArgMatches) -> CliResult<Outcome> {
+fn update(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     let repo = selected_repo(matches)?;
+    if !matches.get_flag("check") {
+        return apply_update(&repo);
+    }
+
+    let release = latest_release(context, &repo)?;
+    let current = env!("CARGO_PKG_VERSION");
+    let (latest, update_available, note) = match release {
+        Release::Missing => (
+            None,
+            Some(false),
+            format!("{repo} 没有可用的 release（或仓库不存在）；用 --repo 指定仓库"),
+        ),
+        Release::NoVersion => (None, None, "release 跳转里没有版本号".to_owned()),
+        Release::Tag(tag) => {
+            let latest = tag.trim_start_matches('v').to_owned();
+            if is_newer(&latest, current) {
+                (
+                    Some(latest),
+                    Some(true),
+                    "有新版本；此构建仅提供版本检查，不执行安装".to_owned(),
+                )
+            } else {
+                (Some(latest), Some(false), "已经是最新版本".to_owned())
+            }
+        }
+    };
+    Ok(Outcome {
+        data: json!({
+            "current": current,
+            "repo": repo,
+            "latest": latest,
+            "update_available": update_available,
+            "note": note,
+        }),
+        code: 0,
+        diagnostic: None,
+    })
+}
+
+/// The apply path still needs download, integrity checks, staging and a safe
+/// replacement. Keep it offline and pending instead of pretending to update.
+fn apply_update(repo: &str) -> CliResult<Outcome> {
     let asset = release_asset(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
         CliError::new(
             5,
@@ -74,19 +119,158 @@ fn update(matches: &ArgMatches) -> CliResult<Outcome> {
     let target = current_verified_executable()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "no verified current executable".into());
-    let action = if matches.get_flag("check") {
-        "update check"
-    } else {
-        "update installation"
-    };
     Err(CliError::new(
         5,
         "upstream",
-        format!("{action} for {repo} is not available in this migration build"),
+        format!("update installation for {repo} is not available in this migration build"),
         format!(
-            "Would use {asset} and target {target}; release checks, downloads and replacement are pending."
+            "Would use {asset} and target {target}; downloads, replacement and the Windows runtime swap are pending."
         ),
     ))
+}
+
+enum Release {
+    Missing,
+    NoVersion,
+    Tag(String),
+}
+
+fn latest_release(context: &mut Context<'_>, repo: &str) -> CliResult<Release> {
+    let url = format!("https://{GITHUB_RELEASE_HOST}/{repo}/releases/latest");
+    let response = context.transport.send(Request {
+        method: "GET",
+        url,
+        headers: vec![("User-Agent".into(), USER_AGENT.into())],
+        body: Vec::new(),
+    })?;
+    match response.status {
+        301 | 302 | 303 | 307 | 308 => {
+            let location = header(&response.headers, "location")
+                .ok_or_else(|| malformed_release_redirect("redirect has no Location header"))?;
+            let tag = release_tag_from_location(location, repo)?;
+            if tag == "latest" {
+                Ok(Release::NoVersion)
+            } else {
+                Ok(Release::Tag(tag))
+            }
+        }
+        404 => match header(&response.headers, "location") {
+            Some(location) if !location.trim().is_empty() => {
+                Err(upstream_http_error(response.status))
+            }
+            _ => Ok(Release::Missing),
+        },
+        401 | 403 => Err(CliError::new(
+            3,
+            "auth",
+            format!("release check was rejected (HTTP {})", response.status),
+            "GitHub refused the release request.",
+        )),
+        status => Err(upstream_http_error(status)),
+    }
+}
+
+fn release_tag_from_location(location: &str, repo: &str) -> CliResult<String> {
+    let location = location.trim();
+    if location.is_empty()
+        || location
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(malformed_release_redirect(
+            "Location is empty or contains whitespace",
+        ));
+    }
+    let path = location
+        .strip_prefix("https://")
+        .and_then(|rest| rest.strip_prefix(GITHUB_RELEASE_HOST))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .ok_or_else(|| malformed_release_redirect("Location must be HTTPS on github.com"))?;
+    if path.contains(['?', '#']) {
+        return Err(malformed_release_redirect(
+            "Location must not carry a query or fragment",
+        ));
+    }
+    let prefix = format!("{repo}/releases/tag/");
+    let tag = path
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(&prefix))
+        .and_then(|_| path.get(prefix.len()..))
+        .ok_or_else(|| {
+            malformed_release_redirect("Location must name this repository's release tag")
+        })?;
+    if tag.is_empty()
+        || tag.contains('/')
+        || tag.contains('%')
+        || tag.contains('\\')
+        || tag == "."
+        || tag == ".."
+    {
+        return Err(malformed_release_redirect(
+            "Location does not name a single release tag",
+        ));
+    }
+    Ok(tag.to_owned())
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn malformed_release_redirect(reason: &str) -> CliError {
+    CliError::new(
+        5,
+        "upstream",
+        format!("release check returned an invalid redirect: {reason}"),
+        "Expected https://github.com/OWNER/REPO/releases/tag/TAG.",
+    )
+}
+
+fn upstream_http_error(status: u16) -> CliError {
+    let hint = if status == 429 {
+        "GitHub is rate limiting release checks; wait before retrying."
+    } else {
+        "GitHub returned an unexpected response."
+    };
+    CliError::new(
+        5,
+        "upstream",
+        format!("release check failed with HTTP {status}"),
+        hint,
+    )
+}
+
+/// Mirrors the Python comparison: only the first three numeric runs count, and
+/// a shorter tuple is older than a longer one with the same prefix. Comparing
+/// strings would rank `1.10.0` below `1.9.0`.
+fn is_newer(latest: &str, current: &str) -> bool {
+    version_parts(latest) > version_parts(current)
+}
+
+fn version_parts(text: &str) -> Vec<u64> {
+    let mut parts = Vec::new();
+    let mut digits = String::new();
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+        } else if !digits.is_empty() {
+            parts.push(digits.parse().unwrap_or(u64::MAX));
+            digits.clear();
+            if parts.len() == 3 {
+                return parts;
+            }
+        }
+    }
+    if parts.len() < 3 && !digits.is_empty() {
+        parts.push(digits.parse().unwrap_or(u64::MAX));
+    }
+    if parts.is_empty() {
+        parts.push(0);
+    }
+    parts
 }
 
 fn selected_repo(matches: &ArgMatches) -> CliResult<String> {
@@ -729,7 +913,7 @@ fn with_reason(path: &Path, reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::Offline;
+    use crate::transport::{Offline, Response, Transport, testing::Scripted};
     use std::fs;
     use std::time::Duration;
 
@@ -757,7 +941,7 @@ mod tests {
         if cfg!(windows) { "bupt.exe" } else { "bupt" }
     }
 
-    fn test_context<'a>(root: &Path, transport: &'a mut Offline) -> Context<'a> {
+    fn test_context<'a>(root: &Path, transport: &'a mut dyn Transport) -> Context<'a> {
         Context {
             home_dir: root.join("home"),
             config_dir: root.join("config"),
@@ -765,6 +949,77 @@ mod tests {
             timeout: Duration::from_secs(1),
             transport,
         }
+    }
+
+    fn update_matches(args: &[&str]) -> ArgMatches {
+        commands()
+            .into_iter()
+            .find(|command| command.get_name() == "update")
+            .expect("update command")
+            .try_get_matches_from(args)
+            .expect("valid update arguments")
+    }
+
+    fn check_release(
+        root: &Path,
+        repo: &str,
+        response: CliResult<Response>,
+    ) -> (CliResult<Outcome>, Scripted) {
+        let mut transport = Scripted::default();
+        transport.expected.push_back((
+            "GET",
+            format!("https://github.com/{repo}/releases/latest"),
+            response,
+        ));
+        let result = {
+            let mut context = test_context(root, &mut transport);
+            update(
+                &update_matches(&["update", "--check", "--repo", repo]),
+                &mut context,
+            )
+        };
+        (result, transport)
+    }
+
+    fn response(status: u16, headers: &[(&str, &str)]) -> Response {
+        Response {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            body: Vec::new(),
+        }
+    }
+
+    fn tree_paths(root: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).expect("read test tree") {
+                let entry = entry.expect("read test tree entry");
+                let path = entry.path();
+                paths.push(path.clone());
+                if entry.file_type().expect("read test entry type").is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    fn expect_error(result: CliResult<Outcome>, message: &str) -> CliError {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
+    }
+
+    fn assert_upstream(error: CliError) -> CliError {
+        assert_eq!(error.code, 5, "expected upstream exit: {error:?}");
+        assert_eq!(error.kind, "upstream");
+        error
     }
 
     fn valid_timetable() -> &'static str {
@@ -1142,6 +1397,253 @@ mod tests {
         assert!(uninstall_note(false, 0, 1, 0).contains("未移除内容"));
         assert!(uninstall_note(false, 1, 0, 1).contains("--keep-data"));
         assert_ne!(uninstall_note(false, 1, 1, 0), "卸载完成");
+    }
+
+    #[test]
+    fn update_check_reports_a_newer_release_without_side_effects() {
+        let root = tempfile::tempdir().expect("create update check directory");
+        let sentinel = root.path().join("sentinel.json");
+        write(&sentinel, "{}");
+        let before = tree_paths(root.path());
+        let (result, transport) = check_release(
+            root.path(),
+            "owner/repo",
+            Ok(response(
+                302,
+                &[(
+                    "location",
+                    "https://github.com/owner/repo/releases/tag/v0.0.1",
+                )],
+            )),
+        );
+        let outcome = result.expect("release check succeeds");
+
+        assert_eq!(outcome.code, 0);
+        assert_eq!(outcome.data["current"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(outcome.data["repo"], json!("owner/repo"));
+        assert_eq!(outcome.data["latest"], json!("0.0.1"));
+        assert_eq!(outcome.data["update_available"], json!(true));
+        assert!(
+            outcome.data["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("新版本"))
+        );
+
+        assert_eq!(transport.calls.len(), 1);
+        assert_eq!(transport.calls[0].method, "GET");
+        assert_eq!(
+            transport.calls[0].url,
+            "https://github.com/owner/repo/releases/latest"
+        );
+        assert_eq!(
+            transport.calls[0].headers,
+            vec![("User-Agent".to_owned(), "bupt-cli".to_owned())]
+        );
+        assert!(transport.calls[0].body.is_empty());
+        assert_eq!(tree_paths(root.path()), before);
+    }
+
+    #[test]
+    fn update_check_reports_missing_release_and_no_upgrade() {
+        let root = tempfile::tempdir().expect("create no-release directory");
+        let (result, transport) = check_release(root.path(), "owner/repo", Ok(response(404, &[])));
+        let outcome = result.expect("a missing release is not an error");
+        assert_eq!(outcome.code, 0);
+        assert!(outcome.data["latest"].is_null());
+        assert_eq!(outcome.data["update_available"], json!(false));
+        assert!(
+            outcome.data["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("没有可用的 release"))
+        );
+        assert_eq!(transport.calls.len(), 1);
+
+        let (result, transport) = check_release(
+            root.path(),
+            "owner/repo",
+            Ok(response(
+                302,
+                &[(
+                    "Location",
+                    "https://github.com/owner/repo/releases/tag/v0.0.0",
+                )],
+            )),
+        );
+        let outcome = result.expect("an equal release is not a failure");
+        assert_eq!(outcome.code, 0);
+        assert_eq!(outcome.data["latest"], json!("0.0.0"));
+        assert_eq!(outcome.data["update_available"], json!(false));
+        assert_eq!(outcome.data["note"], json!("已经是最新版本"));
+        assert_eq!(transport.calls.len(), 1);
+
+        let (result, transport) = check_release(
+            root.path(),
+            "owner/repo",
+            Ok(response(
+                302,
+                &[("Location", "https://github.com/owner/repo/releases/tag/v0")],
+            )),
+        );
+        let outcome = result.expect("an older short tag is not a failure");
+        assert_eq!(outcome.code, 0);
+        assert_eq!(outcome.data["latest"], json!("0"));
+        assert_eq!(outcome.data["update_available"], json!(false));
+        assert_eq!(transport.calls.len(), 1);
+    }
+
+    #[test]
+    fn update_check_reports_a_redirect_without_a_version() {
+        let root = tempfile::tempdir().expect("create no-version directory");
+        let (result, _) = check_release(
+            root.path(),
+            "owner/repo",
+            Ok(response(
+                302,
+                &[(
+                    "Location",
+                    "https://github.com/owner/repo/releases/tag/latest",
+                )],
+            )),
+        );
+        let outcome = result.expect("a valid redirect without a tag is still a check");
+        assert_eq!(outcome.code, 0);
+        assert!(outcome.data["latest"].is_null());
+        assert!(outcome.data["update_available"].is_null());
+        assert_eq!(outcome.data["note"], json!("release 跳转里没有版本号"));
+    }
+
+    #[test]
+    fn release_location_must_name_the_same_repository_tag() {
+        assert_eq!(
+            release_tag_from_location(
+                "https://github.com/owner/repo/releases/tag/v1.2.3",
+                "owner/repo"
+            )
+            .expect("valid release location"),
+            "v1.2.3"
+        );
+        assert_eq!(
+            release_tag_from_location(
+                "https://github.com/Owner/Repo/releases/tag/v1.2.3",
+                "owner/repo"
+            )
+            .expect("GitHub repository names are case-insensitive"),
+            "v1.2.3"
+        );
+
+        for location in [
+            "https://evil.example/owner/repo/releases/tag/v1.2.3",
+            "http://github.com/owner/repo/releases/tag/v1.2.3",
+            "https://github.com/other/repo/releases/tag/v1.2.3",
+            "https://github.com/owner/other/releases/tag/v1.2.3",
+            "https://github.com/owner/repo/releases/latest",
+            "https://github.com/owner/repo/releases/tag/",
+            "https://github.com/owner/repo/releases/tag/v1.2.3/extra",
+            "https://github.com/owner/repo/releases/tag/v1.2.3?asset=1",
+            "https://github.com/owner/repo/releases/tag/v1.2.3#notes",
+            "https://github.com/owner/repo/releases/tag/v1%2F2",
+        ] {
+            let error = release_tag_from_location(location, "owner/repo")
+                .expect_err("foreign or malformed release location");
+            assert_eq!(error.code, 5, "location: {location}");
+            assert_eq!(error.kind, "upstream", "location: {location}");
+        }
+    }
+
+    #[test]
+    fn update_check_rejects_a_foreign_redirect() {
+        let root = tempfile::tempdir().expect("create foreign redirect directory");
+        let before = tree_paths(root.path());
+        let (result, transport) = check_release(
+            root.path(),
+            "owner/repo",
+            Ok(response(
+                302,
+                &[(
+                    "Location",
+                    "https://evil.example/owner/repo/releases/tag/v1.2.3",
+                )],
+            )),
+        );
+        let error = assert_upstream(expect_error(result, "a foreign redirect must fail closed"));
+        assert!(error.message.contains("invalid redirect"));
+        assert_eq!(transport.calls.len(), 1);
+        assert_eq!(tree_paths(root.path()), before);
+    }
+
+    #[test]
+    fn release_check_layers_transport_and_http_failures() {
+        let root = tempfile::tempdir().expect("create release failure directory");
+        let once = |response: CliResult<Response>| {
+            let (result, transport) = check_release(root.path(), "owner/repo", response);
+            (expect_error(result, "release failure"), transport)
+        };
+
+        let (error, transport) = once(Err(CliError::new(
+            4,
+            "network",
+            "synthetic transport failure",
+            "",
+        )));
+        assert_eq!(error.code, 4);
+        assert_eq!(error.kind, "network");
+        assert_eq!(transport.calls.len(), 1);
+
+        for status in [500, 429] {
+            let (error, transport) = once(Ok(response(status, &[])));
+            assert_upstream(error);
+            assert_eq!(transport.calls.len(), 1);
+        }
+
+        let (error, transport) = once(Ok(response(403, &[])));
+        assert_eq!(error.code, 3);
+        assert_eq!(error.kind, "auth");
+        assert_eq!(transport.calls.len(), 1);
+
+        let (error, transport) = once(Ok(response(200, &[])));
+        assert_upstream(error);
+        assert_eq!(transport.calls.len(), 1);
+    }
+
+    #[test]
+    fn version_ordering_does_not_promote_older_tags() {
+        for (latest, current, expected) in [
+            ("1.10.0", "1.9.0", true),
+            ("1.9.0", "1.10.0", false),
+            ("1.2.3", "1.2.3", false),
+            ("1.2.2", "1.2.3", false),
+            ("1.2", "1.2.0", false),
+            ("1.2.3.4", "1.2.3", false),
+            ("0.0.1", "0.0.0", true),
+            ("0.0", "0.0.0", false),
+            ("nightly", "0.0.0", false),
+        ] {
+            assert_eq!(
+                is_newer(latest, current),
+                expected,
+                "latest={latest} current={current}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_update_remains_pending_without_network_or_files() {
+        let root = tempfile::tempdir().expect("create apply directory");
+        let sentinel = root.path().join("sentinel.json");
+        write(&sentinel, "{}");
+        let before = tree_paths(root.path());
+        let mut transport = Scripted::default();
+        let result = {
+            let mut context = test_context(root.path(), &mut transport);
+            update(
+                &update_matches(&["update", "--repo", "owner/repo"]),
+                &mut context,
+            )
+        };
+        let error = assert_upstream(expect_error(result, "apply must remain pending"));
+        assert!(error.message.contains("not available"));
+        assert!(transport.calls.is_empty());
+        assert_eq!(tree_paths(root.path()), before);
     }
 
     #[test]
