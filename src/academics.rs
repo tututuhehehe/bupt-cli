@@ -7,8 +7,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
+
+mod graduate;
+
+use graduate::GradPageSource as _;
 
 const WEEKDAYS: [&str; 7] = [
     "星期一",
@@ -194,14 +198,29 @@ fn update_schedule(ctx: &Context<'_>) -> CliResult<Outcome> {
 }
 
 fn run_exams(ctx: &Context<'_>) -> CliResult<Outcome> {
-    let account = identity::require_authenticated_profile(&ctx.config_dir)?;
+    let mut source = graduate::ChromePageSource::new(&ctx.config_dir, &ctx.cache_dir, ctx.timeout);
+    run_exams_with_source(&ctx.config_dir, &mut source)
+}
+
+fn run_exams_with_source(
+    config_dir: &Path,
+    source: &mut impl graduate::GradPageSource,
+) -> CliResult<Outcome> {
+    let account = identity::require_authenticated_profile(config_dir)?;
     let role = required_role(&account)?;
-    let label = if role == Role::Graduate {
-        "研究生考试数据源"
-    } else {
-        "本科考试数据源"
-    };
-    Err(pending_remote(label))
+    if role != Role::Graduate {
+        return Err(pending_remote("本科考试数据源"));
+    }
+    let pages = source.collect(&[graduate::GradPage::Exams])?;
+    let html = pages.exams.ok_or_else(|| {
+        CliError::new(
+            5,
+            "upstream",
+            "研究生考试页面缺失，无法读取考试安排",
+            "重试一次；不会伪造考试日期、场次或地点。",
+        )
+    })?;
+    graduate::parse_exams(&html).map(outcome)
 }
 
 fn run_scores(ctx: &Context<'_>) -> CliResult<Outcome> {
@@ -294,27 +313,43 @@ trait TimetableSource {
     fn fetch(&mut self, username: &str, role: Role) -> CliResult<Snapshot>;
 }
 
-struct UnavailableSource;
+struct NativeTimetableSource {
+    config_dir: PathBuf,
+    cache_dir: PathBuf,
+    timeout: Duration,
+}
 
-impl TimetableSource for UnavailableSource {
-    fn fetch(&mut self, _: &str, _: Role) -> CliResult<Snapshot> {
-        Err(CliError::new(
-            5,
-            "upstream",
-            "当前构建没有接通教务课表刷新；不会伪造课表数据",
-            "等待教务响应注入后再接入联网刷新。",
-        ))
+impl NativeTimetableSource {
+    fn new(config_dir: &Path, cache_dir: &Path, timeout: Duration) -> Self {
+        Self {
+            config_dir: config_dir.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            timeout,
+        }
+    }
+}
+
+impl TimetableSource for NativeTimetableSource {
+    fn fetch(&mut self, username: &str, role: Role) -> CliResult<Snapshot> {
+        match role {
+            Role::Graduate => {
+                let mut pages = graduate::ChromePageSource::new(
+                    &self.config_dir,
+                    &self.cache_dir,
+                    self.timeout,
+                );
+                let pages =
+                    pages.collect(&[graduate::GradPage::Schedule, graduate::GradPage::Calendar])?;
+                graduate::snapshot_from_pages(username, &pages)
+            }
+            Role::Undergraduate => Err(pending_remote("本科课表数据源")),
+        }
     }
 }
 
 fn current_selection(ctx: &Context<'_>, today: Date, force: bool) -> CliResult<Selected> {
-    select_snapshot(
-        &ctx.config_dir,
-        &ctx.cache_dir,
-        today,
-        force,
-        &mut UnavailableSource,
-    )
+    let mut source = NativeTimetableSource::new(&ctx.config_dir, &ctx.cache_dir, ctx.timeout);
+    select_snapshot(&ctx.config_dir, &ctx.cache_dir, today, force, &mut source)
 }
 
 fn select_snapshot(
@@ -521,12 +556,26 @@ fn validate_refreshed_snapshot(snapshot: &Snapshot, today: Date) -> CliResult<()
     if snapshot.calendar.is_empty() {
         return Err(refresh_failed("刷新结果缺少教学周日历，已保留上一份快照"));
     }
+    let mut previous_week = None;
     for (week, dates) in &snapshot.calendar {
         if *week <= 0 {
             return Err(refresh_failed(format!(
                 "刷新结果包含无效周次 {week}，已保留上一份快照"
             )));
         }
+        if let Some(previous) = previous_week
+            && *week != previous + 1
+        {
+            return Err(refresh_failed(format!(
+                "刷新结果的教学周次不连续（第 {previous} 周后是第 {week} 周），已保留上一份快照"
+            )));
+        }
+        if previous_week.is_none() && *week != 1 {
+            return Err(refresh_failed(format!(
+                "刷新结果没有从第 1 教学周开始（首周是第 {week} 周），已保留上一份快照"
+            )));
+        }
+        previous_week = Some(*week);
         if dates.len() != WEEKDAYS.len() {
             return Err(refresh_failed(format!(
                 "刷新结果第 {week} 周不是完整的七天日期，已保留上一份快照"
@@ -1244,6 +1293,7 @@ fn week_arg(text: &str) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::graduate::{GradPage, GradPageSource, GradPages};
     use super::*;
     use std::collections::VecDeque;
     use tempfile::tempdir;
@@ -1316,18 +1366,26 @@ mod tests {
         )
     }
 
-    fn account(config: &Path) {
+    fn account_with_role(config: &Path, role: &str) {
         fs::create_dir_all(config).expect("create config directory");
         fs::write(
             config.join("credentials.json"),
             serde_json::to_vec_pretty(&json!({
                 "username": USER,
                 "password": SESSION_PASSWORD,
-                "role": "undergraduate",
+                "role": role,
             }))
             .expect("serialize synthetic account"),
         )
         .expect("write synthetic account");
+    }
+
+    fn account(config: &Path) {
+        account_with_role(config, "undergraduate");
+    }
+
+    fn graduate_account(config: &Path) {
+        account_with_role(config, "graduate");
     }
 
     struct FakeSource {
@@ -1351,6 +1409,89 @@ mod tests {
                 .pop_front()
                 .expect("selection fetched more times than the test allowed")
         }
+    }
+
+    struct FakePageSource {
+        pages: GradPages,
+        calls: usize,
+        wanted: Vec<Vec<GradPage>>,
+    }
+
+    impl FakePageSource {
+        fn with(pages: GradPages) -> Self {
+            Self {
+                pages,
+                calls: 0,
+                wanted: Vec::new(),
+            }
+        }
+    }
+
+    impl GradPageSource for FakePageSource {
+        fn collect(&mut self, wanted: &[GradPage]) -> CliResult<GradPages> {
+            self.calls += 1;
+            self.wanted.push(wanted.to_vec());
+            Ok(self.pages.clone())
+        }
+    }
+
+    struct GraduatePageTimetable<S> {
+        pages: S,
+    }
+
+    impl<S: GradPageSource> TimetableSource for GraduatePageTimetable<S> {
+        fn fetch(&mut self, username: &str, role: Role) -> CliResult<Snapshot> {
+            if role != Role::Graduate {
+                return Err(CliError::new(
+                    2,
+                    "usage",
+                    "test timetable source only serves graduate accounts",
+                    "",
+                ));
+            }
+            let pages = self
+                .pages
+                .collect(&[GradPage::Schedule, GradPage::Calendar])?;
+            graduate::snapshot_from_pages(username, &pages)
+        }
+    }
+
+    fn chinese_week(week: i64) -> String {
+        let digit = |value: i64| match value {
+            1 => "一",
+            2 => "二",
+            3 => "三",
+            4 => "四",
+            5 => "五",
+            6 => "六",
+            7 => "七",
+            8 => "八",
+            9 => "九",
+            _ => "",
+        };
+        match week {
+            1..=9 => digit(week).to_string(),
+            10 => "十".to_string(),
+            11..=19 => format!("十{}", digit(week - 10)),
+            _ => panic!("test calendar only needs weeks 1..=19"),
+        }
+    }
+
+    fn complete_calendar() -> String {
+        let start = Date::parse("2026-08-31").expect("synthetic term Monday");
+        let mut html =
+            String::from("<td class=\"tb_line\"> 学期：2026-2027秋学期 </td><table id=\"dgData\">");
+        for week in 1..=19 {
+            html.push_str("<tr>");
+            html.push_str(&format!("<td>{}</td>", chinese_week(week)));
+            for day in 0..7 {
+                let date = start.add_days((week - 1) * 7 + day);
+                html.push_str(&format!("<td>{}&nbsp;({}月)</td>", date.day, date.month));
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</table>");
+        html
     }
 
     fn cache_file(directory: &Path) -> PathBuf {
@@ -1653,6 +1794,150 @@ mod tests {
             before,
             "a failed manual update must preserve the previous snapshot"
         );
+    }
+
+    #[test]
+    fn injected_graduate_pages_refresh_a_complete_current_snapshot() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        graduate_account(&config);
+        let pages = GradPages {
+            schedule: Some(
+                include_str!("../tests/fixtures/contracts/academics/timetable_graduate.html")
+                    .to_string(),
+            ),
+            calendar: Some(complete_calendar()),
+            exams: None,
+        };
+        let mut source = GraduatePageTimetable {
+            pages: FakePageSource::with(pages),
+        };
+
+        let selected = select_snapshot(&config, &cache, today(), false, &mut source)
+            .expect("injected graduate pages");
+
+        assert_eq!(source.pages.calls, 1);
+        assert_eq!(
+            source.pages.wanted,
+            vec![vec![GradPage::Schedule, GradPage::Calendar]]
+        );
+        assert!(!selected.from_cache);
+        assert_eq!(selected.snapshot.role, "graduate");
+        assert_eq!(selected.snapshot.source, "yjxt");
+        assert_eq!(selected.snapshot.term, "2026-2027秋学期");
+        assert_eq!(selected.snapshot.calendar.len(), 19);
+        assert_eq!(selected.snapshot.courses.len(), 2);
+        let written = read_snapshot(&cache_file(&cache)).expect("written graduate cache");
+        assert_eq!(written.username, USER);
+        assert_eq!(written.role, "graduate");
+        assert_eq!(written.courses[0]["name"], json!("合成通信课程"));
+    }
+
+    #[test]
+    fn malformed_graduate_calendar_preserves_the_previous_snapshot() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        let cache = root.path().join("cache");
+        graduate_account(&config);
+        let old = snapshot(
+            USER,
+            Role::Graduate,
+            monday_of(today()).add_days(-28),
+            "旧研究生课程",
+            "08:00",
+            "08:45",
+        );
+        save_snapshot(&cache_file(&cache), &old).unwrap();
+        let before = read_bytes(&cache_file(&cache));
+        let pages = GradPages {
+            schedule: Some(
+                include_str!("../tests/fixtures/contracts/academics/timetable_graduate.html")
+                    .to_string(),
+            ),
+            // The parser fixture deliberately only has the first and last
+            // teaching weeks; the timetable references weeks 4..19.
+            calendar: Some(
+                include_str!("../tests/fixtures/contracts/academics/calendar_graduate.html")
+                    .to_string(),
+            ),
+            exams: None,
+        };
+        let mut source = GraduatePageTimetable {
+            pages: FakePageSource::with(pages),
+        };
+
+        let error = select_snapshot(&config, &cache, today(), false, &mut source)
+            .expect_err("an incomplete calendar must not replace the snapshot");
+
+        assert_eq!(source.pages.calls, 1);
+        assert_eq!(error.code, 5);
+        assert!(error.message.contains("教学周"));
+        assert_eq!(read_bytes(&cache_file(&cache)), before);
+        assert!(!cache_file(&cache).with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn exams_command_uses_injected_pages_and_keeps_the_empty_marker_explicit() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        graduate_account(&config);
+        let rows = GradPages {
+            exams: Some(
+                include_str!("../tests/fixtures/contracts/academics/exams_graduate_rows.html")
+                    .to_string(),
+            ),
+            ..GradPages::default()
+        };
+        let mut source = FakePageSource::with(rows);
+        let outcome = run_exams_with_source(&config, &mut source).expect("injected exam rows");
+        assert_eq!(source.calls, 1);
+        assert_eq!(source.wanted, vec![vec![GradPage::Exams]]);
+        assert_eq!(outcome.data["count"], json!(1));
+        assert_eq!(outcome.data["exams"][0]["course"], json!("合成通信网课程"));
+
+        let empty = GradPages {
+            exams: Some(
+                include_str!("../tests/fixtures/contracts/academics/exams_graduate_empty.html")
+                    .to_string(),
+            ),
+            ..GradPages::default()
+        };
+        let mut source = FakePageSource::with(empty);
+        let outcome = run_exams_with_source(&config, &mut source).expect("empty exam table");
+        assert_eq!(outcome.data["count"], json!(0));
+        assert_eq!(outcome.data["exams"], json!([]));
+        assert!(
+            outcome.data["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("暂无"))
+        );
+    }
+
+    #[test]
+    fn undergraduate_exams_are_refused_before_the_graduate_page_source() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("credentials.json"),
+            serde_json::to_vec_pretty(&json!({
+                "username": USER,
+                "password": SESSION_PASSWORD,
+                "role": "undergraduate",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut source = FakePageSource::with(GradPages::default());
+
+        let error = match run_exams_with_source(&config, &mut source) {
+            Ok(_) => panic!("undergraduate exams must not use the graduate browser"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, 5);
+        assert_eq!(source.calls, 0, "the source must not be contacted");
     }
 
     #[test]

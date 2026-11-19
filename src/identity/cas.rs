@@ -12,7 +12,7 @@
 
 use crate::cli::{CliError, CliResult};
 use crate::transport::{Request, Response, Transport};
-use cookie_store::{Cookie, CookieDomain, CookieStore};
+use cookie_store::{Cookie, CookieDomain, CookieExpiration, CookieStore};
 use serde_json::{Map, Value, json};
 use std::fmt;
 use std::io::Cursor;
@@ -58,6 +58,130 @@ impl CasService {
         match self {
             Self::UCloud => "UCloud",
         }
+    }
+}
+
+/// Canonical cookie metadata that may be injected into a CAS browser flow.
+///
+/// Only cookies applicable to the canonical HTTPS `auth.bupt.edu.cn` login URL
+/// are exported; a school-wide suffix is narrowed to that auth host. The value
+/// is intentionally kept behind an accessor and the manual `Debug`
+/// implementation redacts it. `host_only` is preserved separately so callers
+/// can keep the maintained cookie scope when passing metadata to Chrome.
+pub(crate) struct CasCookie {
+    name: String,
+    value: String,
+    domain: String,
+    host_only: bool,
+    path: String,
+    secure: bool,
+    http_only: bool,
+    expires_at: Option<i64>,
+}
+
+impl CasCookie {
+    fn from_cookie(cookie: &Cookie<'_>) -> Option<Self> {
+        let host_only = match &cookie.domain {
+            CookieDomain::HostOnly(domain) if domain.eq_ignore_ascii_case(CAS_HOST) => true,
+            CookieDomain::Suffix(domain)
+                if domain.eq_ignore_ascii_case(CAS_HOST)
+                    || domain.eq_ignore_ascii_case("bupt.edu.cn") =>
+            {
+                false
+            }
+            _ => return None,
+        };
+        let name = cookie.name().to_owned();
+        let value = cookie.value().to_owned();
+        if name.is_empty() || value.is_empty() {
+            return None;
+        }
+        let expires_at = match cookie.expires {
+            CookieExpiration::AtUtc(expires) => Some(expires.unix_timestamp()),
+            CookieExpiration::SessionEnd => None,
+        };
+        Some(Self {
+            name,
+            value,
+            domain: CAS_HOST.to_owned(),
+            host_only,
+            path: cookie.path.as_ref().to_owned(),
+            secure: cookie.secure().unwrap_or(false),
+            http_only: cookie.http_only().unwrap_or(false),
+            expires_at,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub(crate) fn host_only(&self) -> bool {
+        self.host_only
+    }
+
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn secure(&self) -> bool {
+        self.secure
+    }
+
+    pub(crate) fn http_only(&self) -> bool {
+        self.http_only
+    }
+
+    pub(crate) fn expires_at(&self) -> Option<i64> {
+        self.expires_at
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fixture(
+        name: &str,
+        value: &str,
+        domain: &str,
+        host_only: bool,
+        path: &str,
+        secure: bool,
+        http_only: bool,
+        expires_at: Option<i64>,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            domain: domain.to_owned(),
+            host_only,
+            path: path.to_owned(),
+            secure,
+            http_only,
+            expires_at,
+        }
+    }
+}
+
+impl fmt::Debug for CasCookie {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CasCookie")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("host_only", &self.host_only)
+            .field("path", &self.path)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .field("expires_at", &self.expires_at)
+            .finish()
     }
 }
 
@@ -122,6 +246,14 @@ impl CasLogin {
 
     pub(super) fn has_usable_cookies(&self) -> bool {
         self.cookies.has_usable()
+    }
+
+    /// Metadata for cookies the maintained jar would send to the canonical
+    /// HTTPS CAS host. Expired and out-of-scope cookies are omitted; the
+    /// original host-only flag is retained and school-wide suffix scope is
+    /// narrowed to the canonical auth host.
+    pub(super) fn auth_cookies(&self) -> Vec<CasCookie> {
+        self.cookies.auth_cookies()
     }
 
     pub(super) fn has_usable_ucloud_token(&self) -> bool {
@@ -976,6 +1108,25 @@ impl CookieJar {
 
     fn has_usable(&self) -> bool {
         self.header_for(super::CAS_SERVICE_URL).is_some()
+    }
+
+    fn auth_cookies(&self) -> Vec<CasCookie> {
+        let Ok(url) = Url::parse(CAS_LOGIN_URL) else {
+            return Vec::new();
+        };
+        let mut cookies = self
+            .0
+            .iter_any()
+            .filter(|cookie| !cookie.is_expired())
+            .filter(|cookie| {
+                approved_cookie_domain(&cookie.domain) && approved_cookie_path(&cookie.path)
+            })
+            .filter(|cookie| cookie.domain.matches(&url))
+            .filter(|cookie| cookie.path.matches(&url))
+            .filter_map(CasCookie::from_cookie)
+            .collect::<Vec<_>>();
+        cookies.sort_by(|left, right| left.name.cmp(&right.name));
+        cookies
     }
 
     fn header_for(&self, raw: &str) -> Option<String> {

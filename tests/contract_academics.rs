@@ -215,10 +215,15 @@ fn assert_refresh_required(invocation: Invocation, cache: &Path, before: &[u8], 
     let payload = invocation.stderr_json();
     assert_schema(&payload);
     assert_eq!(payload["ok"], json!(false), "{label}: {payload}");
+    assert_eq!(
+        payload["error"]["type"],
+        json!("auth"),
+        "{label}: a missing browser session is an auth failure"
+    );
     let text = error_text(&payload);
     assert!(
-        text.contains("刷新") && text.contains("课表"),
-        "{label}: refusal must identify the unavailable timetable refresh, got: {text}"
+        text.contains("会话") && text.contains("login"),
+        "{label}: refusal must point at the missing CAS session, got: {text}"
     );
     assert_eq!(
         fs::read(cache).expect("read cache after refusal"),
@@ -877,25 +882,26 @@ fn invalid_weekday_entries_are_ignored_not_wrapped_or_fabricated() {
 }
 
 #[test]
-fn missing_snapshot_reports_unavailable_refresh_without_fabricating_cache() {
+fn missing_snapshot_and_session_report_auth_without_fabricating_cache() {
     let sandbox = Sandbox::new();
     write_credentials(&sandbox, USER, "graduate");
 
     let invocation = run(&sandbox, &["schedule"]);
     assert_eq!(
         invocation.code(),
-        5,
-        "an unconnected upstream must be an explicit upstream error; stdout={:?}; stderr={:?}",
+        3,
+        "a missing browser session must be an auth error; stdout={:?}; stderr={:?}",
         String::from_utf8_lossy(&invocation.0.stdout),
         String::from_utf8_lossy(&invocation.0.stderr)
     );
     assert!(invocation.0.stdout.is_empty());
     let payload = invocation.stderr_json();
     assert_schema(&payload);
+    assert_eq!(payload["error"]["type"], json!("auth"));
     let text = error_text(&payload);
     assert!(
-        text.contains("没有接通") && text.contains("不会伪造"),
-        "the temporary production source must say that no timetable was fabricated: {text}"
+        text.contains("会话") && text.contains("login"),
+        "the refusal must say that a CAS session is required: {text}"
     );
     assert!(
         !cache_path(&sandbox).exists(),
@@ -904,21 +910,22 @@ fn missing_snapshot_reports_unavailable_refresh_without_fabricating_cache() {
 }
 
 #[test]
-fn manual_update_without_a_source_preserves_the_existing_snapshot() {
+fn manual_update_without_a_session_preserves_the_existing_snapshot() {
     let sandbox = Sandbox::new();
     let snapshot = synthetic_snapshot(USER, "graduate");
     write_credentials(&sandbox, USER, "graduate");
     let (cache, before) = write_cache(&sandbox, &snapshot.entry);
 
     let invocation = run(&sandbox, &["schedule", "update"]);
-    assert_eq!(invocation.code(), 5);
+    assert_eq!(invocation.code(), 3);
     assert!(invocation.0.stdout.is_empty());
     let payload = invocation.stderr_json();
     assert_schema(&payload);
+    assert_eq!(payload["error"]["type"], json!("auth"));
     let text = error_text(&payload);
     assert!(
-        text.contains("没有接通") && text.contains("不会伪造"),
-        "manual refresh must be explicit about the unconnected upstream: {text}"
+        text.contains("会话") && text.contains("login"),
+        "manual refresh must point at the missing CAS session: {text}"
     );
     assert_eq!(
         fs::read(&cache).expect("read unchanged cache"),
@@ -953,6 +960,34 @@ fn graduate_accounts_are_refused_by_undergraduate_jwgl_commands() {
             "{command} contacted a source before refusing the role"
         );
     }
+}
+
+#[test]
+fn graduate_exams_without_a_session_is_an_auth_error_before_browser() {
+    let sandbox = Sandbox::new();
+    write_credentials(&sandbox, USER, "graduate");
+
+    let invocation = run(&sandbox, &["exams"]);
+    assert_eq!(
+        invocation.code(),
+        3,
+        "missing CAS session must stop before Chrome; stdout={:?}; stderr={:?}",
+        String::from_utf8_lossy(&invocation.0.stdout),
+        String::from_utf8_lossy(&invocation.0.stderr)
+    );
+    assert!(invocation.0.stdout.is_empty());
+    let payload = invocation.stderr_json();
+    assert_schema(&payload);
+    assert_eq!(payload["error"]["type"], json!("auth"));
+    let text = error_text(&payload);
+    assert!(text.contains("会话") && text.contains("login"));
+    assert!(
+        fs::read_dir(sandbox.root().join("cache"))
+            .expect("read cache dir")
+            .next()
+            .is_none(),
+        "the browser source must not write state before the session check"
+    );
 }
 
 #[test]
