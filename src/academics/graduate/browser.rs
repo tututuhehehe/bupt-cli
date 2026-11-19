@@ -7,9 +7,8 @@
 //!
 //! Authentication reuses only the canonical CAS cookie metadata exposed by the
 //! identity lane; this module never reads `session.json`, uses the password
-//! value, or logs cookie values. The known Python HTTP service callback path is
-//! still pending live confirmation, so this module does not invent a route or
-//! weaken Chrome privacy settings to get past a challenge.
+//! value, or logs cookie values. The verified CAS service callback uses HTTPS;
+//! the temporary browser blocks plaintext requests before installing cookies.
 
 use super::{GradPage, GradPageSource, GradPages};
 use crate::cli::{CliError, CliResult};
@@ -35,8 +34,7 @@ const CHROME_CANDIDATES: [&str; 3] = [
 ];
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
-const LOGIN_URL: &str =
-    "https://auth.bupt.edu.cn/authserver/login?service=http%3a%2f%2fyjxt.bupt.edu.cn%2fULogin.aspx";
+const LOGIN_URL: &str = "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fyjxt.bupt.edu.cn%2FULogin.aspx";
 const YJXT_BASE: &str = "https://yjxt.bupt.edu.cn";
 const MENU_URL: &str = "https://yjxt.bupt.edu.cn/Gstudent/LeftMenu.aspx?menu=00";
 const STALE_PROFILE_SECONDS: u64 = 6 * 3600;
@@ -475,6 +473,13 @@ impl Browser {
         self.ws.call("Page.enable", json!({}), self.timeout)?;
         self.ws.call("Runtime.enable", json!({}), self.timeout)?;
         self.ws.call("Network.enable", json!({}), self.timeout)?;
+        // The server still advertises legacy HTTP redirects. Chrome may
+        // upgrade them internally, but must not send a plaintext request.
+        self.ws.call(
+            "Network.setBlockedURLs",
+            json!({"urls": ["http://*"]}),
+            self.timeout,
+        )?;
         self.ws.call(
             "Network.setUserAgentOverride",
             json!({"userAgent": USER_AGENT, "platform": "MacIntel"}),
@@ -1124,6 +1129,22 @@ mod tests {
         ] {
             assert!(read_devtools_response(std::io::Cursor::new(input)).is_err());
         }
+    }
+
+    #[test]
+    fn graduate_cas_login_requests_only_the_https_callback() {
+        let login = Url::parse(LOGIN_URL).unwrap();
+        assert_eq!(login.scheme(), "https");
+        assert_eq!(login.host_str(), Some("auth.bupt.edu.cn"));
+        assert_eq!(login.path(), "/authserver/login");
+        let pairs = login.query_pairs().collect::<Vec<_>>();
+        assert_eq!(
+            pairs,
+            [(
+                "service".into(),
+                "https://yjxt.bupt.edu.cn/ULogin.aspx".into()
+            )]
+        );
     }
 
     #[test]

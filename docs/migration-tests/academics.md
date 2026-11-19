@@ -162,7 +162,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 - Python SDK 明确说 curriculum 接口通常只描述当前周；`zc` 是否从 1 开始、是否一次返回整学期都未在真实本科生账号验证。Rust 的完整校验会拒绝“只有当前周”的刷新并保留旧快照；若真实响应确实只有当前周，需要另做 DOM/日期来源适配，不能按周次补日期。
 - `termGPA`/成绩相关接口可能返回 `{"code":"0","Msg":"未授权访问：..."}`；客户端把它归为永久权限边界（退出 5、不重试）。需要真实账号确认成绩读取是否在权限范围内。
 - 三个考试接口在学期之间可能返回空 data；已保留空数组和 note，不伪造考试。`todayClassrooms` 是实时数据，没有日期参数。
-- 真实 Chrome/CDP/校园网验收仍单独安排；本轮明确不启动真实 Chrome、不访问真实凭据/浏览器 profile/校园服务。CAS Cookie 过期、瑞数挑战、Chrome 版本差异、真实菜单/课表/日历/考试页面结构都需联网记录；Python 基准里已知的 HTTP service callback 路径仍未确认，不据此制造新路由或修改 Chrome 隐私设置。
+- 真实 Chrome/CDP 验收独立于离线回放。macOS 实测以隔离会话复用 CAS、请求精确 HTTPS service，且在注入 Cookie 前阻止明文请求：考试成功返回 0 条，课表返回 20 周、6 条课程。浏览器对照观察到 HTTPS 教学页面的 Document 和 Script 响应，未观察到单独承载这些数据的站内 Fetch/XHR。直接 HTTPS 回调虽收到教务 Cookie，菜单响应仍无业务标记，不能据此关闭浏览器路径。Windows/本科真实验收仍单列。
 
 ### 4. 平台与解析边界
 
