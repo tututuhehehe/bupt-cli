@@ -1720,6 +1720,30 @@ mod tests {
     }
 
     #[test]
+    fn homework_course_walk_repeated_page_is_a_parse_error() {
+        let records: Vec<Value> = (0..20)
+            .map(|index| json!({"siteId": format!("site-{index:02}"), "siteName": "课程"}))
+            .collect();
+        let mut transport = scripted(vec![
+            (
+                "GET",
+                course_url_sized(1, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(json!(records), Some(40)),
+            ),
+            (
+                "GET",
+                course_url_sized(2, HOMEWORK_COURSE_PAGE_SIZE),
+                course_page(json!(records), Some(40)),
+            ),
+        ]);
+        let error = fetch_all_courses_for_homework(&mut transport, &session())
+            .expect_err("repeated course page must fail");
+
+        assert_eq!(error.code, 5);
+        assert_eq!(transport.calls.len(), 2);
+    }
+
+    #[test]
     fn homework_all_skips_courses_without_a_site_id() {
         let mut transport = scripted(vec![
             (

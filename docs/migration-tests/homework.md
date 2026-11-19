@@ -79,6 +79,7 @@
 | `homework_course_list_short_page_stops_without_a_second_request` | `--course` 短页立即停止，不猜测下一页 |
 | `homework_course_list_repeated_page_is_a_parse_error` | 同一课程页内容重复时退 parse 5，不无限翻页 |
 | `homework_course_walk_paginates_by_total_and_stops_at_thirty_sites` | 默认 all 的课程列表按 `total` 继续一页，并在 30 个站点上限截断，不请求第 3 页 |
+| `homework_course_walk_repeated_page_is_a_parse_error` | 默认 all 的课程页重复时退 parse 5，不无限翻页 |
 | `homework_all_skips_courses_without_a_site_id` | 空 `siteId` 的课程不请求学生列表；有效课程照常取作业 |
 | `homework_page_mapping_matches_python_status_and_fallback_rules` | `assignmentStatus=0` / `"SUBMITTED"` / 非空 `submitTime` 算已交；boolean 状态不算；空 `activityId` 回退 `id`；空 `beginTime`/`endTime` 不伪造 |
 | `homework_list_output_sorts_filters_and_limits_like_python` | `assignment_dict` 字段、按截止时间升序（无截止最后）、`--course` / `--undone` 过滤和 `--limit` 截断；`hours_remaining`、`overdue`、三态 `status` 由注入时钟固定 |
@@ -288,8 +289,8 @@ run_scenario(&sandbox, &fixture_path, args) -> Run { invocation, writes }
 ## 当前验证状态
 
 - `cargo fmt --check`：通过。
-- `cargo test --locked --offline --lib`：150 个通过（含 30 个 homework 只读 helper、11 个 homework 提交 helper、6 个 detail、9 个 show、6 个 verify、3 个 text，以及 identity/transport/CAS 等其它 lane）。
+- `cargo test --locked --offline --lib`：151 个通过（含 31 个 homework 只读 helper、11 个 homework 提交 helper、6 个 detail、9 个 show、6 个 verify、3 个 text，以及 identity/transport/CAS 等其它 lane）。
 - `cargo test --locked --offline --test contract_homework`：16 个通过。
-- `cargo test --locked --offline`：全绿；150 单元 + 25 academics + 33 campus + 16 homework + 28 identity + 23 lifecycle 契约用例全部通过。
+- `cargo test --locked --offline`：全绿；151 单元 + 25 academics + 33 campus + 16 homework + 28 identity + 23 lifecycle 契约用例全部通过。
 - `tests/homework_replay/cases.rs`：不在 Cargo 自动测试集合中；`run_scenario` 未接入，因此 30 个草稿全部不可运行，也没有伪装通过。
 - 本批仍是 synthetic-only slice：公开读命令已接真实 `require_ucloud_session`，但只在进程内用合成 session/`Scripted` 验证；`--new`、`download`、`submit` 写入仍未接；未运行真实校园网、浏览器会话、上传或提交，也没有新增环境变量回放开关。
