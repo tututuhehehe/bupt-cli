@@ -1,21 +1,22 @@
 //! Transport-injected CAS and UCloud protocol slice.
 //!
-//! PROTOTYPE ONLY: the hand-written URL and cookie handling below is suitable
-//! for synthetic protocol tests, not for live Rust wiring. Before any
-//! production transport is connected, replace it with maintained URL/cookie
-//! support covering host-only cookies, expiration, default paths, and strict
-//! URL parsing. This module is not wired to a production session.
+//! URL validation and cookie storage use maintained `url` and `cookie_store`
+//! implementations. The production session layer drives this module through an
+//! injected transport; the CLI still keeps `Offline` until the parent wires the
+//! bounded transport.
 //!
-//! It proves the request shape, redirect policy and response classification
-//! with synthetic `Scripted` transports. A successful `cas_login` is the only
-//! way to obtain a `CasLogin`, and it must include a service ticket issued by
-//! the ordinary CAS verification request. Future account persistence must take
-//! that value so a failed login cannot write local state.
+//! A successful `cas_login` is the only way to obtain a `CasLogin`, and it must
+//! include a service ticket issued by the ordinary CAS verification request.
+//! The session layer persists only the cookie store and an optional lazy token;
+//! a failed or incomplete verification never reaches the local writer.
 
 use crate::cli::{CliError, CliResult};
 use crate::transport::{Request, Response, Transport};
+use cookie_store::{Cookie, CookieDomain, CookieStore};
 use serde_json::{Map, Value, json};
 use std::fmt;
+use std::io::Cursor;
+use url::Url;
 
 const CAS_LOGIN_URL: &str = "https://auth.bupt.edu.cn/authserver/login";
 const CAS_HOST: &str = "auth.bupt.edu.cn";
@@ -68,6 +69,33 @@ impl fmt::Debug for UCloudToken {
 }
 
 impl CasLogin {
+    /// Rebuild a session from persisted cookies and an optional cached token.
+    /// Imported cookies are rejected unless every cookie stays inside the
+    /// approved CAS scope.
+    pub(super) fn from_persisted(cookies: &Value, ucloud: Option<&Value>) -> CliResult<Self> {
+        let cookies = CookieJar::from_json(cookies)?;
+        let ucloud = ucloud.and_then(UCloudToken::from_session_json);
+        Ok(Self {
+            cookies,
+            ticket: None,
+            ucloud,
+        })
+    }
+
+    /// Serialize the maintained cookie store, preserving host-only scope,
+    /// default path, expiry, and non-persistent session cookies.
+    pub(super) fn cookies_json(&self) -> CliResult<Value> {
+        self.cookies.to_json()
+    }
+
+    pub(super) fn has_usable_cookies(&self) -> bool {
+        self.cookies.has_usable()
+    }
+
+    pub(super) fn has_usable_ucloud_token(&self) -> bool {
+        self.ucloud.as_ref().is_some_and(UCloudToken::is_usable)
+    }
+
     /// Fetch a UCloud token only when a caller needs one. The service ticket
     /// obtained during login is consumed first; later needs request a new CAS
     /// service ticket. No OAuth token request happens before this call.
@@ -75,10 +103,7 @@ impl CasLogin {
         &mut self,
         transport: &mut dyn Transport,
     ) -> CliResult<&UCloudToken> {
-        let cached = self
-            .ucloud
-            .as_ref()
-            .is_some_and(|token| !token.is_expired());
+        let cached = self.ucloud.as_ref().is_some_and(UCloudToken::is_usable);
         if !cached {
             let ticket = match self.ticket.take() {
                 Some(ticket) => ticket,
@@ -121,8 +146,13 @@ impl UCloudToken {
         &self.access_token
     }
 
-    /// Existing session-cache metadata for a future persistence step.
-    #[allow(dead_code)]
+    /// The pair a read adapter needs, in `(access_token, user_id)` order.
+    pub(super) fn identity_pair(&self) -> Option<(String, String)> {
+        let user_id = self.user_id_string()?;
+        Some((self.access_token.clone(), user_id))
+    }
+
+    /// Existing session-cache metadata for persistence.
     pub(super) fn as_session_json(&self) -> Value {
         json!({
             "access_token": self.access_token,
@@ -133,6 +163,74 @@ impl UCloudToken {
             "jwt_payload": Value::Object(self.jwt_payload.clone()),
             "expires_at": self.expires_at.map(Value::from).unwrap_or(Value::Null),
         })
+    }
+
+    fn from_session_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let access_token = object
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && !value
+                        .chars()
+                        .any(|ch| ch.is_control() || ch.is_whitespace())
+            })?
+            .to_owned();
+        let jwt_payload = object
+            .get("jwt_payload")
+            .and_then(Value::as_object)
+            .cloned()
+            .or_else(|| super::jwt_payload(&access_token))
+            .unwrap_or_default();
+        let user_id = object
+            .get("user_id")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .or_else(|| {
+                jwt_payload
+                    .get("user_id")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+            });
+        let user_name = script_or_none(object.get("user_name"))
+            .or_else(|| script_or_none(jwt_payload.get("user_name")));
+        let real_name = script_or_none(object.get("real_name"))
+            .or_else(|| script_or_none(jwt_payload.get("real_name")));
+        let expires_at = object
+            .get("expires_at")
+            .and_then(super::number_value)
+            .filter(|value| value.is_finite())
+            .or_else(|| jwt_payload.get("exp").and_then(super::number_value));
+        let refresh_token = object
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        Some(Self {
+            access_token,
+            refresh_token,
+            user_id,
+            user_name,
+            real_name,
+            expires_at,
+            jwt_payload,
+        })
+    }
+
+    fn user_id_string(&self) -> Option<String> {
+        match self.user_id.as_ref()? {
+            Value::String(value) => {
+                let value = value.trim();
+                (!value.is_empty()).then(|| value.to_owned())
+            }
+            Value::Number(value) => value.is_i64().then(|| value.to_string()),
+            _ => None,
+        }
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.is_expired() && self.user_id_string().is_some()
     }
 
     fn is_expired(&self) -> bool {
@@ -183,15 +281,21 @@ pub(super) fn cas_login(
             "refusing a CAS redirect that would replay the credential POST",
         ));
     }
-    let (post, final_url) =
-        follow_get_redirects(transport, &mut cookies, post, CAS_LOGIN_URL.to_owned())?;
-    ensure_http_ok(&post, "CAS login")?;
-
-    let final_text = String::from_utf8_lossy(&post.body);
-    if is_login_page(&final_url, &final_text) {
-        return Err(auth_error(
-            "BUPT CAS login failed: invalid username or password",
-        ));
+    // The ordinary form hands browsers off to the campus portal. The CLI
+    // needs no portal page or cookies: only CAS issuing a ticket proves login.
+    let portal_landing = post.status == 302
+        && header(&post.headers, "location")
+            .and_then(|location| location.split(['?', '#', ';']).next())
+            == Some("https://uc.bupt.edu.cn/");
+    if !portal_landing {
+        let (post, final_url) =
+            follow_get_redirects(transport, &mut cookies, post, CAS_LOGIN_URL.to_owned())?;
+        ensure_http_ok(&post, "CAS login")?;
+        if is_login_page(&final_url, &String::from_utf8_lossy(&post.body)) {
+            return Err(auth_error(
+                "BUPT CAS login failed: invalid username or password",
+            ));
+        }
     }
 
     let ticket = request_cas_service_ticket(transport, &mut cookies)?;
@@ -354,8 +458,11 @@ fn follow_get_redirects(
     mut response: Response,
     mut url: String,
 ) -> CliResult<(Response, String)> {
-    for _ in 0..=MAX_CAS_REDIRECTS {
+    for followed in 0..=MAX_CAS_REDIRECTS {
         if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            if followed == MAX_CAS_REDIRECTS {
+                break;
+            }
             let location = header(&response.headers, "location")
                 .ok_or_else(|| parse_error("CAS redirect response has no Location header"))?;
             let target = allowed_cas_redirect(location)?;
@@ -371,35 +478,37 @@ fn follow_get_redirects(
 fn allowed_cas_redirect(raw: &str) -> CliResult<String> {
     let raw = raw.trim();
     let parsed = parse_https_url(raw).ok_or_else(redirect_error)?;
-    let allowed_path = match parsed.host.as_str() {
-        CAS_HOST => parsed.path == "/authserver" || parsed.path.starts_with("/authserver/"),
-        UCLOUD_HOST => parsed.path == "/uclass" || parsed.path.starts_with("/uclass/"),
+    let path = parsed.path();
+    let allowed_path = match parsed.host_str() {
+        Some(CAS_HOST) => path == "/authserver" || path.starts_with("/authserver/"),
+        Some(UCLOUD_HOST) => path == "/uclass" || path.starts_with("/uclass/"),
         _ => false,
     };
     if !allowed_path {
         return Err(redirect_error());
     }
-    Ok(raw.to_owned())
+    Ok(parsed.into())
 }
 
 fn ticket_from_location(location: &str) -> CliResult<String> {
     let parsed = parse_https_url(location.trim()).ok_or_else(redirect_error)?;
-    if parsed.host != UCLOUD_HOST
-        || !(parsed.path == "/uclass" || parsed.path.starts_with("/uclass/"))
-    {
+    if parsed.host_str() != Some(UCLOUD_HOST) || parsed.path() != "/uclass" {
         return Err(redirect_error());
     }
-    let query = parsed
-        .query
-        .as_deref()
-        .ok_or_else(|| auth_error("No CAS ticket issued for UCloud (login may have expired)"))?;
-    let raw = query
+    let mut tickets = parsed
+        .query()
+        .unwrap_or_default()
         .split('&')
-        .find_map(|pair| {
+        .filter_map(|pair| {
             let (key, value) = pair.split_once('=')?;
             (key == "ticket").then_some(value)
-        })
+        });
+    let raw = tickets
+        .next()
         .ok_or_else(|| auth_error("No CAS ticket issued for UCloud (login may have expired)"))?;
+    if tickets.next().is_some() {
+        return Err(auth_error("CAS issued an ambiguous UCloud ticket"));
+    }
     let ticket = percent_decode(raw)
         .filter(|ticket| {
             !ticket.is_empty()
@@ -424,10 +533,10 @@ fn ucloud_read_url(path: &str) -> CliResult<String> {
     }
     let url = format!("{UCLOUD_API}{path}");
     let parsed = parse_https_url(&url).ok_or_else(|| parse_error("invalid UCloud read URL"))?;
-    if parsed.host != UCLOUD_API_HOST {
+    if parsed.host_str() != Some(UCLOUD_API_HOST) {
         return Err(parse_error("invalid UCloud read host"));
     }
-    Ok(url)
+    Ok(parsed.into())
 }
 
 fn ucloud_headers(access_token: String) -> Vec<(String, String)> {
@@ -517,7 +626,7 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 fn is_login_page(url: &str, body: &str) -> bool {
     parse_https_url(url).is_some_and(|parsed| {
-        parsed.host == CAS_HOST && parsed.path.starts_with("/authserver/login")
+        parsed.host_str() == Some(CAS_HOST) && parsed.path() == "/authserver/login"
     }) || is_login_page_body(body.as_bytes())
 }
 
@@ -726,167 +835,144 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 #[derive(Default)]
-struct CookieJar {
-    cookies: Vec<Cookie>,
-}
-
-struct Cookie {
-    name: String,
-    value: String,
-    domain: String,
-    path: String,
-}
+struct CookieJar(CookieStore);
 
 impl CookieJar {
     fn store_response(&mut self, request_url: &str, headers: &[(String, String)]) {
-        let Some(request) = parse_https_url(request_url) else {
+        let Some(url) = parse_https_url(request_url).filter(|url| url.host_str() == Some(CAS_HOST))
+        else {
             return;
         };
         for (name, value) in headers {
             if !name.eq_ignore_ascii_case("set-cookie") {
                 continue;
             }
-            let Some(cookie) = parse_set_cookie(value, &request.host) else {
+            let Ok(cookie) = Cookie::parse(value.clone(), &url) else {
                 continue;
             };
-            if let Some(existing) = self.cookies.iter_mut().find(|existing| {
-                existing.name == cookie.name
-                    && existing.domain == cookie.domain
-                    && existing.path == cookie.path
-            }) {
-                *existing = cookie;
-            } else {
-                self.cookies.push(cookie);
+            if approved_cookie_domain(&cookie.domain) && approved_cookie_path(&cookie.path) {
+                let _ = self.0.insert(cookie, &url);
             }
         }
     }
 
-    fn header_for(&self, url: &str) -> Option<String> {
-        let parsed = parse_https_url(url)?;
-        let values: Vec<String> = self
-            .cookies
-            .iter()
-            .filter(|cookie| domain_matches(&cookie.domain, &parsed.host))
-            .filter(|cookie| path_matches(&cookie.path, &parsed.path))
-            .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+    fn to_json(&self) -> CliResult<Value> {
+        let mut bytes = Vec::new();
+        cookie_store::serde::json::save_incl_expired_and_nonpersistent(&self.0, &mut bytes)
+            .map_err(|_| {
+                CliError::new(
+                    5,
+                    "upstream",
+                    "cannot serialize the saved CAS cookies",
+                    "Run `bupt login` again to rebuild the local session.",
+                )
+            })?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            CliError::new(
+                5,
+                "upstream",
+                "cannot encode the saved CAS cookies",
+                "Run `bupt login` again to rebuild the local session.",
+            )
+        })
+    }
+
+    fn from_json(value: &Value) -> CliResult<Self> {
+        let bytes = serde_json::to_vec(value).map_err(|_| cookie_session_error())?;
+        let store = cookie_store::serde::json::load_all(Cursor::new(bytes))
+            .map_err(|_| cookie_session_error())?;
+        if store.iter_any().any(|cookie| {
+            !approved_cookie_domain(&cookie.domain) || !approved_cookie_path(&cookie.path)
+        }) {
+            return Err(CliError::new(
+                3,
+                "auth",
+                "saved CAS cookies contain a scope that is not approved",
+                "Run `bupt login` again to rebuild the local session.",
+            ));
+        }
+        Ok(Self(store))
+    }
+
+    fn has_usable(&self) -> bool {
+        self.header_for(super::CAS_SERVICE_URL).is_some()
+    }
+
+    fn header_for(&self, raw: &str) -> Option<String> {
+        let url = parse_https_url(raw).filter(|url| url.host_str() == Some(CAS_HOST))?;
+        let values: Vec<_> = self
+            .0
+            .get_request_values(&url)
+            .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+            .map(|(name, value)| format!("{name}={value}"))
             .collect();
         (!values.is_empty()).then(|| values.join("; "))
     }
 }
 
-fn parse_set_cookie(raw: &str, request_host: &str) -> Option<Cookie> {
-    let mut parts = raw.split(';');
-    let (name, value) = parts.next()?.split_once('=')?;
-    let name = name.trim();
-    let value = value.trim();
-    if name.is_empty()
-        || value.chars().any(|ch| ch.is_control() || ch == ';')
-        || name
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '=' || ch == ';')
-    {
-        return None;
-    }
-    let mut domain = request_host.to_ascii_lowercase();
-    let mut path = "/".to_owned();
-    for attribute in parts {
-        let (key, value) = attribute
-            .split_once('=')
-            .map_or((attribute.trim(), ""), |(key, value)| {
-                (key.trim(), value.trim())
-            });
-        if key.eq_ignore_ascii_case("domain") {
-            domain = value.trim_start_matches('.').to_ascii_lowercase();
-        } else if key.eq_ignore_ascii_case("path") && value.starts_with('/') {
-            path = value.to_owned();
-        }
-    }
-    if !campus_cookie_domain(&domain) || !domain_matches(&domain, request_host) {
-        return None;
-    }
-    Some(Cookie {
-        name: name.to_owned(),
-        value: value.to_owned(),
-        domain,
-        path,
-    })
+fn approved_cookie_domain(domain: &CookieDomain) -> bool {
+    // No public-suffix database is needed: accept only CAS and its campus parent.
+    matches!(domain, CookieDomain::HostOnly(host) if host.eq_ignore_ascii_case(CAS_HOST))
+        || matches!(domain, CookieDomain::Suffix(value) if value.eq_ignore_ascii_case(CAS_HOST) || value.eq_ignore_ascii_case("bupt.edu.cn"))
 }
 
-fn campus_cookie_domain(domain: &str) -> bool {
-    domain == "bupt.edu.cn"
-        || domain == CAS_HOST
-        || domain == UCLOUD_HOST
-        || domain == UCLOUD_API_HOST
+fn approved_cookie_path(path: &cookie_store::CookiePath) -> bool {
+    let path: &str = path.as_ref();
+    (path == "/" || path == "/authserver" || path.starts_with("/authserver/"))
+        && !path.contains("//")
+        && !path.contains('\\')
+        && !path.contains(['?', '#'])
+        && !path.to_ascii_lowercase().contains("%2f")
+        && !path.to_ascii_lowercase().contains("%5c")
+        && !path.split('/').any(|segment| {
+            let segment = segment.to_ascii_lowercase();
+            matches!(
+                segment.as_str(),
+                "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+            )
+        })
+        && !path.chars().any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
-fn domain_matches(domain: &str, host: &str) -> bool {
-    host.eq_ignore_ascii_case(domain)
-        || host
-            .strip_suffix(domain)
-            .is_some_and(|prefix| prefix.ends_with('.'))
+fn cookie_session_error() -> CliError {
+    CliError::new(
+        3,
+        "auth",
+        "saved CAS cookies are invalid",
+        "Run `bupt login` again to rebuild the local session.",
+    )
 }
 
-fn path_matches(cookie_path: &str, request_path: &str) -> bool {
-    request_path == cookie_path
-        || request_path.starts_with(cookie_path)
-            && (cookie_path.ends_with('/')
-                || request_path
-                    .as_bytes()
-                    .get(cookie_path.len())
-                    .is_some_and(|byte| *byte == b'/'))
-}
-
-#[derive(Debug)]
-struct ParsedUrl {
-    host: String,
-    path: String,
-    query: Option<String>,
-}
-
-fn parse_https_url(raw: &str) -> Option<ParsedUrl> {
-    if raw.chars().any(|ch| ch.is_whitespace() || ch.is_control())
-        || raw.contains('#')
-        || raw.contains('\\')
-    {
-        return None;
-    }
+fn parse_https_url(raw: &str) -> Option<Url> {
+    // Keep the established allowlist syntax strict before canonicalizing. In
+    // particular, Url drops explicit default ports, so check the raw authority.
     let rest = raw.strip_prefix("https://")?;
-    if rest.is_empty() {
-        return None;
-    }
-    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
+    let authority = rest.split(['/', '?', '#']).next()?;
     if authority.is_empty()
-        || authority.contains('@')
-        || authority.contains(':')
-        || authority.contains('[')
-        || authority.contains(']')
         || !authority
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        || raw.contains(['\\', '#'])
+        || raw.chars().any(|ch| ch.is_control() || ch.is_whitespace())
     {
         return None;
     }
-    let host = authority.to_ascii_lowercase();
-    let remainder = &rest[authority_end..];
-    let (path, query) = if remainder.is_empty() {
-        ("/".to_owned(), None)
-    } else if remainder.starts_with('/') {
-        match remainder.split_once('?') {
-            Some((path, query)) => (path.to_owned(), Some(query.to_owned())),
-            None => (remainder.to_owned(), None),
-        }
-    } else {
-        let query = remainder.strip_prefix('?')?;
-        ("/".to_owned(), Some(query.to_owned()))
-    };
-    if !path.starts_with('/')
-        || path.contains("//")
-        || path.split('/').any(|segment| matches!(segment, "." | ".."))
+    let path = rest.strip_prefix(authority)?.split('?').next()?;
+    if path.contains("//")
+        || path.split('/').any(|segment| {
+            let path_segment = segment.to_ascii_lowercase();
+            matches!(
+                path_segment.as_str(),
+                "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+            ) || path_segment.contains("%2f")
+                || path_segment.contains("%5c")
+        })
     {
         return None;
     }
-    Some(ParsedUrl { host, path, query })
+    Url::parse(raw)
+        .ok()
+        .filter(|url| url.scheme() == "https" && url.host_str().is_some())
 }
 
 #[cfg(test)]
@@ -1063,6 +1149,149 @@ mod tests {
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn cas_cookie_jar_honors_scope_defaults_and_expiration() {
+        let mut jar = CookieJar::default();
+        jar.store_response(
+            CAS_LOGIN_URL,
+            &[
+                (
+                    "Set-Cookie".into(),
+                    "local=TEST-ONLY; Secure; HttpOnly".into(),
+                ),
+                (
+                    "Set-Cookie".into(),
+                    "campus=TEST-ONLY; Domain=.bupt.edu.cn; Path=/; Secure".into(),
+                ),
+                (
+                    "Set-Cookie".into(),
+                    "public=TEST-ONLY; Domain=.edu.cn; Path=/".into(),
+                ),
+                (
+                    "Set-Cookie".into(),
+                    "expired=TEST-ONLY; Expires=Wed, 01 Jan 2003 00:00:00 GMT".into(),
+                ),
+                (
+                    "Set-Cookie".into(),
+                    "wrong_path=TEST-ONLY; Path=/other; Secure".into(),
+                ),
+            ],
+        );
+        assert!(!jar.to_json().unwrap().to_string().contains("wrong_path"));
+        let login = jar.header_for(CAS_LOGIN_URL).unwrap();
+        assert!(login.contains("local=TEST-ONLY") && login.contains("campus=TEST-ONLY"));
+        assert!(!login.contains("public=") && !login.contains("expired="));
+        assert_eq!(
+            jar.header_for("https://auth.bupt.edu.cn/other").as_deref(),
+            Some("campus=TEST-ONLY")
+        );
+        assert!(
+            jar.header_for("https://ucloud.bupt.edu.cn/uclass")
+                .is_none()
+        );
+        assert!(
+            jar.header_for("https://apiucloud.bupt.edu.cn/ykt-site/")
+                .is_none()
+        );
+        jar.store_response(
+            "https://ucloud.bupt.edu.cn/uclass",
+            &[(
+                "Set-Cookie".into(),
+                "campus=INJECTED; Domain=.bupt.edu.cn; Path=/".into(),
+            )],
+        );
+        assert!(
+            jar.header_for(CAS_LOGIN_URL)
+                .unwrap()
+                .contains("campus=TEST-ONLY")
+        );
+        jar.store_response(
+            CAS_LOGIN_URL,
+            &[("Set-Cookie".into(), "local=; Max-Age=0; Secure".into())],
+        );
+        assert_eq!(
+            jar.header_for(CAS_LOGIN_URL).as_deref(),
+            Some("campus=TEST-ONLY")
+        );
+    }
+
+    #[test]
+    fn canonical_url_must_stay_inside_the_original_campus_scope() {
+        assert_eq!(
+            allowed_cas_redirect("https://AUTH.BUPT.EDU.CN/authserver/a").unwrap(),
+            "https://auth.bupt.edu.cn/authserver/a"
+        );
+        for unsafe_location in [
+            "https://auth.bupt.edu.cn:443/authserver/a",
+            "https://auth.bupt.edu.cn@outside.example/authserver/a",
+            "https://auth.bupt.edu.cn/authserver/%2e%2E/elsewhere",
+            "https://auth.bupt.edu.cn/authserver/%2Felsewhere",
+            "https://auth.bupt.edu.cn/authserver/%5celsewhere",
+            "https://auth.bupt.edu.cn./authserver/a",
+            "//auth.bupt.edu.cn/authserver/a",
+        ] {
+            assert!(allowed_cas_redirect(unsafe_location).is_err());
+        }
+        assert!(
+            ticket_from_location("https://ucloud.bupt.edu.cn/uclass/other?ticket=ST-TEST-ONLY")
+                .is_err()
+        );
+        assert!(
+            ticket_from_location(
+                "https://ucloud.bupt.edu.cn/uclass?ticket=ST-TEST-ONLY&ticket=ST-TEST-ONLY"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cas_portal_landing_is_not_fetched_and_does_not_prove_login() {
+        for ticket in [true, false] {
+            let mut transport = Scripted::default();
+            transport
+                .expected
+                .push_back(("GET", CAS_LOGIN_URL.into(), Ok(login_page())));
+            enqueue(
+                &mut transport,
+                "POST",
+                CAS_LOGIN_URL,
+                302,
+                &[
+                    ("Location", "https://uc.bupt.edu.cn/?test=opaque"),
+                    (
+                        "Set-Cookie",
+                        "CASTGC=TEST-ONLY-PORTAL; Path=/authserver; Secure; HttpOnly",
+                    ),
+                ],
+                "",
+            );
+            if ticket {
+                enqueue(
+                    &mut transport,
+                    "GET",
+                    super::super::CAS_SERVICE_URL,
+                    302,
+                    &[("Location", TICKET_URL)],
+                    "",
+                );
+            } else {
+                transport.expected.push_back((
+                    "GET",
+                    super::super::CAS_SERVICE_URL.into(),
+                    Ok(login_page()),
+                ));
+            }
+            assert_eq!(
+                cas_login(&mut transport, USERNAME, PASSWORD).is_ok(),
+                ticket
+            );
+            assert_eq!(transport.calls.len(), 3);
+            assert_eq!(transport.calls[2].url, super::super::CAS_SERVICE_URL);
+            assert_single_password_post(&transport);
+            assert_no_token_request(&transport);
+        }
     }
 
     #[test]
