@@ -27,7 +27,9 @@ mod probe;
 mod session;
 
 pub(crate) use cas::CasService;
-pub(crate) use session::{OwnedCasSession, load_owned_cas_session};
+pub(crate) use session::{
+    CasCookie, OwnedCasSession, load_cas_cookies_for_auth, load_owned_cas_session,
+};
 
 const DIAGNOSE_GROUPS: &[&str] = &[
     "public",

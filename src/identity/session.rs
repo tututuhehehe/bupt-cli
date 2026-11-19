@@ -14,6 +14,8 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
+pub(crate) use cas::CasCookie;
+
 const SESSION_REVISION_KEY: &str = "session_revision";
 
 struct NativeAccount {
@@ -159,11 +161,37 @@ pub(crate) fn load_owned_cas_session(context: &Context<'_>) -> CliResult<OwnedCa
     })
 }
 
+/// Load only canonical CAS cookie metadata for an HTTPS auth-host browser flow.
+///
+/// This shares the same owner, revision, private-file, and maintained-jar
+/// validation as the native session accessors. It never logs cookie values and
+/// does not expose a password or a raw `session.json` map.
+pub(crate) fn load_cas_cookies_for_auth(
+    config_dir: &Path,
+    cache_dir: &Path,
+) -> CliResult<Vec<CasCookie>> {
+    let (_, cas_session) = load_bound_session_from_paths(config_dir, cache_dir)?;
+    let cookies = cas_session.auth_cookies();
+    if cookies.is_empty() {
+        return Err(session_error(
+            "the saved CAS session has no cookies for HTTPS auth.bupt.edu.cn",
+        ));
+    }
+    Ok(cookies)
+}
+
 fn load_bound_session(context: &Context<'_>) -> CliResult<(Map<String, Value>, cas::CasLogin)> {
+    load_bound_session_from_paths(&context.config_dir, &context.cache_dir)
+}
+
+fn load_bound_session_from_paths(
+    config_dir: &Path,
+    cache_dir: &Path,
+) -> CliResult<(Map<String, Value>, cas::CasLogin)> {
     ensure_supported_platform()?;
-    let account = load_native_account(&context.config_dir)?;
-    validate_owner_relationship(&context.config_dir, &context.cache_dir)?;
-    let data = load_native_session(&context.cache_dir)?;
+    let account = load_native_account(config_dir)?;
+    validate_owner_relationship(config_dir, cache_dir)?;
+    let data = load_native_session(cache_dir)?;
     validate_binding(&account, &data)?;
     let empty_cookies = Value::Array(Vec::new());
     let cookies = data.get("cookies").unwrap_or(&empty_cookies);
@@ -862,6 +890,8 @@ mod tests {
     const REFRESH_TOKEN: &str = "TEST-ONLY-REFRESH-TOKEN-f1g2";
     const OLD_ACCESS_TOKEN: &str = "TEST-ONLY-OLD-ACCESS-TOKEN-h3i4";
     const SESSION_SECRET: &str = "TEST-ONLY-SESSION-SECRET-k1l2";
+    const EXPORT_SECRET: &str = "TEST-ONLY-EXPORT-SECRET-z9y8";
+    const BROAD_SECRET: &str = "TEST-ONLY-BROAD-SECRET-v7w6";
     const USER_ID: &str = "42";
     const OLD_REVISION: &str = "TEST-ONLY-OLD-REVISION-a1b2c3";
     const NEW_REVISION: &str = "TEST-ONLY-NEW-REVISION-d4e5f6";
@@ -1427,6 +1457,101 @@ mod tests {
         assert_eq!(error.code, 3);
         assert_eq!(error.kind, "auth");
         assert!(transport.calls.is_empty());
+    }
+
+    #[test]
+    fn cas_cookie_export_is_bound_and_preserves_host_scope() {
+        let sandbox = Sandbox::new();
+        seed_native_state(&sandbox, OLD_PASSWORD, OLD_REVISION);
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let mut session = read_json(&session_path);
+        session["cookies"] = cookies_json(&[
+            (
+                LOGIN_URL,
+                &format!("CASTGC={EXPORT_SECRET}; Path=/authserver; Secure; HttpOnly"),
+            ),
+            (
+                LOGIN_URL,
+                &format!(
+                    "SCHOOL={BROAD_SECRET}; Domain=.bupt.edu.cn; Path=/; Secure; Expires=Wed, 01 Jan 2100 00:00:00 GMT"
+                ),
+            ),
+        ]);
+        write_private(&session_path, &session);
+
+        let cookies = load_cas_cookies_for_auth(&sandbox.config_dir(), &sandbox.cache_dir())
+            .expect("trusted synthetic cookies are exported");
+        assert_eq!(cookies.len(), 2);
+        let castgc = cookies
+            .iter()
+            .find(|cookie| cookie.name() == "CASTGC")
+            .expect("host-only CAS cookie");
+        assert_eq!(castgc.value(), EXPORT_SECRET);
+        assert_eq!(castgc.domain(), "auth.bupt.edu.cn");
+        assert!(castgc.host_only());
+        assert_eq!(castgc.path(), "/authserver");
+        assert!(castgc.secure());
+        assert!(castgc.http_only());
+        assert_eq!(castgc.expires_at(), None);
+
+        let school = cookies
+            .iter()
+            .find(|cookie| cookie.name() == "SCHOOL")
+            .expect("domain CAS cookie");
+        assert_eq!(school.value(), BROAD_SECRET);
+        assert_eq!(school.domain(), "auth.bupt.edu.cn");
+        assert!(!school.host_only());
+        assert_eq!(school.path(), "/");
+        assert_eq!(school.expires_at(), Some(4_102_444_800));
+
+        let rendered = format!("{cookies:?}");
+        assert!(!rendered.contains(EXPORT_SECRET));
+        assert!(!rendered.contains(BROAD_SECRET));
+    }
+
+    #[test]
+    fn cas_cookie_export_rejects_a_different_credential_revision() {
+        let sandbox = Sandbox::new();
+        seed_native_state(&sandbox, OLD_PASSWORD, OLD_REVISION);
+        let credentials_path = sandbox.config_dir().join(CREDENTIALS_FILENAME);
+        let mut credentials = read_json(&credentials_path);
+        credentials[SESSION_REVISION_KEY] = serde_json::json!(NEW_REVISION);
+        write_private(&credentials_path, &credentials);
+
+        let error = load_cas_cookies_for_auth(&sandbox.config_dir(), &sandbox.cache_dir())
+            .expect_err("stale revision must not reach a browser");
+        assert_eq!(error.code, 3);
+        assert_eq!(error.kind, "auth");
+        assert!(error.message.contains("revision"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cas_cookie_export_rejects_a_public_session_file_before_browser() {
+        let sandbox = Sandbox::new();
+        seed_native_state(&sandbox, OLD_PASSWORD, OLD_REVISION);
+        set_mode(&sandbox.cache_dir().join(SESSION_FILENAME), 0o644);
+
+        let error = load_cas_cookies_for_auth(&sandbox.config_dir(), &sandbox.cache_dir())
+            .expect_err("public session state must not reach a browser");
+        assert_eq!(error.code, 3);
+        assert_eq!(error.kind, "auth");
+        assert!(error.message.contains("not private"));
+    }
+
+    #[test]
+    fn cas_cookie_export_rejects_expired_cookies() {
+        let sandbox = Sandbox::new();
+        seed_native_state(&sandbox, OLD_PASSWORD, OLD_REVISION);
+        let session_path = sandbox.cache_dir().join(SESSION_FILENAME);
+        let mut session = read_json(&session_path);
+        session["cookies"] = expired_native_cookies();
+        write_private(&session_path, &session);
+
+        let error = load_cas_cookies_for_auth(&sandbox.config_dir(), &sandbox.cache_dir())
+            .expect_err("expired cookies must not reach a browser");
+        assert_eq!(error.code, 3);
+        assert_eq!(error.kind, "auth");
     }
 
     #[cfg(unix)]

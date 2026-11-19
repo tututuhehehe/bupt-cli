@@ -5,16 +5,15 @@
 //! temporary profile, navigates only known school origins, and is killed on
 //! drop. No CAPTCHA challenge is solved or bypassed here.
 //!
-//! Authentication reuses the CAS cookies that the identity lane already
-//! persisted in `session.json`; this module never uses or logs the password
-//! value.
-//! The small `IdentitySessionAuth` type is the scoped session interface. It can
-//! be replaced by an identity-owned accessor without changing page parsing or
-//! command wiring.
+//! Authentication reuses only the canonical CAS cookie metadata exposed by the
+//! identity lane; this module never reads `session.json`, uses the password
+//! value, or logs cookie values. The known Python HTTP service callback path is
+//! still pending live confirmation, so this module does not invent a route or
+//! weaken Chrome privacy settings to get past a challenge.
 
 use super::{GradPage, GradPageSource, GradPages};
 use crate::cli::{CliError, CliResult};
-use crate::identity::{self, Role};
+use crate::identity::{self, CasCookie, Role};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -26,8 +25,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{Builder as TempBuilder, TempDir};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
+use url::Url;
 
 const CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const CHROME_CANDIDATES: [&str; 3] = [
@@ -41,224 +39,54 @@ const LOGIN_URL: &str =
     "https://auth.bupt.edu.cn/authserver/login?service=http%3a%2f%2fyjxt.bupt.edu.cn%2fULogin.aspx";
 const YJXT_BASE: &str = "https://yjxt.bupt.edu.cn";
 const MENU_URL: &str = "https://yjxt.bupt.edu.cn/Gstudent/LeftMenu.aspx?menu=00";
-const SESSION_FILENAME: &str = "session.json";
 const STALE_PROFILE_SECONDS: u64 = 6 * 3600;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 const CHROME_MISSING_HINT: &str = "研究生系统需要真实浏览器（瑞数防护无法用纯 HTTP 绕过）。请安装 Google Chrome：https://www.google.com/chrome/";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::academics) struct SessionCookie {
-    name: String,
-    value: String,
-    domain: String,
-    path: String,
-    secure: bool,
-    http_only: bool,
-    expires: Option<i64>,
-    same_site: Option<String>,
-}
-
-/// Narrow session interface: only CAS cookies for the saved account and role.
-pub(in crate::academics) struct IdentitySessionAuth {
-    config_dir: PathBuf,
-    cache_dir: PathBuf,
-}
-
-impl IdentitySessionAuth {
-    pub(super) fn new(config_dir: &Path, cache_dir: &Path) -> Self {
-        Self {
-            config_dir: config_dir.to_path_buf(),
-            cache_dir: cache_dir.to_path_buf(),
-        }
-    }
-
-    pub(super) fn cookies(
-        &self,
-        expected_username: &str,
-        expected_role: Role,
-    ) -> CliResult<Vec<SessionCookie>> {
-        let account = identity::require_authenticated_profile(&self.config_dir)?;
-        if account.username() != expected_username || account.role() != Some(expected_role) {
-            return Err(auth_error(
-                "保存的会话与当前学号或身份不一致",
-                "重新执行 `bupt login --role graduate` 建立当前账号的会话。",
-            ));
-        }
-        let path = self.cache_dir.join(SESSION_FILENAME);
-        if let Ok(metadata) = fs::symlink_metadata(&path)
-            && (!metadata.file_type().is_file() || metadata.file_type().is_symlink())
-        {
-            return Err(auth_error(
-                "本地 CAS 会话不是普通文件，拒绝读取",
-                "重新执行 `bupt login --role graduate`。",
-            ));
-        }
-        let bytes = fs::read(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                auth_error(
-                    "研究生系统需要先建立可用的 CAS 会话",
-                    "运行 `bupt login --role graduate`，再重试本命令。",
-                )
-            } else {
-                CliError::new(
-                    3,
-                    "auth",
-                    format!("无法读取本地 CAS 会话：{error}"),
-                    "重新执行 `bupt login --role graduate`。",
-                )
-            }
-        })?;
-        let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-            auth_error(
-                "本地 CAS 会话不是可用的 JSON",
-                "重新执行 `bupt login --role graduate`。",
-            )
-        })?;
-        let object = value.as_object().ok_or_else(|| {
-            auth_error(
-                "本地 CAS 会话格式无法识别",
-                "重新执行 `bupt login --role graduate`。",
-            )
-        })?;
-        if object.get("version").and_then(Value::as_u64) != Some(2) {
-            return Err(auth_error(
-                "本地 CAS 会话版本不受支持",
-                "重新执行 `bupt login --role graduate`。",
-            ));
-        }
-        if object.get("username").and_then(Value::as_str) != Some(expected_username)
-            || object
-                .get("role")
-                .and_then(Value::as_str)
-                .and_then(|role| match role {
-                    "graduate" => Some(Role::Graduate),
-                    "undergraduate" => Some(Role::Undergraduate),
-                    _ => None,
-                })
-                != Some(expected_role)
-        {
-            return Err(auth_error(
-                "本地 CAS 会话不属于当前学号或身份",
-                "重新执行 `bupt login --role graduate`。",
-            ));
-        }
-        let cookies = object
-            .get("cookies")
-            .and_then(Value::as_array)
-            .map(|cookies| {
-                cookies
-                    .iter()
-                    .filter_map(session_cookie)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if cookies.is_empty() {
-            return Err(auth_error(
-                "本地 CAS 会话没有可用的认证 Cookie",
-                "重新执行 `bupt login --role graduate`。",
-            ));
-        }
-        Ok(cookies)
-    }
-}
-
 fn auth_error(message: impl Into<String>, hint: impl Into<String>) -> CliError {
     CliError::new(3, "auth", message, hint)
 }
 
-fn session_cookie(value: &Value) -> Option<SessionCookie> {
-    let object = value.as_object()?;
-    let raw = object.get("raw_cookie")?.as_str()?.trim();
-    let mut segments = raw.split(';');
-    let first = segments.next()?.trim();
-    let (name, value) = first.split_once('=')?;
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    let value = unquote(value.trim()).to_string();
-    let attributes = segments
-        .map(|segment| {
-            let segment = segment.trim();
-            let (key, value) = segment.split_once('=').unwrap_or((segment, ""));
-            (key.trim().to_ascii_lowercase(), value.trim().to_string())
-        })
-        .collect::<BTreeMap<_, _>>();
-    let domain = object
-        .get("domain")
-        .and_then(Value::as_object)
-        .and_then(|domain| {
-            domain
-                .get("HostOnly")
-                .or_else(|| domain.get("Suffix"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| attributes.get("domain").map(String::as_str))
-        .map(str::trim)
-        .and_then(|domain| {
-            let domain = domain.trim_start_matches('.');
-            (domain.eq_ignore_ascii_case("auth.bupt.edu.cn")
-                || domain.eq_ignore_ascii_case("bupt.edu.cn"))
-            .then_some("auth.bupt.edu.cn".to_string())
-        })?;
-    let path = object
-        .get("path")
-        .and_then(Value::as_array)
-        .and_then(|path| path.first())
-        .and_then(Value::as_str)
-        .or_else(|| attributes.get("path").map(String::as_str))
-        .filter(|path| path.starts_with('/'))
-        .unwrap_or("/")
-        .to_string();
-    let expires = cookie_expiry(object.get("expires"))?;
-    let secure = attributes.contains_key("secure");
-    let http_only = attributes.contains_key("httponly");
-    let same_site =
-        attributes
-            .get("samesite")
-            .and_then(|value| match value.to_ascii_lowercase().as_str() {
-                "strict" => Some("Strict".to_string()),
-                "lax" => Some("Lax".to_string()),
-                "none" => Some("None".to_string()),
-                _ => None,
-            });
-    Some(SessionCookie {
-        name: name.to_string(),
-        value,
-        domain,
-        path,
-        secure,
-        http_only,
-        expires,
-        same_site,
-    })
+fn graduate_session_error(error: CliError) -> CliError {
+    auth_error(
+        format!("研究生系统需要可用的本地 CAS 会话：{}", error.message),
+        "运行 `bupt login --role graduate`，再重试本命令；不会尝试破解验证码。",
+    )
 }
 
-/// `None` means the cookie is absent, expired, or unparseable; expired cookies
-/// must never be injected into a fresh browser session.
-fn cookie_expiry(value: Option<&Value>) -> Option<Option<i64>> {
-    match value {
-        None | Some(Value::Null) => Some(None),
-        Some(Value::String(value)) if value == "SessionEnd" => Some(None),
-        Some(Value::Object(object)) => {
-            let raw = object.get("AtUtc")?.as_str()?;
-            let expires = OffsetDateTime::parse(raw, &Rfc3339).ok()?.unix_timestamp();
-            (expires > OffsetDateTime::now_utc().unix_timestamp()).then_some(Some(expires))
-        }
-        _ => None,
+fn cookie_params(cookie: &CasCookie) -> Map<String, Value> {
+    let mut params = Map::new();
+    params.insert("name".to_string(), json!(cookie.name()));
+    params.insert("value".to_string(), json!(cookie.value()));
+    params.insert("secure".to_string(), json!(cookie.secure()));
+    params.insert("httpOnly".to_string(), json!(cookie.http_only()));
+    if let Some(expires) = cookie.expires_at() {
+        params.insert("expires".to_string(), json!(expires));
     }
+    params.insert("path".to_string(), json!(cookie.path()));
+    if cookie.host_only() {
+        // Omitting `domain` and supplying a URL keeps Chrome's host-only
+        // semantics; the explicit path preserves the maintained jar's path.
+        params.insert(
+            "url".to_string(),
+            json!(format!("https://{}/", cookie.domain())),
+        );
+    } else {
+        params.insert("domain".to_string(), json!(cookie.domain()));
+    }
+    params
 }
 
-fn unquote(value: &str) -> &str {
-    if value.len() >= 2 {
-        let first = value.as_bytes()[0];
-        let last = value.as_bytes()[value.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return &value[1..value.len() - 1];
-        }
-    }
-    value
+fn is_yjxt_url(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == Some("yjxt.bupt.edu.cn")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 pub(in crate::academics) struct ChromePageSource {
@@ -300,8 +128,8 @@ impl GradPageSource for ChromePageSource {
                 "本科生请使用 `bupt schedule` / `bupt scores` / `bupt classrooms`。",
             ));
         }
-        let cookies = IdentitySessionAuth::new(&self.config_dir, &self.cache_dir)
-            .cookies(account.username(), role)?;
+        let cookies = identity::load_cas_cookies_for_auth(&self.config_dir, &self.cache_dir)
+            .map_err(graduate_session_error)?;
         let mut browser = Browser::launch(&cookies, self.timeout)?;
         browser.login()?;
         let menu = browser.menu()?;
@@ -551,7 +379,7 @@ struct Browser {
 }
 
 impl Browser {
-    fn launch(cookies: &[SessionCookie], timeout: Duration) -> CliResult<Self> {
+    fn launch(cookies: &[CasCookie], timeout: Duration) -> CliResult<Self> {
         sweep_stale_profiles();
         let profile = TempBuilder::new()
             .prefix("bupt-grad-")
@@ -633,7 +461,7 @@ impl Browser {
         Ok(browser)
     }
 
-    fn configure(&mut self, cookies: &[SessionCookie]) -> CliResult<()> {
+    fn configure(&mut self, cookies: &[CasCookie]) -> CliResult<()> {
         self.ws.call("Page.enable", json!({}), self.timeout)?;
         self.ws.call("Runtime.enable", json!({}), self.timeout)?;
         self.ws.call("Network.enable", json!({}), self.timeout)?;
@@ -643,19 +471,7 @@ impl Browser {
             self.timeout,
         )?;
         for cookie in cookies {
-            let mut params = Map::new();
-            params.insert("name".to_string(), json!(cookie.name));
-            params.insert("value".to_string(), json!(cookie.value));
-            params.insert("domain".to_string(), json!(cookie.domain));
-            params.insert("path".to_string(), json!(cookie.path));
-            params.insert("secure".to_string(), json!(cookie.secure));
-            params.insert("httpOnly".to_string(), json!(cookie.http_only));
-            if let Some(expires) = cookie.expires {
-                params.insert("expires".to_string(), json!(expires));
-            }
-            if let Some(same_site) = &cookie.same_site {
-                params.insert("sameSite".to_string(), json!(same_site));
-            }
+            let params = cookie_params(cookie);
             let result = self
                 .ws
                 .call("Network.setCookie", Value::Object(params), self.timeout)?;
@@ -674,7 +490,7 @@ impl Browser {
         let deadline = Instant::now() + self.timeout.max(Duration::from_secs(10));
         loop {
             if let Ok(url) = self.url()
-                && url.contains("yjxt.bupt.edu.cn")
+                && is_yjxt_url(&url)
             {
                 return Ok(());
             }
@@ -1227,124 +1043,65 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
-    const USER: &str = "20260001";
-
-    fn write_account(config: &Path, username: &str, role: &str) {
-        fs::create_dir_all(config).unwrap();
-        fs::write(
-            config.join("credentials.json"),
-            serde_json::to_vec_pretty(&json!({
-                "username": username,
-                "password": "synthetic-test-password",
-                "role": role,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn write_session(cache: &Path, username: &str, role: &str, cookies: Value) {
-        fs::create_dir_all(cache).unwrap();
-        fs::write(
-            cache.join(SESSION_FILENAME),
-            serde_json::to_vec_pretty(&json!({
-                "version": 2,
-                "username": username,
-                "role": role,
-                "cookies": cookies,
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn synthetic_cookie(expiry: &str) -> Value {
-        json!([{
-            "raw_cookie": "CASTGC=synthetic-castgc; Path=/authserver; Secure; HttpOnly",
-            "path": ["/authserver", true],
-            "domain": {"HostOnly": "auth.bupt.edu.cn"},
-            "expires": {"AtUtc": expiry},
-        }])
-    }
-
-    fn synthetic_suffix_cookie() -> Value {
-        json!([{
-            "raw_cookie": "CASTGC=synthetic-castgc; Path=/authserver; Secure; HttpOnly",
-            "path": ["/authserver", true],
-            "domain": {"Suffix": "bupt.edu.cn"},
-            "expires": {"AtUtc": "2100-01-01T00:00:00Z"},
-        }])
+    #[test]
+    fn yjxt_redirect_requires_the_exact_https_host() {
+        assert!(is_yjxt_url(
+            "https://yjxt.bupt.edu.cn/ULogin.aspx?ticket=ST-synthetic"
+        ));
+        for untrusted in [
+            "https://yjxt.bupt.edu.cn.evil.example/ULogin.aspx",
+            "https://evil.example/?next=https://yjxt.bupt.edu.cn/ULogin.aspx",
+            "http://yjxt.bupt.edu.cn/ULogin.aspx",
+            "https://yjxt.bupt.edu.cn:8443/ULogin.aspx",
+            "https://user@yjxt.bupt.edu.cn/ULogin.aspx",
+        ] {
+            assert!(!is_yjxt_url(untrusted), "accepted {untrusted}");
+        }
     }
 
     #[test]
-    fn missing_session_is_an_auth_error_before_chrome_launch() {
-        let root = tempdir().unwrap();
-        let config = root.path().join("config");
-        write_account(&config, USER, "graduate");
-        let error = IdentitySessionAuth::new(&config, root.path())
-            .cookies(USER, Role::Graduate)
-            .expect_err("missing session must not launch Chrome");
-        assert_eq!(error.code, 3);
-        assert!(error.message.contains("CAS 会话"));
-    }
-
-    #[test]
-    fn foreign_or_role_mismatched_session_is_not_reused() {
-        let root = tempdir().unwrap();
-        let config = root.path().join("config");
-        write_account(&config, USER, "graduate");
-        write_session(
-            root.path(),
-            "20260002",
-            "graduate",
-            synthetic_cookie("2100-01-01T00:00:00Z"),
+    fn chrome_cookie_params_preserve_host_only_scope() {
+        let cookie = CasCookie::fixture(
+            "CASTGC",
+            "TEST-ONLY-COOKIE-VALUE",
+            "auth.bupt.edu.cn",
+            true,
+            "/authserver",
+            true,
+            true,
+            None,
         );
-        let error = IdentitySessionAuth::new(&config, root.path())
-            .cookies(USER, Role::Graduate)
-            .expect_err("foreign session must be refused");
-        assert_eq!(error.code, 3);
-        assert!(error.message.contains("不属于"));
+        let params = cookie_params(&cookie);
+        assert_eq!(params["name"], json!("CASTGC"));
+        assert_eq!(params["value"], json!("TEST-ONLY-COOKIE-VALUE"));
+        assert_eq!(params["url"], json!("https://auth.bupt.edu.cn/"));
+        assert_eq!(params["path"], json!("/authserver"));
+        assert_eq!(params["secure"], json!(true));
+        assert_eq!(params["httpOnly"], json!(true));
+        assert!(!params.contains_key("domain"));
+        assert!(!params.contains_key("expires"));
+        assert!(!format!("{cookie:?}").contains("TEST-ONLY-COOKIE-VALUE"));
     }
 
     #[test]
-    fn expired_cas_cookies_are_not_injected() {
-        let root = tempdir().unwrap();
-        let config = root.path().join("config");
-        write_account(&config, USER, "graduate");
-        write_session(
-            root.path(),
-            USER,
-            "graduate",
-            synthetic_cookie("2000-01-01T00:00:00Z"),
+    fn chrome_cookie_params_keep_domain_cookie_scope_and_expiry() {
+        let cookie = CasCookie::fixture(
+            "SCHOOL",
+            "TEST-ONLY-SCHOOL-VALUE",
+            "auth.bupt.edu.cn",
+            false,
+            "/",
+            true,
+            false,
+            Some(4_102_444_800),
         );
-        let error = IdentitySessionAuth::new(&config, root.path())
-            .cookies(USER, Role::Graduate)
-            .expect_err("expired cookie must not become a browser session");
-        assert_eq!(error.code, 3);
-        assert!(error.message.contains("没有可用"));
-    }
-
-    #[test]
-    fn live_cas_cookie_is_scoped_to_the_known_auth_host() {
-        let root = tempdir().unwrap();
-        let config = root.path().join("config");
-        write_account(&config, USER, "graduate");
-        write_session(
-            root.path(),
-            USER,
-            "graduate",
-            synthetic_cookie("2100-01-01T00:00:00Z"),
-        );
-        let cookies = IdentitySessionAuth::new(&config, root.path())
-            .cookies(USER, Role::Graduate)
-            .expect("live synthetic session");
-        assert_eq!(cookies.len(), 1);
-        assert_eq!(cookies[0].name, "CASTGC");
-        assert_eq!(cookies[0].domain, "auth.bupt.edu.cn");
-        assert_eq!(cookies[0].path, "/authserver");
-        assert!(cookies[0].secure && cookies[0].http_only);
+        let params = cookie_params(&cookie);
+        assert_eq!(params["domain"], json!("auth.bupt.edu.cn"));
+        assert_eq!(params["path"], json!("/"));
+        assert_eq!(params["expires"], json!(4_102_444_800i64));
+        assert_eq!(params["httpOnly"], json!(false));
+        assert!(!params.contains_key("url"));
     }
 
     #[test]
@@ -1358,18 +1115,6 @@ mod tests {
             )),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
-    }
-
-    #[test]
-    fn broad_school_cookie_is_narrowed_to_the_cas_host() {
-        let root = tempdir().unwrap();
-        let config = root.path().join("config");
-        write_account(&config, USER, "graduate");
-        write_session(root.path(), USER, "graduate", synthetic_suffix_cookie());
-        let cookies = IdentitySessionAuth::new(&config, root.path())
-            .cookies(USER, Role::Graduate)
-            .expect("suffix school cookie");
-        assert_eq!(cookies[0].domain, "auth.bupt.edu.cn");
     }
 
     #[test]

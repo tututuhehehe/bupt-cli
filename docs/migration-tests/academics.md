@@ -11,7 +11,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 ## 关键约定
 
 1. **课表快照归属与当前学期**：Rust 快照格式为 v2，顶层带 `username` 和 `role`。只有 `username` 等于当前凭据、`role` 等于当前身份、且运行当天落在快照教学周日期的闭区间内，才可直接服务 `schedule` / `schedule calendar` / `schedule export`。v1 没有 `username`，属于“无法确认归属”，不能按 `role` 猜测后继续。归属不符、缺失、损坏或当天不在学期内的快照都走唯一一次自动刷新；刷新失败/不完整/不覆盖当天时保留旧文件但不把它当作当前学期，也不生成日历或导出。
-2. **研究生刷新边界**：`schedule update` 和自动刷新通过 `TimetableSource` 进入 `ChromePageSource`；后者只读本地 `session.json` 中已保存的 CAS Cookie，不使用密码值、不破解验证码。没有可用会话时在启动 Chrome 前以 auth（退出 3）失败。测试通过 `GradPageSource` 注入合成 HTML，从不启动真实浏览器。
+2. **研究生刷新边界**：`schedule update` 和自动刷新通过 `TimetableSource` 进入 `ChromePageSource`；浏览器 Cookie 只由 identity 的 `load_cas_cookies_for_auth` 提供，复用同一份 owner/revision/私有文件校验和已维护的 cookie jar。academics 不再手读 `session.json`，也不使用密码值、不破解验证码。没有可用会话、revision 不符、文件权限过宽或 Cookie 过期时，都在启动 Chrome 前以 auth（退出 3）失败。导出的元数据只面向 HTTPS `auth.bupt.edu.cn`，保留 host-only 标记与 path/secure/httpOnly/expiry；`.bupt.edu.cn` 收窄到 auth host。测试通过 `GradPageSource` 注入合成 HTML，从不启动真实浏览器。
 3. **缓存位置**：沿用旧行为，fixture 写到 `BUPT_CLI_CACHE_DIR/timetable.json`；凭据写到 `BUPT_CLI_CONFIG_DIR/credentials.json`；CAS 会话写到 `BUPT_CLI_CACHE_DIR/session.json`。
 4. **网络隔离边界**：共享 `Sandbox` 只隔离 HOME/config/cache。把 `HTTP(S)_PROXY`/`ALL_PROXY` 指向关闭的本地端口是 best-effort，只对遵守这些环境变量的 HTTP 客户端生效；它不覆盖浏览器/非 HTTP 流量，也不能证明“没有发起网络请求”。真正的 no-calls 断言放在实现侧的注入来源用例中。
 5. **动态日期与时钟**：进程用例的教学周围绕本机当天生成，避免测试在学期结束后因“过期”而误判；实现侧用例使用固定日期 `2026-09-23`，并显式把 `today` 传给 `select_snapshot`。运行时使用本机日期，无法确定本机日期则报告错误。
@@ -77,7 +77,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `atomic_write_refuses_a_symlink_target_without_touching_it` | 目标本身是 symlink 时拒绝替换；返回 upstream 错误，链接和指向文件都不变 |
 | `concurrent_atomic_writes_leave_one_complete_file` | 多个并发写同一目标：最终内容是某一次完整 payload，不出现交叉/截断内容 |
 
-## 实现侧研究生页面解析与浏览器边界用例
+## 实现侧研究生页面解析、Cookie 导出与浏览器边界用例
 
 | Rust 用例 | 覆盖点 |
 |---|---|
@@ -89,11 +89,13 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 | `exams_real_row_preserves_every_reported_field` | 真实行保留课程、考核方式、日期、时间、地点、备注 |
 | `malformed_exam_page_is_an_error_not_an_empty_schedule` | 缺“考试课程”表头是 upstream 错误，不伪装成“没有考试” |
 | `snapshot_from_pages_requires_both_pages_and_a_term_label` | 缺课表/缺日历/缺学期标签都失败；不会只保存半份快照 |
-| `missing_session_is_an_auth_error_before_chrome_launch` | 无 `session.json` 时在 Chrome 前 auth 退出 |
-| `foreign_or_role_mismatched_session_is_not_reused` | 会话学号/身份不匹配时拒绝复用 |
-| `expired_cas_cookies_are_not_injected` | 过期 Cookie 不注入新浏览器 |
-| `live_cas_cookie_is_scoped_to_the_known_auth_host` | 只接受 `auth.bupt.edu.cn` Cookie，路径/secure/httpOnly 保留 |
-| `broad_school_cookie_is_narrowed_to_the_cas_host` | `.bupt.edu.cn` 的 CAS Cookie 注入时收窄到 `auth.bupt.edu.cn`，不扩大到 yjxt/其他子域 |
+| `cas_cookie_export_is_bound_and_preserves_host_scope` | 有效合成会话经 identity 导出：host-only 为 true；domain Cookie 保留 path/secure/expiry，并收窄到 `auth.bupt.edu.cn`；`Debug` 不含 Cookie 值 |
+| `cas_cookie_export_rejects_a_different_credential_revision` | 凭据 revision 与会话不一致：在浏览器前 auth 失败 |
+| `cas_cookie_export_rejects_a_public_session_file_before_browser` | `session.json` 为 0644：在浏览器前以 auth 拒绝，不读取/注入 Cookie |
+| `cas_cookie_export_rejects_expired_cookies` | 过期 Cookie 不进入浏览器；没有可用 Cookie 时 auth 失败 |
+| `yjxt_redirect_requires_the_exact_https_host` | 登录后跳转用解析后的 HTTPS 精确 host；`yjxt.bupt.edu.cn.evil.example`、外部 query 子串、HTTP、非标准端口、userinfo 都拒绝 |
+| `chrome_cookie_params_preserve_host_only_scope` | host-only Cookie 传 Chrome 时省略 `domain`、使用 auth host URL，并保留 path/secure/httpOnly |
+| `chrome_cookie_params_keep_domain_cookie_scope_and_expiry` | 非 host-only Cookie 使用 canonical auth domain，并保留 path/expiry |
 | `menu_urls_stay_on_known_graduate_pages` | 菜单绝对 URL、协议相对 URL、`..`、反斜杠都拒绝；只拼已知研究生页面 |
 | `menu_parser_and_eid_extraction_ignore_untrusted_urls` | 菜单 name/url 提取；EID 只接受安全字符 |
 | `websocket_handshake_helpers_match_known_vectors` | 自实现的 SHA-1/Base64 对已知向量正确，避免新增依赖 |
@@ -101,12 +103,12 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
 ## 实施状态（研究生运行时接通与完整导出）
 
 - `NativeTimetableSource` 已把 `schedule` / `schedule calendar` / `schedule export` / `schedule update` 的刷新边界接到 `ChromePageSource`。研究生路径启动隔离的已安装 Chrome（临时 profile、正常桌面 UA、仅访问已知 `auth.bupt.edu.cn` / `yjxt.bupt.edu.cn` / `TermCalender.aspx`），通过 CDP 读取渲染后的 HTML；不提交密码、不破解验证码，也没有 stealth/自动化隐藏参数。
-- `ChromePageSource` 先读 `session.json`：只接受 version 2、当前学号/身份、`auth.bupt.edu.cn` 且未过期的 CAS Cookie；会话缺失/过期/归属不符时在启动 Chrome 前 auth 失败（退出 3）。`IdentitySessionAuth` 是当前临时的 scoped session reader；父级 identity 应提供等价访问器并接管 `session.json` 解析，academics 不应长期复制该格式。
+- `ChromePageSource` 通过 `load_cas_cookies_for_auth` 取得 Cookie；identity 侧与 `load_owned_cas_session` 共用 `load_bound_session`（config/cache 路径 helper），校验账号、role、revision、私有目录/普通文件，并用 `cookie_store` 的已维护 jar 校验 domain/path。返回值是窄的 `CasCookie` 元数据：只面向 HTTPS `auth.bupt.edu.cn`，保留 host-only、path、secure、httpOnly、expiry，`Debug` 对值打码；`.bupt.edu.cn` 后缀收窄到 auth host。会话缺失/过期/归属或 revision 不符/权限过宽都在 Chrome 前 auth 失败（退出 3）。
 - `schedule update` / 自动刷新只在成功解析出完整快照后原子替换缓存；课表刷新要求课表+日历两页、学期标签有年份、教学周从第 1 周开始且连续、每周恰好 7 个连续合法日期、覆盖运行当天，并且所有课程场次都能生成完整 ICS。任一条件失败保留旧文件，不提供半份课表/日历。
-- `exams` 的研究生路径已接通：解析考试表格的共同外壳 `columns` / `count` / `exams` / `note`；空表明确显示“暂无考试”，不伪造日期、场次或地点。本科 `exams` 仍停在 pending（退出 5），`scores` / `classrooms` 仍只完成本地身份与数据源路由校验。
+- `exams` 的研究生路径已接通：解析考试表格的共同外壳 `columns` / `count` / `exams` / `note`；空表明确显示“暂无考试”，不伪造日期、场次或地点。登录后跳转只认解析后的精确 HTTPS `yjxt.bupt.edu.cn`，不再做 host 子串匹配。本科 `exams` 仍停在 pending（退出 5），`scores` / `classrooms` 仍只完成本地身份与数据源路由校验。
 - 本地优先读取路径（`schedule` / `schedule calendar` / `schedule export` 命中新鲜快照）不构造浏览器、不读会话；实现侧注入用例对刷新来源的调用次数有明确断言。
 - 缓存与 `.ics` 共用原子写入助手：在目标同目录用 `NamedTempFile` 创建不可预测临时文件，写满、flush、`sync_all` 后才 `persist`；目标若是 symlink、非普通文件或与临时文件同一 inode 会拒绝。`tempfile` 是正式依赖，本轮未增加 crate，`Cargo.lock` 无变化。
-- 本清单进程用例 31 个；academics 实现侧用例 33 个（17 个当前学期/刷新/写入 + 8 个研究生解析 + 8 个浏览器/session 边界）。`cargo fmt --check`、`cargo test --locked --offline --lib`、`cargo test --locked --offline --test contract_academics` 是交付检查项。
+- 本清单进程用例 31 个；academics 实现侧用例 31 个（17 个当前学期/刷新/写入 + 8 个研究生解析 + 6 个浏览器边界），另有 identity session 的 4 个 Cookie 导出用例。`cargo fmt --check`、`cargo test --locked --offline --lib`、`cargo test --locked --offline --test contract_academics` 是交付检查项。
 - 当前学期策略：只看运行当天是否在快照日期闭区间内，不看 `--date`、不看 TTL、不按抓取时间淘汰；学期内不会因快照“旧”而自动刷新。跨学期时按上述边界自动刷新一次。
 
 ## 尚未完成 / 交接
@@ -118,6 +120,7 @@ Python 基准：`d7c35ef`。合同：`docs/rust-migration.md`。本清单只覆�
    - 需要可注入的移动教务 HTTP 传输或录制响应；`scores --semester` 过滤、考试空数据、classroom 空/非空解析尚未验证。
 3. **真实 Chrome/CDP/校园网验收**
    - 本轮明确不启动真实 Chrome、不访问真实凭据/浏览器 profile/校园服务；CAS Cookie 过期、瑞数挑战、Chrome 版本差异、真实菜单/课表/日历/考试页面结构都需单独的联网验收记录。CDP 生命周期目前只有 helper/解析单元测试，没有本地假 Chrome 端点测试。
+   - Python 基准里已知的 HTTP service callback 路径仍需真实联网确认；本轮不据此制造新的路由，也不修改 Chrome 隐私设置去绕过挑战。
 4. **Unix `0600` 权限**
    - 原子写入已实现，但尚未验证快照/导出的 Unix 权限位；需要平台验收。
 5. **Windows 下打开导出目录 / persist 行为**
