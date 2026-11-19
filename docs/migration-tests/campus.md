@@ -6,7 +6,7 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 
 ## 已执行的离线用例
 
-`tests/contract_campus.rs` 全部通过公开 CLI 进程边界验证，使用共享 `Sandbox`，只用合成输入，不读取真实凭据、不依赖校园网响应。所有错误用例都断言：stdout 为空、stderr 是单个 JSON、带 `schema: "bupt.v1"`、`ok: false`、正确的 `error.type` 和退出码。进程级用例没有成功响应注入，只能区分本地参数、配置和凭据层，不能证明实现没有发起请求；库解析和请求形状由 `src/campus/library.rs` 内的 `Scripted` 测试覆盖。
+`tests/contract_campus.rs` 全部通过公开 CLI 进程边界验证，使用共享 `Sandbox`，只用合成输入，不读取真实凭据、不依赖校园网响应。所有错误用例都断言：stdout 为空、stderr 是单个 JSON、带 `schema: "bupt.v1"`、`ok: false`、正确的 `error.type` 和退出码。进程级用例没有成功响应注入，只能区分本地参数、配置和凭据层，不能证明实现没有发起请求；库解析、请求形状、门户/电费完整请求链由模块内的 `Scripted` 会话驱动测试覆盖。
 
 | Rust 用例 | 覆盖语义 | Python 来源 |
 |---|---|---|
@@ -54,7 +54,7 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 
 ## 合成夹具
 
-`tests/fixtures/contracts/campus/` 是脱敏的上游响应形状；`src/campus/library.rs` 与 `src/campus/portal.rs` 的内部 `Scripted` 传输测试已直接消费图书馆和门户响应。电费夹具仍留给会话适配器接通后的测试。
+`tests/fixtures/contracts/campus/` 是脱敏的上游响应形状；`src/campus/library.rs`、`src/campus/portal.rs` 与 `src/campus/electricity.rs` 的内部 `Scripted` 会话/传输测试直接消费图书馆、门户和电费响应，不联网。
 
 | 夹具 | 预期用途 |
 |---|---|
@@ -62,25 +62,41 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `library_holdings.html` | 馆藏行：固定状态列、列偏移回退、非馆藏行过滤、可借计数 |
 | `library_ebook.json` / `library_ebook_empty.json` | 扁平 `{locate, recNote}`、`\x1e` 清理、空列表 `has_electronic=false` |
 | `portal_notices_notice.html` | 通知列表：相对 URL 补全、author/time、空 href 过滤；`src/campus/portal.rs` 已消费 |
+| `portal_notices_news.html` | 新闻列表；命令级默认 `notice,news` 双请求与合并排序测试消费 |
 | `portal_notice_detail.html` | 详情：标题、发布部门/时间、正文、相对图片、装饰图过滤、附件；`src/campus/portal.rs` 已消费 |
 | `portal_card.json` / `portal_card_invalid.txt` | 卡余额字段映射；非 JSON 错误；`src/campus/portal.rs` 已消费 |
 | `portal_login_page.html` | 门户登录页识别（auth 分类，而不是 parse/network）；列表与卡余额均已消费 |
 | `electricity_buildings_shahe.json`、`electricity_buildings_empty.json` | 楼栋列表字段原样映射、空列表 `count=0` |
-| `electricity_floors.json`、`electricity_rooms.json` | 后续楼层/房间解析的合成形状；本轮未消费 |
+| `electricity_floors.json`、`electricity_floors_xitucheng.json`、`electricity_rooms.json` | 沙河/西土城楼层形状、房间匹配与 `dromNum`；`src/campus/electricity.rs` 的查询链测试已消费 |
 | `electricity_meter.json`、`electricity_meter_empty.json` | 电表余额字段映射；空/零值的默认值、`freeEnd` 回退 |
 | `electricity_auth_error.json` | 上游 `e/m` 未登录标记 |
 | `electricity_upstream_error.json` | `e != 0` 且无登录标记的维护错误 |
 
-## 第一批实现（本地路径）
+## 命令编排与会话边界
 
-`src/campus.rs` 保留命令注册、路由、参数校验和占位 portal 桥；`src/campus/library.rs` 负责匿名 OPAC；`src/campus/dorm.rs` 负责宿舍配置与楼名；`src/campus/electricity.rs` 负责电费响应到 CLI 字段的离线映射。已实现：
+`src/campus.rs` 保留命令注册、参数校验和路由，并新增 `run_with_session`；`src/campus/session.rs` 定义 `SessionDriver` 与 `Route`；`src/campus/library.rs` 负责匿名 OPAC；`src/campus/dorm.rs` 负责宿舍配置、楼名和楼栋元数据；`src/campus/portal.rs` 负责门户请求/响应；`src/campus/electricity.rs` 负责电费完整请求链和字段映射。已实现：
 
-- `library search|hold|ebook` 的参数规格：`--page`、`--page-size`、`--location`、`--with-ebook`、位置参数与空白校验。
-- 匿名 OPAC 请求和响应解析：书目字段、HTML 高亮/实体清理、馆藏状态列与偏移回退、电子资源扁平列表和 `\x1e` 清理；`--with-ebook` 的旁路查询失败只记 `null`。
+- `library search|hold|ebook` 的参数规格、匿名 OPAC 请求和响应解析。匿名 `library` 路径不读取凭据，也不使用 `SessionDriver`。
 - `electricity` / `electricity buildings` 的参数规格、楼名与校区别名、`config.json` 的 `dorm` 解析，以及 flag > env > config > built-in placeholder 的优先级。
-- `electricity buildings` 的 `area`/`count`/原样列表映射，以及余额的 `building/floor/room/surplus/price/remaining_kwh/total_consumed_kwh/meter_time/low_balance/threshold/source` 映射。`src/campus/electricity.rs` 提供 typed `MeterTarget` 和基于共享 `Transport` 的 Scripted 测试缝；生产会话/楼层房间解析尚未接线，`run_electricity` 有 profile 时仍停在 pending。
-- `notices` / `notices show` / `card` 的本地参数校验与类型筛选；`notices show` 的空白 URL 在读取 profile 前以 usage 2 拒绝。受保护命令统一使用 `identity::require_authenticated_profile`，只从临时目录的 `credentials.json` 读取 username 和非空密码，不读取账号环境变量，也不要求 role；无本地 profile 或凭据损坏时返回 auth 3，有 profile 时停在 session adapter pending，不伪造成功。匿名 `library` 路径不读取凭据。
-- 门户请求与响应核心在 `src/campus/portal.rs`：类型解析（`--type`）、列表请求与合并排序截断、详情正文/附件/图片映射、卡余额字段映射、门户登录页/系统错误页分类，以及 `notices show` 的目标校验。核心只接收注入的 `Transport`，不附加任何凭据；生产命令仍停在 session adapter pending，见下节。
+- `electricity buildings` 的 `/part` 请求和 `area`/`count`/原样列表映射。
+- `electricity` 余额的 Python 请求链：静态楼栋 `partmentId`/`areaId`/默认楼层 → `/floor` 精确楼层名匹配 → `/drom` 房间名/房号评分 → `/search` → CLI 字段。楼层推断、沙河 `层` 后缀、房间规范化/精确>后缀>包含、非对象项、缺 `dromNum` 都有离线用例。
+- `notices` / `notices show` / `card` 的本地参数校验、profile 检查和命令编排；`notices show` 的空白/外部 URL 在读取 profile 前以 usage 2 拒绝。受保护命令统一使用 `identity::require_authenticated_profile`，只从临时目录的 `credentials.json` 读取 username 和非空密码，不读取账号环境变量，也不要求 role；无本地 profile 或凭据损坏时返回 auth 3。
+- `SessionDriver` 在联网前调用 `ensure(Service::Portal|Electricity)`，每个请求带 `Route` 标签；`send` 只执行一次交换，`renew` 只在确认 auth 3 后调用一次。门户列表 auth 后重启整个列表；电费只重试失败的 `/post`。这与 Python 的 invalidate-and-retry 行为一致。`Route::accepts` 固定方法、完整 URL/主机、请求头集合和空/非空 body，驱动不得把 `Cookie`/`Authorization` 放进 `Request`。
+- 默认 `run` 使用 `PendingSession`，在本地参数和 profile 检查后返回 upstream 5；因此当前正式二进制仍不会发门户/电费请求。父会话层可调用 `run_with_session` 接入真实 `ensure`/`send`/`renew`。
+
+`SessionDriver` 收到的 route 模板（`Route::accepts` 逐项校验）：
+
+| Route | 方法 | 目标与固定请求头 |
+|---|---|---|
+| `PortalNoticeList` | GET | `http://my.bupt.edu.cn/list.jsp?...&wbtreeid=<notice/news/rules/ways>`；无自定义头、无 body |
+| `PortalNoticeDetail` | GET | 用户给定、已校验的 `http(s)://my.bupt.edu.cn/...`；无自定义头、无 body |
+| `PortalCard` | GET | `http://my.bupt.edu.cn/system/resource/app/cuser/getwxtsA.jsp`；`Referer` + `X-Requested-With` |
+| `ElectricityBuildings` | POST | `https://app.bupt.edu.cn/buptdf/wap/default/part`；`Referer` + `X-Requested-With` + `Content-Type`，非空 form body |
+| `ElectricityFloors` | POST | `.../floor`；同上 |
+| `ElectricityRooms` | POST | `.../drom`；同上 |
+| `ElectricityBalance` | POST | `.../search`；同上 |
+
+任何 `Cookie`/`Authorization` 头、其他 URL/方法、空/非空 body 不符都会在驱动前被拒绝。门户列表和卡控件固定为 Python 的 `http`；详情允许 `http`/`https` 但主机必须是 `my.bupt.edu.cn`。
 
 ### 本轮新增的内部 fixture 测试
 
@@ -98,6 +114,7 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `library_transport_errors_do_not_echo_internal_diagnostics` | 传输错误仍按 Python 分类映射为 usage 2；消息不含内部诊断，hint 保留 `diagnose` |
 | `dorm_config_defaults_and_config_values_are_resolved_locally` | 内置占位符、config 值、`source=config` |
 | `dorm_flags_win_over_environment_and_config` | flag > env > config、楼名/room/floor |
+| `building_metadata_matches_the_python_constants` | 学一楼/沙河A/学29楼的 `partmentId`、`areaId`、默认楼层（含 `-1`、`层`、`强电`、空列表） |
 | `buildings_maps_area_count_and_response_items` | `/part` 的 `areaid` 请求、shahe/xitucheng 回显、空列表、楼栋字段原样保留 |
 | `balance_maps_fixture_fields_and_response_overrides` | `/search` 表单、响应 `parName/floorName` 覆盖 fallback、余额/价格/剩余量/总用量/时间/阈值/source 映射 |
 | `balance_keeps_empty_and_zero_values_compatible` | 空 surplus、零/空 price、空 `vTotal` 回退 `freeEnd`、空名称/时间、低余额阈值 |
@@ -105,6 +122,12 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `nonzero_status_without_auth_marker_keeps_python_classification` | 维护错误为 network 4；`请登录` 近似文本不升级为 auth；`无数据` 为 not_found 5 |
 | `malformed_payloads_are_parse_errors` | 非对象、缺 `e`、缺 `d.data`、错误数据类型均为 parse 5 |
 | `invalid_json_is_a_parse_error` | 非 JSON 响应为 parse 5 |
+| `floor_inference_and_explicit_suffix_match_python_examples` | 学一楼 `101/1204` 首层回退、显式楼层 trim；沙河默认楼层与 `层` 后缀、显式 `强电` 原样；学29楼空默认楼层回退 `1` |
+| `room_scores_are_exact_then_suffix_then_containment` | 房间名/房号规范化后 exact 3、后缀 2、包含 1、空/不匹配 0 |
+| `query_rejects_a_floor_name_that_is_not_exactly_present` | `/floor` 名称不做模糊匹配；找不到时 not_found 5，只发一次请求 |
+| `query_rejects_a_room_without_a_match_after_floor_and_room_requests` | `/drom` 无匹配时 not_found 5，请求链停在 `/drom` |
+| `query_fails_honestly_on_non_object_floor_or_room_items` | 非对象楼层/房间项均为 parse 5，不 panic |
+| `query_rejects_a_room_without_a_meter_number` | 缺少/空 `dromNum` 为 parse 5，不伪造电表号 |
 
 ### 门户响应核心（portal.rs）
 
@@ -130,12 +153,33 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 | `card_rejects_non_json_payloads_as_parse_errors` | 非 JSON、数组、字符串 → parse 5，消息不回显字段 |
 | `card_login_page_is_an_auth_error` | 200 登录页 → auth 3 |
 
+### 命令编排与会话驱动测试
+
+`src/campus/session.rs` 和 `src/campus.rs` 的测试使用进程内 `ScriptedSession`（实现 `SessionDriver`，底层仍是共享 `Scripted`）与临时合成 `credentials.json`；不读取真实 profile/session，不联网。成功用例断言同一 `run_with_session` 路径、请求顺序、`ensure`/`renew` 次数，以及 credentials 不变、cache 目录为空。这些是命令处理器级证据，不是正式二进制进程级成功输出。
+
+| Rust 测试 | 覆盖 |
+|---|---|
+| `routes_accept_only_their_exact_shape` | 门户列表类型/URL、卡控件精确 URL 与两个头、详情主机校验；增加 `Cookie` 头即拒绝 |
+| `electricity_route_rejects_credentials_and_other_destinations` | `/part` 方法/URL/头/body；换 `/search` 或加 `Authorization` 即拒绝 |
+| `scoped_transport_rejects_an_unapproved_request_before_the_driver` | 不匹配 route 的请求在 driver 前 upstream 5，driver/transport 均零调用 |
+| `notices_success_runs_through_the_command_without_writing_state` | 默认 `notice,news` 双请求、排序/截断、CLI 数据形状；`ensure=1`、`renew=0`、无状态写入 |
+| `notice_detail_success_runs_through_the_command_without_writing_state` | URL 规范化、`--max-chars`、详情字段；无状态写入 |
+| `card_success_runs_through_the_command_without_writing_state` | 卡控件请求/字段映射；`ensure(Service::Portal)`；无状态写入 |
+| `buildings_success_runs_through_the_command_without_writing_state` | `/part` 表单、area/count/list；`ensure(Service::Electricity)`；无状态写入 |
+| `electricity_success_runs_floor_room_and_balance_through_the_command` | 默认 `学一楼/101` 的 `/floor`→`/drom`→`/search` 顺序、partment/floor/meter 表单、CLI 字段；无状态写入 |
+| `portal_auth_failure_renews_once_and_restarts_the_list` | 列表首个响应为登录页 → `renew=1`，从第一个类型重新请求后成功 |
+| `electricity_auth_failure_renews_only_the_failed_post_once` | `/part` 首次 auth → `renew=1`，只重试 `/part` 后成功 |
+| `electricity_stops_after_one_renewal_when_auth_still_fails` | 第二次仍 auth 时返回 auth 3，不无限续期 |
+| `default_pending_driver_keeps_the_local_auth_then_upstream_layering` | 默认 `run`：有 profile → upstream 5 且零传输；无 profile → auth 3 |
+| `run_rejects_an_unknown_command_before_any_session_use` | 未知命令 usage 2，`ensure`/请求均为零 |
+| `command_json_shape_is_not_added_by_the_campus_layer` | 校园层不自行添加 `schema`/`ok`，仍由共享 CLI 包装 |
+
 请求与输出映射（沿用 Python 字段，不扩字段）：
 
-- `notices`：每个类型一次 `GET http://my.bupt.edu.cn/list.jsp?totalpage=30&PAGENUM=0&urltype=tree.TreeTempUrl&wbtreeid=<id>`（`notice` 1154、`news` 1221、`rules` 1536、`ways` 1524）；输出 `{count, types, notices[{title,url,author,time,type,type_name}]}`。`types` 为命令行显式类型，默认时是 `null`。`count=0` 不发起请求。
+- `notices`：每个类型一次 `GET http://my.bupt.edu.cn/list.jsp?totalpage=30&PAGENUM=0&urltype=tree.TreeTempUrl&wbtreeid=<id>`（`notice` 1154、`news` 1221、`rules` 1536、`ways` 1524）；输出 `{count, types, notices[{title,url,author,time,type,type_name}]}`。`types` 为命令行显式类型，默认时是 `null`。`count=0` 在 `ensure` 后不发起列表请求。
 - `notices show`：`GET <校验后的 URL>`，输出 `{notice:{title,url,author,time,content_text,content_truncated,attachments[{title,url}],images[]}}`；不输出 `content_html` 与 `blocks`。
 - `card`：`GET http://my.bupt.edu.cn/system/resource/app/cuser/getwxtsA.jsp`，输出 `{student_id,main_wallet,subsidy,unread_mail}`；无法解析的数值保持 `null`（与 Python 一致，见「旧版歧义」）。
-- `notices show` 的 URL 只接受 `http`/`https`、主机恰为 `my.bupt.edu.cn`、无显式非默认端口、无 userinfo 的绝对 URL；校验发生在该模块发出请求之前，且实际请求使用规范化后的解析结果。生产命令的凭据检查仍先于这一校验（合并用例 `notices_show_requires_credentials_without_creating_session` 要求无凭据时对任意 URL 先报 auth 3）。
+- `notices show` 的 URL 只接受 `http`/`https`、主机恰为 `my.bupt.edu.cn`、无显式非默认端口、无 userinfo 的绝对 URL；校验发生在 profile 检查和该模块任何请求之前，实际请求使用规范化后的解析结果。有效 URL 但无凭据时仍返回 auth 3（`notices_show_requires_credentials_without_creating_session`）；空白/外部 URL 即使凭据损坏也先报 usage 2。
 
 **HTML 扫描器边界（未新增依赖）**：扫描器按需覆盖引号属性、注释/声明、void 元素、`script`/`style` 原始文本、同名嵌套深度匹配、文档顺序取最外层匹配，并对文本与属性做实体解码。它不实现 HTML 错误恢复、隐含结束标签、`<p>`/`<li>` 自动闭合或外来内容。若线上页面出现必须依赖浏览器级解析的结构（例如未闭合容器、表格重排、选择器语义变化），再评估引入 `html5ever`/`scraper` 这类维护中的解析器；那会增加依赖，需整合者批准，本轮不预置。
 
@@ -183,38 +227,32 @@ Rust 合同：`docs/rust-migration.md`。本文件记录测试、实现边界与
 - **3xx 不跟随**：上游若返回重定向，会作为 HTTP 状态交给 `ensure_success`，最终按旧行为成为 usage 错误，而不是自动跳转。
 - **依赖系统 curl**：macOS/Windows 缺少 curl 时返回 network 4，提示检查网络；没有内置下载或打包 curl。
 
-本轮验证：
+验证记录见文末「验证记录」；本轮没有运行真实校园网、浏览器、登录或公共图书馆请求，也没有新增环境变量回放或公开 CLI 参数。
 
-```sh
-cargo fmt --check
-cargo test --locked --offline
-```
+## 仍需父会话层接通的场景
 
-- `cargo fmt --check`：通过。
-- `cargo test --locked --offline`：通过；89 个库测试 + 25 academics + 33 campus + 14 homework + 28 identity + 23 lifecycle，共 212 个 Rust 测试，0 失败。
-- 没有运行真实校园网、浏览器、登录或公共图书馆请求；没有新增环境变量回放或公开 CLI 参数。
+以下不是校园模块内部缺失，而是父持有的 `src/cli.rs` / `src/transport.rs` / `src/identity` 接口尚未提供真实 `SessionDriver`。没有写成 `#[ignore]` 或永远通过的假测试：
 
-## 仍未接通的场景
+1. **父会话驱动实现**：实现 `campus::SessionDriver`：
+   - `ensure(&mut self, service: Service)`：按 `Service::Portal` / `Service::Electricity` 读取/验证本地会话，完成对应的门户或电费会话 prime/CAS 握手；校园模块只从 `credentials.json` 检查 username + 非空密码，不要求 role。
+   - `send(&mut self, route: Route, request: Request)`：先复核 `route.accepts(&request)`，再附加 Cookie/token 并执行一次 HTTP 交换；HTTP 状态（含 401/403/3xx）要作为 `Response` 返回给校园层分类，只有传输失败才返回 network 4。不得在 `Request` 里加凭据，不得隐式重试或跟随重定向。
+   - `renew(&mut self, service: Service)`：只在校园层已确认 auth 3 后，按该 service 失效并刷新一次会话；不得把凭据发到未批准目的地。
+2. **CLI 接入点**：父层调用 `campus::run_with_session`（或把 `campus::run` 的 `PendingSession` 换成真实驱动）。当前 `cli.rs` 的 `uses_campus_transport` 仍未把 `electricity` / `notices` / `card` 路由到带 Cookie 的传输，所以正式二进制仍是 `Offline` 语义；本批未改父文件。
+3. **scheme/WebVPN 决策**：`Route` 当前按 Python 固定门户 `http://my.bupt.edu.cn` 和电费 `https://app.bupt.edu.cn` 的精确形状校验。若父层要改用 HTTPS/WebVPN 或代理，必须先修改并评审 route 模板，不能由驱动静默改写 URL；本轮不猜测。
+4. **cookie/redirect 实际边界**：真实 401/403 后的会话失效、3xx 是否跟随、Cookie 域/路径、WebVPN 地址仍未实测；校园层只按确认的 `e/m` 标记或 401/403 进入 auth 3，3xx 不猜成登录页。若未来跟随重定向，必须在每一跳重新校验 `Route` 目标并重新确认 Cookie 域。
+5. **进程级成功输出**：共享 CLI 负责 `schema: "bupt.v1"` 和 `--pretty`；本批内部命令测试验证的是 `Outcome` 数据对象，尚未通过正式二进制回放门户/电费成功响应。进程合同测试仍只覆盖本地参数、无 profile 的 auth 层和文件副作用。
+6. **library 上游错误分层**：传输错误、HTTP 非 2xx、`result.code != 0`、hold 404/500、JSON 形状错误。本轮仍按 Python 旧版全部归为 usage 2；是否改为 network/upstream 分层仍未决定。
 
-这些场景没有写成 `#[ignore]` 或永远通过的假测试；当前没有对应的红测在失败，等会话/传输能力接通后再补：
+## 会话驱动的安全约束
 
-1. **library 上游错误分层**：传输错误、HTTP 非 2xx、`result.code != 0`、hold 404/500、JSON 形状错误。本轮按 Python 旧版全部归为 usage 2；是否改为 network/upstream 分层仍未决定。
-2. **electricity 余额完整请求链**：楼层推断/楼层 ID 查询、房间匹配与 `dromNum`、楼栋 `partmentId`/`areaId` 元数据，以及会话适配器。响应到 CLI 的字段映射已由 typed `MeterTarget` 离线覆盖；`run_electricity` 尚未接线。
-3. **electricity buildings 生产接线**：`areaid` 请求和列表映射已离线覆盖，仍缺会话适配器、真实传输和进程级成功输出。
-4. **electricity 会话/HTTP 边界**：401/403 的会话失效与是否续期、3xx/登录页处理、真实 cookie；本轮只按合成 `e/m` 和 HTTP 状态映射，不猜测登录重定向。
-5. **门户会话适配器与真实传输**：`notices` / `notices show` / `card` 的请求构造、响应解析和 CLI 字段已由 `src/campus/portal.rs` 离线覆盖，但生产命令仍停在 session adapter pending（有 profile 时 upstream 5）。适配器需要决定：请求实际使用 `http` 还是 `https`、Cookie/token 如何附加、是否以及如何跟随重定向（跟随前必须重新校验目标）、`my.bupt.edu.cn` 与 WebVPN 的地址来源。`src/cli.rs` 的路由和 `src/transport.rs` 的 campus 适配器由整合者持有，本轮未改。
-6. **明确过期后的一次续期**：Python 在门户 auth 问题后会让会话失效并重试至多一次。核心按单次请求返回 auth 3，续期与重试策略留给会话适配器；没有对应红测。
-7. **进程级成功输出**：共享 CLI 负责 `schema: "bupt.v1"` 和 `--pretty`；本轮内部测试验证的是数据对象，尚未通过正式二进制回放门户成功响应。
-
-进程测试当前只能验证参数、无 profile 的 auth 层和文件副作用；不能证明实现没有发请求。成功响应测试需要整合者提供的进程内传输注入或等价 seam，生产二进制不增加模拟环境变量。
-
-## 待门户适配器落实的安全约束
-
-- `notices show` 已在 `src/campus/portal.rs` 内校验目标：只接受 `http`/`https`、主机恰为 `my.bupt.edu.cn`、无显式非默认端口、无 userinfo 的绝对 URL；校验先于该模块的任何请求，请求使用规范化后的解析结果。
-- 重定向仍不跟随；适配器若要跟随，必须在跟随前后复核目标仍属于门户主机，且不得把 Cookie 带到其他主机。
-- 不得把校园凭据、Cookie 或 token 发送到任意 `--url` 指向的地址；`src/campus/portal.rs` 本身不附加 Cookie/Authorization，只设置卡控件要求的 `Referer` 与 `X-Requested-With`。
-- 已知 Python 入口使用 `http://my.bupt.edu.cn`（校内 RFC1918 主机）。在决定复用 Cookie 前，适配器必须先确定是否改用 HTTPS/WebVPN；本轮不发送任何真实 cookie 或密码，也不猜测该决定。
-- electricity 映射不跟随或解释重定向；3xx 交由响应体解析，登录页不会被猜成 auth，只有确认的 `e/m` 标记或 401/403 才进入 auth。
+- `notices show` 已在 `src/campus/portal.rs` 内校验目标：只接受 `http`/`https`、主机恰为 `my.bupt.edu.cn`、无显式非默认端口、无 userinfo 的绝对 URL；校验先于 profile 检查和该模块的任何请求，请求使用规范化后的解析结果。
+- `Route::accepts` 在任何 `SessionDriver::send` 前固定方法、完整 URL/主机、请求头集合和空/非空 body；`ScopedTransport` 在驱动前再次拒绝不匹配请求。门户列表/卡/详情和电费四个 endpoint 都有对应 route。
+- 校园模块不把 Cookie、Authorization 或 token 放进 `Request`；卡控件只设置 Python 要求的 `Referer` 与 `X-Requested-With`，电费只设置 `Referer`、`X-Requested-With`、`Content-Type`。驱动应在自己的传输层附加会话材料，而不是修改请求头。
+- 重定向仍不跟随；驱动若要跟随，必须在每一跳复核目标仍匹配原 `Route`，且不得把 Cookie 带到其他主机/端口/userinfo。
+- 不得把校园凭据、Cookie 或 token 发送到任意 `--url` 指向的地址。
+- 已知 Python 门户入口使用 `http://my.bupt.edu.cn`（校内主机），电费使用 `https://app.bupt.edu.cn`。若父层决定改用 HTTPS/WebVPN，必须先评审并更新 route；本轮不发送任何真实 cookie 或密码，也不猜测该决定。
+- electricity 不跟随或解释重定向；3xx 交由响应体解析，登录页不会被猜成 auth，只有确认的 `e/m` 标记或 401/403 才进入 auth。
+- 确认 auth 后只允许一次 `renew`；门户列表从第一个类型重启，电费只重试失败的单次 `/post`。第二次 auth 直接返回 3。
 
 ## 解析与编码边界
 
@@ -224,8 +262,10 @@ cargo test --locked --offline
 - 路径段编码按 UTF-8 字节百分号编码，空格在路径用 `%20`、表单用 `+`；未验证上游是否接受所有保留字符 ID，也未做 URL 规范化。
 - 搜索 `data` 非数组时当前按空列表处理；浮点计数截断；这些形状变化没有线上回归证据。
 - 电费数值按 Python 的 `or` 默认规则处理已测试的空/零标量；非法字符串和 NaN/Infinity 会转为默认值或 null，但没有单独夹具，也没有线上对照。
-- 电费 `MeterTarget` 依赖调用方已经解析出的楼层/房间 ID 与显示 fallback；本轮不实现楼层推断、房间列表匹配或楼栋元数据。
-- 电费列表项原样透传，不逐项验证对象形状。
+- 电费楼层推断按 ASCII 数字分组实现 Python `re.findall(r"\d+")` 的常见输入；Python 的 Unicode `\d`/`isdigit()` 边界（非 ASCII 数字）没有夹具，可能与 Rust 的 ASCII 判断不同。
+- 电费房间规范化实现 Python 的 `[\s_-]+` 去除和 `.upper()`，但 Python 的 Unicode 大小写/空白全集没有逐码点对照；合成测试只覆盖 ASCII 与少量中文。
+- 查询链按单次 CLI 调用实现，没有移植 Python 的进程内楼层/房间元数据缓存；重复查询会重复 `/floor`、`/drom`，结果预计一致但没有线上对照。
+- 电费 `/floor`、`/drom` 列表项现在逐项要求 JSON object；Python 的 `/floor` 非对象项会抛未包装异常，Rust 统一为 parse 5。`/part` 列表仍原样透传，不逐项验证对象形状。
 - 门户 HTML 用自写扫描器（无新依赖），只覆盖合成夹具与合同列出的结构；不实现 HTML 错误恢复、隐含结束标签、表格重排等浏览器级行为。列表缺 `newslist`、条目全无效、详情缺标题/正文容器都按 parse 5 处理；href 无法解析的条目会被跳过，若全部跳过则报「no valid notice items」。
 - 门户卡片数字按 Python 的静默容错：无法解析或非有限值 → `null`；`mail` 小数向零截断。Python 对 `NaN`/`Infinity` 会输出非法 JSON，Rust 侧固定输出合法 JSON 的 `null`，无线上对照。
 - 正文 `content_text` 的空白按 Python `html_to_text` 保留内部空白（标签替换为空格后仅去首尾）；`<script>`/`<style>` 的原始文本被排除，这一点比 Python 的正则剥离更严格。
@@ -233,16 +273,16 @@ cargo test --locked --offline
 
 ## 旧版歧义（未在本轮决定）
 
-1. **library 上游错误退出码**：Python `cmd_library_search` / `cmd_library_hold` / `cmd_library_ebook` 把 `LibraryError` 统一转成 `UsageError`（退出 2），包括传输错误、上游返回 `result.code != 0` 和 hold 页面 404/500。第一批实现为保持旧行为暂时沿用 usage 2；内部测试只固定该分类和通用消息，进程合同未覆盖错误分层。Rust 合同的分层错误可能更适合 network/upstream，仍待整合者决定。
+1. **library 上游错误退出码**：Python `cmd_library_search` / `cmd_library_hold` / `cmd_library_ebook` 把 `LibraryError` 统一转成 `UsageError`（退出 2），包括传输错误、上游返回 `result.code != 0` 和 hold 页面 404/500。当前实现为保持旧行为暂时沿用 usage 2；内部测试只固定该分类和通用消息，进程合同未覆盖错误分层。Rust 合同的分层错误可能更适合 network/upstream，仍待整合者决定。
 2. **`notices --count 0`**：Python 仍先建立会话（无凭据时 auth 3），然后客户端短路返回空列表。核心实现了「有凭据后不发起请求直接返回空列表」，生产命令接适配器时仍需先过凭据层；是否允许完全无会话的空查询仍未决定。
-3. **损坏 config 与完整 flag 的关系**：Python `resolve_dorm` 无条件读取 `config.json`，因此即使 flag 已给全，损坏配置仍会让查询失败。本轮验证了「参数本身非法时先报参数错误」「buildings 不因 dorm config 失败而抢先」，以及「无 flag/env 时 config 中的无效楼名会触发 usage（证明配置被读取）」；没有决定完整 flag 是否应绕过损坏配置，也没有验证最终电表请求的来源。
+3. **损坏 config 与完整 flag 的关系**：Python `resolve_dorm` 无条件读取 `config.json`，因此即使 flag 已给全，损坏配置仍会让查询失败。本轮验证了「参数本身非法时先报参数错误」「buildings 不因 dorm config 失败而抢先」，以及「无 flag/env 时 config 中的无效楼名会触发 usage（证明配置被读取）」；没有决定完整 flag 是否应绕过损坏配置；默认参数下的完整电表请求来源已由命令级测试固定，损坏配置与完整 flag 的组合仍未决定。
 4. **`electricity buildings` 是否需要登录**：Python 走 `_session(required=True)`，所以无凭据是 auth 3。若上游元数据实际可匿名读取，这是合同未写明的新行为；本轮按旧版断言 auth。
 5. **card 数字容错**：Python 把无法解析的 `qkje/oddfare/mail` 静默变成 null。核心按 Python 保留静默容错并已由测试固定；是否改为 parse 错误仍未决定，改行为需整合者确认。
 6. **notices 详情输出字段**：CLI 只输出 `title/url/author/time/content_text/content_truncated/attachments/images`，不输出 `content_html` 与 `blocks`。本轮按「保留能沿用的字段」记录，不扩字段；`src/campus/portal.rs` 的输出与此一致。
 
 ## 验证记录
 
-执行目录：`/Users/limoon/Documents/moon_cli_or_tool/.worktrees/bupt-rust/portal`
+执行目录：`/Users/limoon/Documents/moon_cli_or_tool/.worktrees/bupt-rust/campus`
 
 ```sh
 cargo fmt --check
@@ -253,9 +293,9 @@ cargo test --locked --offline
 ```
 
 - `cargo fmt --check`：通过。
-- `cargo clippy --locked --offline --all-targets`：通过编译；`src/campus/portal.rs` 与 `src/campus.rs` 无 clippy 告警，其余告警是本线外既有项。
-- `cargo test --locked --offline --lib`：139 passed（此前 122；新增 17 个 `campus::portal` 测试）。
-- `cargo test --locked --offline --test contract_campus`：33 passed，与门户相关的进程用例保持原分类（无凭据 auth 3、未知类型 usage 2、有 profile 停在 pending upstream 5）。
-- `cargo test --locked --offline`：262 passed，0 failed；覆盖 lib 与全部离线 contract 测试。
+- `cargo clippy --locked --offline --all-targets`：通过编译；`src/campus.rs`、`src/campus/session.rs`、`src/campus/electricity.rs` 与 `src/campus/portal.rs` 无 clippy 告警，其余告警是本线外既有项。
+- `cargo test --locked --offline --lib`：210 passed（此前 192；新增 18 个 `campus` 测试：11 个命令编排/驱动 + 6 个电费查询链 + 1 个楼栋元数据）。
+- `cargo test --locked --offline --test contract_campus`：34 passed，进程用例保持原分类（无凭据 auth 3、未知类型/URL usage 2、有 profile 停在 pending upstream 5）。
+- `cargo test --locked --offline`：341 passed，0 failed；lib 210 + academics 30 + campus 34 + homework 16 + identity 28 + lifecycle 23。
 - 未新增 Cargo 依赖、公开 CLI 参数、环境变量回放或会话文件；未读取真实 profile/session，未访问校园网或 GitHub，未提交真实 cookie/密码。
 - 上述未接通场景没有对应的红测，也没有用 `#[ignore]`/`#[should_panic]` 隐藏。
