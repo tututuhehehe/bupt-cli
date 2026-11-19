@@ -518,10 +518,7 @@ fn parse_homework_page(data: &Value, site_id: &str) -> CliResult<HomeworkPage> {
                 .and_then(value_as_string),
             end_time: first_present(record, &["assignmentEndTime", "endTime"])
                 .and_then(value_as_string),
-            submit_time: record
-                .get("submitTime")
-                .filter(|value| is_truthy(value))
-                .and_then(value_as_string),
+            submit_time: record.get("submitTime").and_then(value_as_string),
             is_submitted: submitted,
             score: record.get("score").and_then(parse_score),
             raw: record.clone(),
@@ -1826,6 +1823,7 @@ mod tests {
         assert_eq!(page.items[1].begin_time, None);
         assert_eq!(page.items[1].end_time, None);
         assert!(!page.items[2].is_submitted);
+        assert_eq!(page.items[2].submit_time.as_deref(), Some(""));
         assert_eq!(page.items[2].activity_id, "hw-bool");
     }
 
