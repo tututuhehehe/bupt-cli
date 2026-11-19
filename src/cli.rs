@@ -249,7 +249,10 @@ fn run(
             });
             crate::transport::CampusCurl::for_diagnose(timeout)
         });
-        let mut release_curl = crate::transport::ReleaseMetadataCurl::new(timeout);
+        let mut release_curl = crate::transport::ReleaseCurl::new(
+            timeout,
+            name == "update" && !arguments.get_flag("check"),
+        );
         // An injected public transport marks the entire dispatch as a test;
         // the first injected transport then handles all non-library commands.
         let transport: &mut dyn Transport = match public {
@@ -258,7 +261,7 @@ fn run(
             None if uses_public_library(name) => &mut library_curl,
             None if uses_campus_transport(name, arguments) => &mut campus_curl,
             None if name == "diagnose" => diagnose_curl.as_mut().expect("diagnose has a transport"),
-            None if name == "update" && arguments.get_flag("check") => &mut release_curl,
+            None if name == "update" => &mut release_curl,
             None => offline,
         };
         let mut context = Context::from_environment(timeout, transport)?;

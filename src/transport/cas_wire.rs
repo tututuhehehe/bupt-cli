@@ -378,7 +378,7 @@ fn valid_homework_list_body(body: &str, page_size: u64) -> bool {
         && object.get("size").and_then(serde_json::Value::as_u64) == Some(page_size)
 }
 
-fn option(config: &mut String, name: &'static str, value: &str) {
+pub(super) fn option(config: &mut String, name: &'static str, value: &str) {
     let _ = write!(config, "{name} = \"");
     for ch in value.chars() {
         if matches!(ch, '"' | '\\') {

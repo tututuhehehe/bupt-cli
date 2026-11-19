@@ -103,6 +103,17 @@ struct SystemCurl {
 
 impl CurlExec for SystemCurl {
     fn exec(&mut self, args: &[OsString], body: &[u8]) -> CliResult<CurlOutput> {
+        self.exec_bounded(args, body, MAX_STDOUT_BYTES)
+    }
+}
+
+impl SystemCurl {
+    fn exec_bounded(
+        &mut self,
+        args: &[OsString],
+        body: &[u8],
+        max_stdout: usize,
+    ) -> CliResult<CurlOutput> {
         let mut child = Command::new(&self.program)
             .args(args)
             .env_clear()
@@ -132,7 +143,7 @@ impl CurlExec for SystemCurl {
             let _ = writer.join();
             return Err(transport_failure());
         };
-        let bytes = match read_bounded(&mut stdout, MAX_STDOUT_BYTES) {
+        let bytes = match read_bounded(&mut stdout, max_stdout) {
             Ok(Some(bytes)) => bytes,
             Ok(None) | Err(_) => {
                 terminate(&mut child);
@@ -401,20 +412,26 @@ fn transport_failure() -> CliError {
 
 mod cas_wire;
 
-/// Public release metadata only: read the redirect without following it.
-pub(crate) struct ReleaseMetadataCurl {
+/// Public release metadata and, for installs only, fixed release archives.
+/// Redirects are returned to the lifecycle handler, never followed by curl.
+pub(crate) struct ReleaseCurl {
     timeout: Duration,
+    allow_assets: bool,
 }
 
-impl ReleaseMetadataCurl {
-    pub(crate) fn new(timeout: Duration) -> Self {
-        Self { timeout }
+impl ReleaseCurl {
+    pub(crate) fn new(timeout: Duration, allow_assets: bool) -> Self {
+        Self {
+            timeout,
+            allow_assets,
+        }
     }
 }
 
-impl Transport for ReleaseMetadataCurl {
+const MAX_RELEASE_DOWNLOAD: usize = 64 * 1024 * 1024;
+
+impl Transport for ReleaseCurl {
     fn send(&mut self, request: Request) -> CliResult<Response> {
-        let args = release_metadata_arguments(&request, self.timeout)?;
         let mut exec = SystemCurl {
             program: system_curl_program(),
         };
@@ -422,11 +439,26 @@ impl Transport for ReleaseMetadataCurl {
             CliError::new(
                 4,
                 "network",
-                "GitHub release metadata request failed",
+                "GitHub release request failed",
                 "Check the connection and retry `bupt update --check`.",
             )
         };
-        let output = exec.exec(&args, &[]).map_err(|_| network())?;
+        let output = match release_metadata_arguments(&request, self.timeout) {
+            Ok(args) => exec.exec(&args, &[]),
+            Err(_) if self.allow_assets => {
+                let config = release_asset_config(&request, self.timeout)?;
+                let mut args = base_curl_arguments(self.timeout);
+                let cap = args
+                    .iter()
+                    .position(|arg| arg == "--max-filesize")
+                    .expect("curl size limit is configured");
+                args[cap + 1] = MAX_RELEASE_DOWNLOAD.to_string().into();
+                args.extend(["--config".into(), "-".into()]);
+                exec.exec_bounded(&args, &config, MAX_RELEASE_DOWNLOAD + 64 * 1024)
+            }
+            Err(error) => return Err(error),
+        }
+        .map_err(|_| network())?;
         if !output.success {
             return Err(network());
         }
@@ -477,6 +509,69 @@ fn release_metadata_arguments(request: &Request, timeout: Duration) -> CliResult
         request.url.clone().into(),
     ]);
     Ok(args)
+}
+
+fn release_asset_config(request: &Request, timeout: Duration) -> CliResult<Vec<u8>> {
+    let error = || {
+        CliError::new(
+            5,
+            "upstream",
+            "request is outside the release asset policy",
+            "",
+        )
+    };
+    let raw = request.url.as_str();
+    if raw.len() > 8192
+        || raw.contains(['\\', '#'])
+        || !raw.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+        || timeout.is_zero()
+        || request.method != "GET"
+        || !request.body.is_empty()
+        || !matches!(request.headers.as_slice(), [(name, value)] if name.eq_ignore_ascii_case("user-agent") && value == "bupt-cli")
+    {
+        return Err(error());
+    }
+    let url = url::Url::parse(raw).map_err(|_| error())?;
+    let host = url.host_str().ok_or_else(error)?;
+    if raw
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        != Some(host)
+        || url.as_str() != raw
+        || url.path().contains("//")
+        || url.path().to_ascii_lowercase().contains("%2f")
+        || url.path().to_ascii_lowercase().contains("%5c")
+    {
+        return Err(error());
+    }
+    let valid = match host {
+        "github.com" => {
+            let parts: Vec<_> = url.path().split('/').skip(1).collect();
+            let segment = |value: &str| {
+                !value.is_empty()
+                    && !matches!(value, "." | "..")
+                    && value.bytes().all(|b| {
+                        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+')
+                    })
+            };
+            url.query().is_none()
+                && matches!(parts.as_slice(), [owner, repo, "releases", "download", tag, asset]
+                if [*owner, *repo, *tag].into_iter().all(segment)
+                    && matches!(*asset, "bupt-macos-arm64.zip" | "bupt-windows-x64.zip"))
+        }
+        "release-assets.githubusercontent.com"
+        | "objects.githubusercontent.com"
+        | "github-releases.githubusercontent.com" => url.path() != "/",
+        _ => false,
+    };
+    if !valid {
+        return Err(error());
+    }
+    let mut config = String::from("include\n");
+    cas_wire::option(&mut config, "url", raw);
+    cas_wire::option(&mut config, "request", "GET");
+    cas_wire::option(&mut config, "user-agent", "bupt-cli");
+    Ok(config.into_bytes())
 }
 
 /// Separate from public-library transport: CAS cookies and UCloud credentials
@@ -563,6 +658,38 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Cursor;
     use std::rc::Rc;
+
+    #[test]
+    fn release_assets_allow_only_the_named_platform_archives_and_trusted_https_hosts() {
+        let timeout = Duration::from_secs(3);
+        let mut request = Request {
+            method: "GET",
+            url: "https://github.com/owner/project/releases/download/v1.0.0/bupt-macos-arm64.zip"
+                .into(),
+            headers: vec![("User-Agent".into(), "bupt-cli".into())],
+            body: vec![],
+        };
+        assert!(release_metadata_arguments(&request, timeout).is_err());
+        assert!(release_asset_config(&request, timeout).is_ok());
+        request.url = "https://release-assets.githubusercontent.com/example?signature=TEST".into();
+        let config = String::from_utf8(release_asset_config(&request, timeout).unwrap()).unwrap();
+        assert!(config.contains("signature=TEST"));
+        assert!(!config.contains("location"));
+        for invalid in [
+            "https://github.com/owner/project/releases/download/v1.0.0/source.zip",
+            "https://release-assets.githubusercontent.com@outside.example/example",
+            "https://github.com/owner/project/releases/download/v1.0.0/%2Fbupt-macos-arm64.zip",
+            "http://release-assets.githubusercontent.com/example",
+        ] {
+            request.url = invalid.into();
+            assert!(release_asset_config(&request, timeout).is_err());
+        }
+        request.url = "https://release-assets.githubusercontent.com/example".into();
+        request
+            .headers
+            .push(("Authorization".into(), "TEST-ONLY".into()));
+        assert!(release_asset_config(&request, timeout).is_err());
+    }
 
     #[test]
     fn release_metadata_requests_are_read_only_and_never_follow_redirects() {
