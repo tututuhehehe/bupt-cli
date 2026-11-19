@@ -1,4 +1,4 @@
-//! The CAS/UCloud slice for a one-exchange system curl executor. All request
+//! Scoped campus requests for a one-exchange system curl executor. All request
 //! strings are written as curl options to stdin, never to argv or a file.
 
 use super::{CurlExec, Request, Response, base_curl_arguments};
@@ -9,6 +9,7 @@ use url::Url;
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_HEADERS: usize = 64 * 1024;
+const ELECTRICITY_LANDING: &str = "https://app.bupt.edu.cn/buptdf/wap/default/chong";
 
 #[derive(Clone, Copy)]
 enum Route {
@@ -18,6 +19,8 @@ enum Route {
     UcloudToken,
     UcloudRead,
     UcloudHomeworkList,
+    ElectricityLanding,
+    ElectricityRead(&'static [&'static str]),
 }
 
 pub(super) fn exchange(
@@ -52,7 +55,7 @@ fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
     let body = std::str::from_utf8(&request.body).map_err(|_| rejected())?;
     let requires_body = matches!(
         route,
-        Route::CasForm | Route::UcloudToken | Route::UcloudHomeworkList
+        Route::CasForm | Route::UcloudToken | Route::UcloudHomeworkList | Route::ElectricityRead(_)
     );
     if body.len() > MAX_REQUEST
         || body.is_empty() == requires_body
@@ -86,6 +89,15 @@ fn curl_config(request: &Request) -> CliResult<Vec<u8>> {
                 .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "application/json"))
     {
         return Err(rejected());
+    }
+    if let Route::ElectricityRead(keys) = route {
+        if !valid_electricity_body(body, keys)
+            || !has_header(request, "referer", ELECTRICITY_LANDING)
+            || !has_header(request, "x-requested-with", "XMLHttpRequest")
+            || !has_header(request, "content-type", "application/x-www-form-urlencoded")
+        {
+            return Err(rejected());
+        }
     }
     if requires_body {
         option(&mut options, "header", "Expect:");
@@ -143,6 +155,19 @@ fn route(request: &Request) -> Option<Route> {
         {
             Some(Route::UcloudHomeworkList)
         }
+        ("app.bupt.edu.cn", "GET", "/buptdf/wap/default/chong") if parsed.query().is_none() => {
+            Some(Route::ElectricityLanding)
+        }
+        ("app.bupt.edu.cn", "POST", path) if parsed.query().is_none() => {
+            let keys: &'static [&'static str] = match path {
+                "/buptdf/wap/default/part" => &["areaid"],
+                "/buptdf/wap/default/floor" => &["areaid", "partmentId"],
+                "/buptdf/wap/default/drom" => &["areaid", "partmentId", "floorId"],
+                "/buptdf/wap/default/search" => &["areaid", "partmentId", "floorId", "dromNumber"],
+                _ => return None,
+            };
+            Some(Route::ElectricityRead(keys))
+        }
         _ => None,
     }
 }
@@ -150,7 +175,11 @@ fn route(request: &Request) -> Option<Route> {
 fn allowed_header(route: Route, name: &str) -> bool {
     name == "user-agent"
         || match route {
-            Route::CasRead => name == "cookie",
+            Route::CasRead | Route::ElectricityLanding => name == "cookie",
+            Route::ElectricityRead(_) => matches!(
+                name,
+                "cookie" | "referer" | "x-requested-with" | "content-type"
+            ),
             Route::CasForm => matches!(name, "cookie" | "content-type"),
             Route::UcloudLanding => false,
             Route::UcloudToken => matches!(name, "authorization" | "content-type"),
@@ -161,6 +190,29 @@ fn allowed_header(route: Route, name: &str) -> bool {
                 ) || (matches!(route, Route::UcloudHomeworkList) && name == "content-type")
             }
         }
+}
+
+fn has_header(request: &Request, name: &str, value: &str) -> bool {
+    request
+        .headers
+        .iter()
+        .any(|(key, actual)| key.eq_ignore_ascii_case(name) && actual == value)
+}
+
+fn valid_electricity_body(body: &str, expected_keys: &[&str]) -> bool {
+    let mut keys = Vec::with_capacity(expected_keys.len());
+    for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+        if !expected_keys.contains(&key.as_ref())
+            || keys.contains(&key)
+            || value.trim().is_empty()
+            || value.chars().any(char::is_control)
+            || (key == "areaid" && !matches!(value.as_ref(), "1" | "2"))
+        {
+            return false;
+        }
+        keys.push(key);
+    }
+    keys.len() == expected_keys.len()
 }
 
 fn valid_homework_list_body(body: &str) -> bool {
@@ -263,7 +315,7 @@ fn rejected() -> CliError {
     CliError::new(
         5,
         "upstream",
-        "request is outside the CAS/UCloud transport policy",
+        "request is outside the scoped campus transport policy",
         "",
     )
 }
@@ -319,6 +371,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.status, 429);
+    }
+
+    #[test]
+    fn electricity_transport_accepts_only_known_tls_reads() {
+        let mut request = Request {
+            method: "GET",
+            url: ELECTRICITY_LANDING.into(),
+            headers: vec![],
+            body: vec![],
+        };
+        assert!(curl_config(&request).is_ok());
+        request.method = "POST";
+        request.headers = vec![
+            ("Referer".into(), ELECTRICITY_LANDING.into()),
+            ("X-Requested-With".into(), "XMLHttpRequest".into()),
+            (
+                "Content-Type".into(),
+                "application/x-www-form-urlencoded".into(),
+            ),
+            ("Cookie".into(), "TEST=ONLY".into()),
+        ];
+        let base = "https://app.bupt.edu.cn/buptdf/wap/default";
+        for (path, form) in [
+            ("part", "areaid=1"),
+            ("floor", "partmentId=test&areaid=2"),
+            ("drom", "areaid=1&partmentId=test&floorId=1"),
+            (
+                "search",
+                "areaid=1&partmentId=test&floorId=1&dromNumber=TEST",
+            ),
+        ] {
+            request.url = format!("{base}/{path}");
+            request.body = form.as_bytes().to_vec();
+            assert!(curl_config(&request).is_ok());
+            request.url = format!("{base}/{path}?ticket=TEST");
+            assert!(curl_config(&request).is_err());
+        }
+        for url in [
+            format!("{base}/recharge"),
+            format!("{base}/chong"),
+            "http://app.bupt.edu.cn/buptdf/wap/default/search".into(),
+            "https://app.bupt.edu.cn.example.invalid/buptdf/wap/default/search".into(),
+        ] {
+            request.url = url;
+            assert!(curl_config(&request).is_err());
+        }
+        request.url = format!("{base}/part");
+        for form in [
+            "areaid=1&areaid=2",
+            "areaid=3",
+            "areaid=1&amount=2",
+            "areaid=%00",
+        ] {
+            request.body = form.as_bytes().to_vec();
+            assert!(curl_config(&request).is_err());
+        }
+        request.body = b"areaid=1".to_vec();
+        request.headers[0].1 = "https://outside.example".into();
+        assert!(curl_config(&request).is_err());
     }
 
     #[test]
