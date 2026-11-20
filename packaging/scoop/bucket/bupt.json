@@ -1,0 +1,18 @@
+{
+  "version": "0.6.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/tututuhehehe/bupt-cli/releases/download/v0.6.0/bupt-windows-x64.zip",
+      "hash": "7ebb7e60837c238153b5a0c640570af5ef9902636a2f0b91c0e42eb178b6d9c6"
+    }
+  },
+  "bin": "bupt-windows-x64/bupt.exe",
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/tututuhehehe/bupt-cli/releases/download/v$version/bupt-windows-x64.zip"
+      }
+    }
+  }
+}

@@ -41,28 +41,9 @@ scoop bucket add tututuhehehe https://github.com/tututuhehehe/scoop-bucket
 scoop install bupt
 ```
 
-`bucket/bupt.json` 模板：
+清单已放在本仓库 `packaging/scoop/bucket/bupt.json`（交叉编译完成后把 `hash` 换成实测 SHA-256）。
 
-```json
-{
-  "version": "0.6.0",
-  "architecture": {
-    "64bit": {
-      "url": "https://github.com/tututuhehehe/bupt-cli/releases/download/v0.6.0/bupt-windows-x64.zip",
-      "hash": "<sha256>"
-    }
-  },
-  "bin": "bupt.exe",
-  "checkver": "github",
-  "autoupdate": {
-    "architecture": {
-      "64bit": {
-        "url": "https://github.com/tututuhehehe/bupt-cli/releases/download/v$version/bupt-windows-x64.zip"
-      }
-    }
-  }
-}
-```
+当前状态：`bupt-windows-x64.zip` 是**交叉编译产物，尚未在真实 Windows 上执行**。在你那台 Win 电脑上解包跑 `bupt.exe --version / help / status / login --role graduate` 通过后，再把 bucket 公开宣传 / 提交 winget。
 
 ## winget（Windows，覆盖最广，一次性 PR）
 
