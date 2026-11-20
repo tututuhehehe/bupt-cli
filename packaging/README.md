@@ -43,7 +43,7 @@ scoop install bupt
 
 清单已放在本仓库 `packaging/scoop/bucket/bupt.json`（交叉编译完成后把 `hash` 换成实测 SHA-256）。
 
-当前状态：`bupt-windows-x64.zip` 是**交叉编译产物，尚未在真实 Windows 上执行**。在你那台 Win 电脑上解包跑 `bupt.exe --version / help / status / login --role graduate` 通过后，再把 bucket 公开宣传 / 提交 winget。
+当前状态（2026-11-20 用户决定）：**Windows 暂不对外发布**，公开渠道只有 Homebrew。`bupt-windows-x64.zip` 已从 v0.6.0 Release 摘下，`scoop-bucket` 仓库已转私有。在真实 Windows 上完成 `bupt.exe --version / help / status / login --role graduate` 验收后，再把 zip 挂回 Release、bucket 转公开、提交 winget。
 
 ## winget（Windows，覆盖最广，一次性 PR）
 
