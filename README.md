@@ -156,7 +156,7 @@ bupt electricity buildings --area shahe        # 或 xitucheng
 - 研究生教务从「无头 Chrome/CDP」改为直连 HTTPS，快约 4 倍，零浏览器依赖
 - 凭据只从 `credentials.json` 读取，环境变量回退已移除
 - `homework` 默认即列表；`exams` 按身份自动路由；`probe` 更名 `diagnose` 且不提交密码
-- 版本从 0.5.x 起跳至 **0.6.0**；旧 Python 版完整保留在 git 历史 `d7c35ef`
+- 版本从 0.5.x 起跳至 **0.6.0**；旧 Python 版保留在 `legacy/python` 分支（即 git 历史里的 `d7c35ef`），本仓库不再携带 Python 代码
 
 ## 致谢
 

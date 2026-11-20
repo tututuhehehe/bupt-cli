@@ -1,18 +1,12 @@
-.venv/
-.deps/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.ruff_cache/
-*.egg-info/
-build/
-dist/
+# Rust-only tree
 /target/
-# 构建产物：./build.sh 直接把二进制装到项目根目录，不进 git
+/dist/
+# 构建产物：./build-rust.sh 打包进 dist/，仓库根目录的本地安装不进 git
 /bupt
 /bupt.new
 /bupt.old
-.uv/
+
+# 本机状态文件，不提交
 credentials.json
 credentials *.json
 config.json
@@ -21,9 +15,18 @@ homework-seen.json
 .env
 *.local.json
 
+# harness task logs
+.pi/
+
 # macOS
 .DS_Store
 
 # Runtime leftovers if BUPT_CLI_CONFIG_DIR points inside the repo
 yjxt-cookies.json
 *.ics
+
+# Local Python-era leftovers (kept on disk, never tracked)
+.deps/
+__pycache__/
+*.py[cod]
+*.py[cod]

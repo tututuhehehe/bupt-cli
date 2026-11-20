@@ -129,7 +129,7 @@ Retired aliases: `probe`→`diagnose`, `homework list`→`homework`, `schedule e
 - Graduate academics dropped headless Chrome/CDP for direct HTTPS (≈ 4× faster, zero browser dependency)
 - Credentials come only from `credentials.json`; environment-variable fallbacks are removed
 - `homework` lists by default, `exams` routes by role, `probe` became `diagnose` and never submits passwords
-- Version jumped from 0.5.x to **0.6.0**; the full Python implementation stays in git history at `d7c35ef`
+- Version jumped from 0.5.x to **0.6.0**; the full Python implementation stays on the `legacy/python` branch (git history `d7c35ef`); this repository no longer ships Python code
 
 ## Credits
 
