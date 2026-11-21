@@ -32,7 +32,7 @@ enum Route {
     ElectricitySignIn,
     ElectricityRead(&'static [&'static str]),
     GraduateRead,
-    PortalRead { card: bool },
+    PortalRead { card: bool, download: bool },
     PublicProbe,
     MobileProbe,
     MobileLogin,
@@ -81,7 +81,8 @@ fn exchange_with_policy(
         ]);
         upload_body = Some(staged);
     }
-    if probe && request.url == ANONYMOUS_PORTAL_PROBE {
+    // The information portal is HTTP-only. Every other campus route stays HTTPS.
+    if super::portal_scope::portal_url(&request.url, true).is_some() {
         let proto = args
             .iter()
             .position(|arg| arg == "--proto")
@@ -101,7 +102,7 @@ fn network_failure() -> CliError {
     CliError::new(
         4,
         "network",
-        "campus HTTPS request failed",
+        "campus request failed",
         "Check campus network connectivity. The request was not retried.",
     )
 }
@@ -203,11 +204,29 @@ fn config_for_route(request: &Request, route: Route, probe: bool) -> CliResult<V
             return Err(rejected());
         }
     }
-    if matches!(route, Route::PortalRead { card: true })
+    if matches!(route, Route::PortalRead { card: true, .. })
         && request.headers.iter().any(|(key, value)| {
             (key.eq_ignore_ascii_case("referer") && value != super::portal_scope::CARD_REFERER)
                 || (key.eq_ignore_ascii_case("x-requested-with") && value != "XMLHttpRequest")
         })
+    {
+        return Err(rejected());
+    }
+    // An attachment is served only to a request that names a portal page as its
+    // referer. The notice commands pass the page they read the link from; the
+    // exact referer is not pinned because the portal accepts any portal page.
+    // This is the transport's own backstop; the route pins the stricter rule
+    // (a page, never another attachment).
+    if matches!(route, Route::PortalRead { download: true, .. })
+        && (!request
+            .headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("referer"))
+            || request.headers.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("referer")
+                    && !super::portal_scope::portal_url(value, false)
+                        .is_some_and(|url| url.path() != super::portal_scope::DOWNLOAD)
+            }))
     {
         return Err(rejected());
     }
@@ -320,6 +339,21 @@ fn route(request: &Request) -> Option<Route> {
     if raw.len() > 8192 || !raw.bytes().all(|b| matches!(b, 0x21..=0x7e)) || raw.contains('\\') {
         return None;
     }
+    // The portal is HTTP-only, and `exchange_with_policy` derives its protocol
+    // policy from this same predicate. Accepting the `https` spelling here would
+    // hand curl an https URL while the policy says `--proto =http`, which curl
+    // refuses and which would then be reported as a network failure. The driver
+    // already canonicalises portal URLs to http before they reach this layer.
+    if request.method == "GET"
+        && !raw.starts_with("https://")
+        && super::portal_scope::portal_url(raw, true).is_some()
+    {
+        let path = Url::parse(raw).ok()?.path().to_owned();
+        return Some(Route::PortalRead {
+            card: path == super::portal_scope::CARD,
+            download: path == super::portal_scope::DOWNLOAD,
+        });
+    }
     let authority = raw
         .strip_prefix("https://")?
         .split(['/', '?', '#'])
@@ -336,11 +370,6 @@ fn route(request: &Request) -> Option<Route> {
         return None;
     }
     match (host, request.method, path) {
-        ("my.bupt.edu.cn", "GET", path) if super::portal_scope::portal_url(raw, true).is_some() => {
-            Some(Route::PortalRead {
-                card: path == super::portal_scope::CARD,
-            })
-        }
         ("auth.bupt.edu.cn", "POST", "/authserver/login") if parsed.query().is_none() => {
             Some(Route::CasForm)
         }
@@ -551,8 +580,10 @@ fn allowed_header(route: Route, name: &str) -> bool {
             ),
             Route::CasForm => matches!(name, "cookie" | "content-type"),
             Route::UcloudLanding | Route::UcloudAttachment | Route::PublicProbe => false,
-            Route::PortalRead { card } => {
-                name == "cookie" || (card && matches!(name, "referer" | "x-requested-with"))
+            Route::PortalRead { card, download } => {
+                name == "cookie"
+                    || (card && matches!(name, "referer" | "x-requested-with"))
+                    || (download && name == "referer")
             }
             Route::MobileProbe => matches!(name, "token" | "accept"),
             Route::MobileLogin => matches!(name, "accept" | "content-type"),
@@ -710,6 +741,7 @@ fn malformed_response() -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn curl_receives_no_request_secrets_in_arguments() {
@@ -749,6 +781,119 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.status, 429);
+    }
+
+    #[test]
+    fn portal_requests_downgrade_the_protocol_policy_and_others_do_not() {
+        // The live failure this guards: the portal answers plain HTTP only, so
+        // the argv policy must say `=http` for a portal URL and stay `=https`
+        // everywhere else. Reading only the config text would miss it, because
+        // the scheme sits in argv and the URL in stdin.
+        struct Record(Mutex<Vec<(Vec<std::ffi::OsString>, Vec<u8>)>>);
+        impl CurlExec for Record {
+            fn exec(
+                &mut self,
+                args: &[std::ffi::OsString],
+                stdin: &[u8],
+            ) -> CliResult<super::super::CurlOutput> {
+                self.0.lock().unwrap().push((args.to_vec(), stdin.to_vec()));
+                Ok(super::super::CurlOutput {
+                    stdout: b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+                    success: true,
+                })
+            }
+        }
+        fn proto(args: &[std::ffi::OsString]) -> String {
+            let at = args
+                .iter()
+                .position(|arg| arg == "--proto")
+                .expect("--proto is always passed");
+            args[at + 1].to_string_lossy().into_owned()
+        }
+
+        let exec = Record(Mutex::new(Vec::new()));
+        let mut exec_ref = exec;
+        let capture = |exec_ref: &mut Record| {
+            let recorded = exec_ref.0.lock().unwrap().clone();
+            recorded.last().cloned().expect("one recorded call")
+        };
+
+        let portal = Request {
+            method: "GET",
+            url: "http://my.bupt.edu.cn/2026/a/page.htm".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        exchange(&mut exec_ref, Duration::from_secs(5), &portal).unwrap();
+        let (args, stdin) = capture(&mut exec_ref);
+        assert_eq!(proto(&args), "=http", "portal reads use plain HTTP");
+        assert!(
+            String::from_utf8_lossy(&stdin).contains("url = \"http://my.bupt.edu.cn"),
+            "the config carries the same URL the policy describes"
+        );
+
+        let cas = Request {
+            method: "GET",
+            url: "https://auth.bupt.edu.cn/authserver/login".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        exchange(&mut exec_ref, Duration::from_secs(5), &cas).unwrap();
+        let (args, _) = capture(&mut exec_ref);
+        assert_eq!(proto(&args), "=https", "CAS stays on HTTPS");
+
+        // An `https` spelling of the portal URL is refused before curl: the
+        // policy would contradict the URL and curl would fail as if the network
+        // were down.
+        let https_portal = Request {
+            method: "GET",
+            url: "https://my.bupt.edu.cn/2026/a/page.htm".into(),
+            headers: vec![],
+            body: vec![],
+        };
+        let error = match exchange(&mut exec_ref, Duration::from_secs(5), &https_portal) {
+            Err(error) => error,
+            Ok(_) => panic!("an https portal URL must be refused before curl"),
+        };
+        assert_eq!((error.code, error.kind), (5, "upstream"));
+        assert_eq!(
+            exec_ref.0.lock().unwrap().len(),
+            2,
+            "no third curl call was made"
+        );
+    }
+
+    #[test]
+    fn portal_download_reaches_curl_only_with_a_portal_referer() {
+        const PAGE: &str = "http://my.bupt.edu.cn/xntz_content.jsp?urltype=news.NewsContentUrl&wbtreeid=2149&wbnewsid=144119";
+        let mut request = Request {
+            method: "GET",
+            url: "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&owner=1664271694&wbfileid=3251628".into(),
+            headers: vec![
+                ("Cookie".into(), "JSESSIONID=TEST-ONLY".into()),
+                ("Referer".into(), PAGE.into()),
+            ],
+            body: Vec::new(),
+        };
+        let config = std::str::from_utf8(&curl_config(&request).expect("download config"))
+            .unwrap()
+            .to_owned();
+        assert!(config.contains("download.jsp"), "{config}");
+        assert!(
+            config.contains(&format!("header = \"Referer: {PAGE}\"")),
+            "{config}"
+        );
+
+        // Same destination, no referer: this is the request the portal
+        // answers with a captcha page, so it must not reach the network.
+        request.headers.retain(|(name, _)| name != "Referer");
+        assert!(curl_config(&request).is_err());
+        // A referer that is not an approved portal page is refused too.
+        request.headers.push((
+            "Referer".into(),
+            "http://my.bupt.edu.cn/system/_content/download.jsp".into(),
+        ));
+        assert!(curl_config(&request).is_err());
     }
 
     #[test]
@@ -849,9 +994,16 @@ mod tests {
             body: Vec::new(),
         };
         assert!(curl_probe_config(&request).is_ok());
-        assert!(curl_config(&request).is_err());
+        assert!(
+            curl_config(&request).is_ok(),
+            "the portal list is an approved HTTP read"
+        );
         request.headers.push(("Cookie".into(), "TEST=ONLY".into()));
         assert!(curl_probe_config(&request).is_err());
+        assert!(
+            curl_config(&request).is_ok(),
+            "a portal session cookie may ride on the portal list"
+        );
         request.url = "https://auth.bupt.edu.cn/authserver/login".into();
         assert!(
             curl_probe_config(&request).is_err(),

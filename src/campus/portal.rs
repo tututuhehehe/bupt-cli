@@ -15,17 +15,22 @@
 
 use super::session::{Route, ScopedTransport, Service, SessionDriver};
 use crate::cli::{CliError, CliResult};
+use crate::files;
 use crate::transport::{Request, Response, Transport};
 use serde_json::{Value, json};
+use std::path::Path;
 use url::Url;
 
 const PORTAL_BASE: &str = "http://my.bupt.edu.cn";
 const PORTAL_ROOT: &str = "http://my.bupt.edu.cn/";
 const PORTAL_HOST: &str = "my.bupt.edu.cn";
+// One source of truth: the transport layer pins these paths too, and a second
+// literal here could drift into a policy mismatch that only shows up at runtime.
+const ATTACHMENT_PATH: &str = crate::transport::portal_scope::DOWNLOAD;
+const CALLBACK_PATH: &str = crate::transport::portal_scope::CALLBACK;
 
 pub(super) const CARD_URL: &str = "http://my.bupt.edu.cn/system/resource/app/cuser/getwxtsA.jsp";
-pub(super) const CARD_REFERER: &str =
-    "http://my.bupt.edu.cn/xs_index.jsp?urltype=tree.TreeTempUrl&wbtreeid=1541";
+pub(super) const CARD_REFERER: &str = crate::transport::portal_scope::CARD_REFERER;
 
 const LOGIN_PATH_MARKERS: [&str; 2] = ["/system/resource/code/auth/clogin.jsp", "authserver/login"];
 const SYSTEM_ERROR_TITLES: [&str; 5] = ["系统提示", "错误提示", "系统错误", "访问出错", "页面错误"];
@@ -144,11 +149,76 @@ pub(super) fn validate_notice_url(raw: &str) -> CliResult<String> {
     if !allowed {
         return Err(notice_url_error("notice URL must point at my.bupt.edu.cn"));
     }
-    Ok(parsed.to_string())
+    // The page must also be one the transport will fetch. `portal_url` is the
+    // same predicate the wire layer applies, so a URL accepted here is never
+    // refused one layer down as a policy violation (which would surface as an
+    // upstream failure for what is really a user input mistake). The parsed form
+    // is used because it is already lower-cased and port-normalised, which is
+    // exactly what the transport will send.
+    let canonical = parsed.to_string();
+    if crate::transport::portal_scope::portal_url(&canonical, false).is_none() {
+        return Err(notice_url_error(
+            "notice URL must be a notice page on my.bupt.edu.cn",
+        ));
+    }
+    // An attachment link is a file, not a page. Refuse it here instead of
+    // fetching a binary and looking for notice markup inside it.
+    if parsed.path() == ATTACHMENT_PATH {
+        return Err(CliError::new(
+            2,
+            "usage",
+            "that is a notice attachment link, not a notice page",
+            "pass the notice page URL; `bupt notices download` saves its attachments",
+        ));
+    }
+    // The CAS callback signs the session in. It is not a page to read, and it
+    // must not be fetched with portal cookies on a user-supplied URL.
+    if parsed.path() == CALLBACK_PATH {
+        return Err(CliError::new(
+            2,
+            "usage",
+            "that is the portal login callback, not a notice page",
+            "pass the notice page URL from `bupt notices` or `bupt notices search`",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn notice_url_error(message: &str) -> CliError {
     CliError::new(2, "usage", message, "pass a URL printed by `bupt notices`")
+}
+
+/// Accept only the attachment link the portal itself renders under a notice.
+/// The path and its three fields are pinned by the portal scope, so a user
+/// cannot turn this into a fetch of an arbitrary portal file.
+pub(super) fn validate_attachment_url(raw: &str) -> CliResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(attachment_url_error("attachment URL must not be empty"));
+    }
+    let url = crate::transport::portal_scope::portal_url(trimmed, false)
+        .filter(|url| url.path() == ATTACHMENT_PATH)
+        .ok_or_else(|| {
+            attachment_url_error("attachment URL must be a my.bupt.edu.cn notice attachment link")
+        })?;
+    Ok(url.to_string())
+}
+
+/// The `Referer` a download must carry: a portal page the session can read.
+/// The portal serves the file only when some portal page is named; it accepts
+/// any of them, so this is not pinned to the page the link came from.
+pub(super) fn is_attachment_referer(value: &str) -> bool {
+    crate::transport::portal_scope::portal_url(value, false).is_some()
+        && !value.contains(ATTACHMENT_PATH)
+}
+
+fn attachment_url_error(message: &str) -> CliError {
+    CliError::new(
+        2,
+        "usage",
+        message,
+        "pass the notice page URL from `bupt notices` or `bupt notices search`; its attachments are saved together",
+    )
 }
 
 /// Fetch the requested categories, merge them, sort by publication date
@@ -210,6 +280,201 @@ pub(super) fn fetch_notices_with_session(
     }
 }
 
+/// Reject a blank, huge, or control-character keyword before any session use.
+pub(super) fn validate_keyword(raw: &str) -> CliResult<String> {
+    let keyword = raw.trim();
+    if keyword.is_empty() || keyword.chars().count() > 80 || keyword.chars().any(char::is_control) {
+        return Err(CliError::new(
+            2,
+            "usage",
+            "notice search keyword must be 1-80 characters",
+            "try `bupt notices search \u{5956}\u{5b66}\u{91d1}`",
+        ));
+    }
+    Ok(keyword.to_string())
+}
+
+/// Search notice titles through the portal's own notice-tree form.
+///
+/// The form posts `INTEXT2` as standard base64 and scopes the query with the
+/// `wbtreeids` hidden field from the notice list. Only the first result page
+/// is read; `count` truncates that page and `total` is the portal's own count.
+pub(super) fn fetch_notice_search_with_session(
+    driver: &mut dyn SessionDriver,
+    keyword: &str,
+    count: u64,
+) -> CliResult<Value> {
+    if count == 0 {
+        return Ok(json!({
+            "keyword": keyword,
+            "total": null,
+            "count": 0,
+            "notices": [],
+        }));
+    }
+    let mut renewed = false;
+    loop {
+        let result = search_once(driver, keyword, count);
+        match result {
+            Err(error) if !renewed && error.kind == "auth" => {
+                driver.renew(Service::Portal)?;
+                renewed = true;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn search_once(driver: &mut dyn SessionDriver, keyword: &str, count: u64) -> CliResult<Value> {
+    let list = {
+        let mut transport = ScopedTransport::new(driver, Route::portal_list(NoticeType::Notice));
+        get_page(&mut transport, &list_url(NoticeType::Notice), "notice list")?
+    };
+    let tree_ids = notice_search_tree_ids(&list)
+        .ok_or_else(|| parse_error("notice search", "is missing the notice-tree scope"))?;
+    let url = search_url(keyword, &tree_ids)?;
+    let page = {
+        let mut transport = ScopedTransport::new(driver, Route::portal_search());
+        get_page(&mut transport, &url, "notice search")?
+    };
+    parse_notice_search(&page, keyword, count)
+}
+
+pub(super) fn search_url(keyword: &str, tree_ids: &str) -> CliResult<String> {
+    let mut url =
+        Url::parse("http://my.bupt.edu.cn/fz_ssjg.jsp").expect("static notice search URL");
+    url.query_pairs_mut()
+        .append_pair("a218493p", "1")
+        .append_pair("a218493c", "10")
+        .append_pair("wbtreeid", "1154")
+        .append_pair("wbnewsfield", "wbtitle")
+        .append_pair("Find", "find")
+        .append_pair("entrymode", "2")
+        .append_pair("INTEXT", "")
+        .append_pair("INTEXT2", &base64_encode(keyword.as_bytes()))
+        .append_pair("news_search_code", "")
+        .append_pair("wbtreeids", tree_ids);
+    let url = url.to_string();
+    if crate::transport::portal_scope::portal_url(&url, false).is_none() {
+        return Err(parse_error(
+            "notice search",
+            "could not build an approved search request",
+        ));
+    }
+    Ok(url)
+}
+
+fn notice_search_tree_ids(html: &str) -> Option<String> {
+    let start = html
+        .find("name='wbtreeids'")
+        .or_else(|| html.find("name=\"wbtreeids\""))?;
+    let rest = html.get(start..)?;
+    let rest = rest.get(rest.find("value=")? + "value=".len()..)?;
+    let value = if let Some(rest) = rest.strip_prefix('"') {
+        rest.split_once('"')?.0
+    } else if let Some(rest) = rest.strip_prefix('\'') {
+        rest.split_once('\'')?.0
+    } else {
+        rest.split(|c: char| c.is_whitespace() || c == '>').next()?
+    };
+    let value = value
+        .split(',')
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    (!value.is_empty()).then_some(value)
+}
+
+fn parse_notice_search(html: &str, keyword: &str, count: u64) -> CliResult<Value> {
+    let total = search_total(html)
+        .ok_or_else(|| parse_error("notice search", "is missing the result count"))?;
+    let mut notices = Vec::new();
+    if total > 0 {
+        for anchor in elements(html, "a", |_| true) {
+            if notices.len() >= usize::try_from(count).unwrap_or(usize::MAX) {
+                break;
+            }
+            let Some(href) = attr_value(anchor.attrs, "href") else {
+                continue;
+            };
+            let href = decode_entities(href);
+            if !href.contains("wbnewsid=") {
+                continue;
+            }
+            let title = joined_text(&html[anchor.content_start..anchor.content_end]);
+            let title = title.trim();
+            if title.is_empty() {
+                continue;
+            }
+            let Some(url) = portal_join(PORTAL_ROOT, href.trim()) else {
+                continue;
+            };
+            let window = html.get(anchor.end..).unwrap_or("");
+            let time = first_date(window)
+                .map(|(_, date)| date.replace('/', "-"))
+                .unwrap_or_default();
+            notices.push(json!({
+                "title": title,
+                "url": url,
+                "author": "",
+                "time": time,
+                "type": NoticeType::Notice.key(),
+                "type_name": NoticeType::Notice.type_name(),
+            }));
+        }
+    }
+    Ok(json!({
+        "keyword": keyword,
+        "total": total,
+        "count": notices.len(),
+        "notices": notices,
+    }))
+}
+
+fn search_total(html: &str) -> Option<u64> {
+    let marker = "共";
+    let mut rest = html;
+    while let Some(at) = rest.find(marker) {
+        let after = rest[at + marker.len()..].trim_start();
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            let tail = after[digits.len()..].trim_start();
+            if tail.starts_with('条') {
+                return digits.parse().ok();
+            }
+        }
+        rest = &rest[at + marker.len()..];
+    }
+    None
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let (chunks, rest) = input.as_chunks::<3>();
+    for chunk in chunks {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        out.push(TABLE[(n & 0x3f) as usize] as char);
+    }
+    if rest.len() == 1 {
+        let n = u32::from(rest[0]) << 16;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rest.len() == 2 {
+        let n = (u32::from(rest[0]) << 16) | (u32::from(rest[1]) << 8);
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
 /// Fetch one user-supplied notice page and map it to the CLI document.
 pub(super) fn fetch_notice_detail(
     transport: &mut dyn Transport,
@@ -255,6 +520,201 @@ pub(super) fn fetch_notice_detail_with_session(
             result => return result,
         }
     }
+}
+
+/// Save every attachment of one notice page.
+///
+/// The portal serves an attachment only to a request that names a portal page
+/// as its `Referer`; a bare request gets a captcha page instead. That is why
+/// the command takes the notice page and not an attachment link: the page is
+/// both the referer and the list of files, so every saved file is tied to the
+/// page that rendered it.
+pub(super) fn fetch_notice_download_with_session(
+    driver: &mut dyn SessionDriver,
+    notice_url: &str,
+    dir: &Path,
+    force: bool,
+) -> CliResult<Value> {
+    let notice_url = validate_notice_url(notice_url)?;
+    let dir = files::prepare_dir(dir)?;
+    // At most one renewal for the whole command, shared by the page and by every
+    // attachment. Renewal happens per request, so a retry never re-saves a file
+    // this run has already written and never downloads it twice.
+    let mut renewed = false;
+    let detail = retry_once_after_renewal(driver, &mut renewed, |driver| {
+        let mut transport = ScopedTransport::new(driver, Route::portal_detail());
+        let page = get_page(&mut transport, &notice_url, "notice detail")?;
+        parse_notice_detail(&page, &notice_url)
+    })?;
+    let mut saved = Vec::new();
+    let mut skipped = Vec::new();
+    for (index, attachment) in detail.attachments.iter().enumerate() {
+        let title = attachment
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("attachment-{}", index + 1));
+        let Some(raw_url) = attachment.get("url").and_then(Value::as_str) else {
+            skipped.push(skipped_json(&title, None, "no_url"));
+            continue;
+        };
+        // A notice may also link a file the download scope does not approve;
+        // report it instead of failing the whole page.
+        let Ok(url) = validate_attachment_url(raw_url) else {
+            skipped.push(skipped_json(&title, None, "unsupported_link"));
+            continue;
+        };
+        let filename = files::safe_filename(&title, &format!("attachment-{}", index + 1));
+        let dest = dir.join(&filename);
+        // Ask the filesystem before spending the transfer, the same way
+        // `homework download` does.
+        if !force && dest.exists() {
+            skipped.push(skipped_json(&title, Some(&dest), "exists"));
+            continue;
+        }
+        let body = retry_once_after_renewal(driver, &mut renewed, |driver| {
+            let mut transport = ScopedTransport::new(driver, Route::portal_download());
+            download_attachment(&mut transport, &url, &notice_url)
+        })?;
+        match files::write_atomic(&dir, &dest, &body, force) {
+            Ok(files::WriteOutcome::Written(size)) => saved.push(json!({
+                "title": title,
+                "path": dest.to_string_lossy(),
+                "size": size,
+                "url": url,
+            })),
+            Ok(files::WriteOutcome::Exists) => {
+                skipped.push(skipped_json(&title, Some(&dest), "exists"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(json!({
+        "title": detail.title,
+        "url": notice_url,
+        "dir": dir.to_string_lossy(),
+        "saved": saved,
+        "skipped": skipped,
+        "count_saved": saved.len(),
+        "count_skipped": skipped.len(),
+    }))
+}
+
+/// Run one request, renewing the portal session at most once per command.
+/// The contract allows a renewal only when the service actually reported an
+/// expired session, so every other failure is returned untouched.
+fn retry_once_after_renewal<T>(
+    driver: &mut dyn SessionDriver,
+    renewed: &mut bool,
+    mut attempt: impl FnMut(&mut dyn SessionDriver) -> CliResult<T>,
+) -> CliResult<T> {
+    match attempt(&mut *driver) {
+        Err(error) if !*renewed && error.kind == "auth" => {
+            driver.renew(Service::Portal)?;
+            *renewed = true;
+            attempt(driver)
+        }
+        result => result,
+    }
+}
+
+fn skipped_json(title: &str, path: Option<&Path>, reason: &str) -> Value {
+    json!({
+        "title": title,
+        "path": path.map(|path| path.to_string_lossy().into_owned()),
+        "reason": reason,
+    })
+}
+
+/// Fetch one attachment. The portal answers a request that does not name a
+/// portal page with a captcha form and HTTP 200, so a page is never written to
+/// disk as if it were the file.
+///
+/// The saved name comes from the link text on the notice page. The portal does
+/// send a `Content-Disposition`, but the campus transport surfaces only the
+/// headers the routes act on (`location`, `set-cookie`), and the link text is
+/// the same file name the page shows the reader.
+fn download_attachment(
+    transport: &mut dyn Transport,
+    url: &str,
+    referer: &str,
+) -> CliResult<Vec<u8>> {
+    let response = send(
+        transport,
+        Request {
+            method: "GET",
+            url: url.into(),
+            headers: vec![("Referer".into(), referer.into())],
+            body: Vec::new(),
+        },
+        "notice attachment",
+    )
+    .map_err(|error| {
+        if error.kind != "network" {
+            return error;
+        }
+        // The transport cannot tell a dead connection from a file over its
+        // 8 MiB cap, so both causes are named here.
+        CliError::new(
+            4,
+            "network",
+            error.message,
+            "my.bupt.edu.cn must be reachable on the campus network, and one attachment is limited to 8 MiB; try `bupt diagnose`",
+        )
+    })?;
+    check_status(&response, "notice attachment")?;
+    if response.body.is_empty() {
+        return Err(parse_error("notice attachment", "returned an empty file"));
+    }
+    if looks_like_html(&response.body) {
+        return Err(attachment_page_error(&String::from_utf8_lossy(
+            &response.body,
+        )));
+    }
+    Ok(response.body)
+}
+
+fn looks_like_html(body: &[u8]) -> bool {
+    // The captcha form is HTML. A captcha page written to disk would look like a
+    // successful download, so this errs towards calling a response a page: after
+    // an optional UTF-8 BOM and whitespace, a leading `<` is a page. No file
+    // format the portal serves starts that way (xlsx/docx start with `PK`, pdf
+    // with `%PDF`).
+    let body = body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body);
+    let head = &body[..body.len().min(512)];
+    head.iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte == b'<')
+}
+
+fn attachment_page_error(page: &str) -> CliError {
+    // A login page must win over the captcha text that a sign-in form can carry
+    // as well: it is the case the caller can renew.
+    let mut page_error = page_problem(ATTACHMENT_PATH, page, "notice attachment");
+    if page_error
+        .as_ref()
+        .is_some_and(|error| error.kind == "auth")
+    {
+        return page_error.take().expect("checked as a login page");
+    }
+    if page.contains("验证码") {
+        return CliError::new(
+            5,
+            "upstream",
+            "the portal answered with a captcha page instead of the file",
+            "No file was written. The portal serves an attachment only to a session that is still signed in; run `bupt login` if it expired, then rerun `bupt notices download` with the notice page URL.",
+        );
+    }
+    if let Some(error) = page_error {
+        return error;
+    }
+    CliError::new(
+        5,
+        "upstream",
+        "the portal answered with a page instead of the file",
+        "No file was written. The attachment link may have expired; re-read the notice with `bupt notices show`.",
+    )
 }
 
 fn truncate_chars(content: String, max_chars: usize) -> (String, bool) {
@@ -323,7 +783,10 @@ fn notice_sort_time(notice: &Value) -> &str {
 }
 
 fn send(transport: &mut dyn Transport, request: Request, context: &str) -> CliResult<Response> {
-    transport.send(request).map_err(|_| {
+    transport.send(request).map_err(|error| {
+        if error.kind != "network" {
+            return error;
+        }
         CliError::new(
             4,
             "network",
@@ -1398,6 +1861,26 @@ mod tests {
     }
 
     #[test]
+    fn search_with_zero_count_makes_no_request() {
+        struct Never;
+        impl SessionDriver for Never {
+            fn ensure(&mut self, _: Service) -> CliResult<()> {
+                panic!("a zero count must not touch the session")
+            }
+            fn renew(&mut self, _: Service) -> CliResult<()> {
+                panic!("a zero count must not renew")
+            }
+            fn send(&mut self, _: Route, _: Request) -> CliResult<Response> {
+                panic!("a zero count must not send")
+            }
+        }
+        let data = fetch_notice_search_with_session(&mut Never, "奖学金", 0).unwrap();
+        assert_eq!(data["count"], 0);
+        assert_eq!(data["notices"], json!([]));
+        assert_eq!(data["total"], Value::Null);
+    }
+
+    #[test]
     fn notices_zero_count_returns_empty_without_requests() {
         let mut transport = Scripted::default();
         let types = [NoticeType::Rules];
@@ -1532,7 +2015,7 @@ mod tests {
             notice["attachments"],
             json!([{
                 "title": "示例附件.pdf",
-                "url": "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&id=FIXTURE-ATTACH-1",
+                "url": "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&owner=1664271694&wbfileid=3251628",
             }])
         );
         assert_eq!(transport.calls.len(), 1);
@@ -1647,6 +2130,85 @@ mod tests {
             error.message.contains("content"),
             "message={}",
             error.message
+        );
+    }
+
+    #[test]
+    fn an_html_answer_is_recognised_whatever_preamble_it_carries() {
+        let bom = "\u{feff}";
+        let captcha = r#"<!DOCTYPE html><html><head><title>请输入验证码</title></head></html>"#;
+        for page in [
+            captcha.to_string(),
+            format!("{bom}{captcha}"),
+            format!("\n\n  \t{captcha}"),
+            format!("{bom}  {captcha}"),
+            "<?xml version=\"1.0\"?><html><body>验证码</body></html>".into(),
+            "<!-- saved from the portal --><html></html>".into(),
+        ] {
+            assert!(
+                looks_like_html(page.as_bytes()),
+                "{page:?} must be treated as a page, not a file"
+            );
+        }
+        // Real attachment bytes are never pages.
+        let xlsx = b"PK\x03\x04\x14\x00";
+        let pdf = b"%PDF-1.7\n";
+        let docx = b"PK\x03\x04";
+        let zip = b"PK\x05\x06";
+        for file in [xlsx.as_slice(), pdf, docx, zip, b"" as &[u8]] {
+            assert!(!looks_like_html(file), "{file:?} is a file, not a page");
+        }
+    }
+
+    #[test]
+    fn an_attachment_page_error_prefers_the_actionable_cause() {
+        // A sign-in form that also shows a captcha must stay an auth error: that
+        // is the only case the caller can renew.
+        let login = r#"<html><title>登录</title><form><input type="password"><input name="captcha">请输入验证码</form></html>"#;
+        let error = attachment_page_error(login);
+        assert_eq!((error.code, error.kind), (3, "auth"));
+
+        // A captcha without a sign-in form explains itself.
+        let error = attachment_page_error("<html><body>请输入验证码后下载附件</body></html>");
+        assert_eq!((error.code, error.kind), (5, "upstream"));
+        assert!(error.message.contains("captcha"), "{}", error.message);
+        assert!(
+            error.hint.contains("bupt login"),
+            "the hint names the recovery step; hint={}",
+            error.hint
+        );
+
+        // A generic page still reports that nothing was written.
+        let error = attachment_page_error("<html><body>404</body></html>");
+        assert_eq!((error.code, error.kind), (5, "upstream"));
+        assert!(error.hint.contains("No file was written"));
+    }
+
+    #[test]
+    fn notice_urls_must_be_a_page_the_transport_would_fetch() {
+        for (url, expected) in [
+            (
+                "http://my.bupt.edu.cn/system/resource/code/auth/clogin.jsp?owner=1",
+                "login callback",
+            ),
+            (
+                "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&owner=1&wbfileid=2",
+                "attachment link",
+            ),
+            ("http://my.bupt.edu.cn/foo.jsp", "notice page"),
+        ] {
+            let error = validate_notice_url(url).unwrap_err();
+            assert_eq!((error.code, error.kind), (2, "usage"), "{url}");
+            assert!(
+                error.message.contains(expected),
+                "{url}: expected {expected:?} in {:?}",
+                error.message
+            );
+        }
+        // A page the wire approves is accepted, including an upper-case host.
+        assert_eq!(
+            validate_notice_url("http://MY.BUPT.EDU.CN/2026/a/page.htm").unwrap(),
+            "http://my.bupt.edu.cn/2026/a/page.htm"
         );
     }
 
@@ -1774,5 +2336,40 @@ mod tests {
         let error = fetch_card(&mut transport).unwrap_err();
         assert_eq!((error.code, error.kind), (3, "auth"));
         assert!(error.hint.contains("login"));
+    }
+
+    #[test]
+    fn notice_search_encodes_the_keyword_and_reads_the_first_page() {
+        assert_eq!(base64_encode("奖学金".as_bytes()), "5aWW5a2m6YeR");
+        assert!(validate_keyword("  ").is_err());
+        assert!(validate_keyword(&"奖".repeat(81)).is_err());
+
+        let ids = notice_search_tree_ids("<input type='hidden' name='wbtreeids' value=1155,1158,>")
+            .unwrap();
+        assert_eq!(ids, "1155,1158");
+        let url = search_url("奖学金", &ids).unwrap();
+        assert!(url.contains("INTEXT2=5aWW5a2m6YeR"));
+        assert!(url.contains("wbtreeids=1155%2C1158") || url.contains("wbtreeids=1155,1158"));
+
+        let page = r#"
+            <a href="xntz_content.jsp?urltype=news.NewsContentUrl&wbtreeid=2149&wbnewsid=143528">奖学金通知</a>
+            <span>2026-11-20</span>
+            <span class="p_t">共12条</span>
+            <a href="xntz_content.jsp?urltype=news.NewsContentUrl&wbtreeid=1736&wbnewsid=142208">第二条</a>
+            <span>2026-11-19</span>
+        "#;
+        let parsed = parse_notice_search(page, "奖学金", 1).unwrap();
+        assert_eq!(parsed["total"], 12);
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["notices"][0]["title"], "奖学金通知");
+        assert_eq!(parsed["notices"][0]["type"], "notice");
+        assert_eq!(parsed["notices"][0]["time"], "2026-11-20");
+        assert!(
+            parsed["notices"][0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("wbnewsid=143528")
+        );
+        assert!(parse_notice_search("<p>公共信息</p>", "奖学金", 1).is_err());
     }
 }

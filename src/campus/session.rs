@@ -34,7 +34,9 @@ pub(crate) struct Route(RouteKind);
 #[derive(Clone, Copy)]
 enum RouteKind {
     PortalNoticeList(NoticeType),
+    PortalNoticeSearch,
     PortalNoticeDetail,
+    PortalNoticeDownload,
     PortalCard,
     ElectricityBuildings,
     ElectricityFloors,
@@ -47,8 +49,16 @@ impl Route {
         Self(RouteKind::PortalNoticeList(kind))
     }
 
+    pub(super) fn portal_search() -> Self {
+        Self(RouteKind::PortalNoticeSearch)
+    }
+
     pub(super) fn portal_detail() -> Self {
         Self(RouteKind::PortalNoticeDetail)
+    }
+
+    pub(super) fn portal_download() -> Self {
+        Self(RouteKind::PortalNoticeDownload)
     }
 
     pub(super) fn portal_card() -> Self {
@@ -82,11 +92,27 @@ impl Route {
                     && request.headers.is_empty()
                     && request.body.is_empty()
             }
+            RouteKind::PortalNoticeSearch => {
+                request.method == "GET"
+                    && request.headers.is_empty()
+                    && request.body.is_empty()
+                    && crate::transport::portal_scope::portal_url(&request.url, false)
+                        .is_some_and(|url| url.path() == "/fz_ssjg.jsp")
+            }
             RouteKind::PortalNoticeDetail => {
                 request.method == "GET"
                     && portal::validate_notice_url(&request.url).is_ok()
                     && request.headers.is_empty()
                     && request.body.is_empty()
+            }
+            RouteKind::PortalNoticeDownload => {
+                request.method == "GET"
+                    && portal::validate_attachment_url(&request.url).is_ok()
+                    && request.body.is_empty()
+                    && request.headers.len() == 1
+                    && request.headers.iter().all(|(name, value)| {
+                        name == "Referer" && portal::is_attachment_referer(value)
+                    })
             }
             RouteKind::PortalCard => {
                 request.method == "GET"
@@ -120,7 +146,9 @@ impl Route {
     pub(crate) fn describe(self) -> &'static str {
         match self.0 {
             RouteKind::PortalNoticeList(_) => "portal notice list",
+            RouteKind::PortalNoticeSearch => "portal notice search",
             RouteKind::PortalNoticeDetail => "portal notice detail",
+            RouteKind::PortalNoticeDownload => "portal notice attachment",
             RouteKind::PortalCard => "portal campus card",
             RouteKind::ElectricityBuildings => "electricity buildings",
             RouteKind::ElectricityFloors => "electricity floors",
@@ -471,6 +499,8 @@ mod tests {
         }
     }
 
+    const DETAIL_PAGE: &str = "http://my.bupt.edu.cn/xntz_content.jsp?urltype=news.NewsContentUrl&wbtreeid=2149&wbnewsid=144119";
+
     #[test]
     fn routes_accept_only_their_exact_shape() {
         let notice = Route::portal_list(NoticeType::Notice);
@@ -489,11 +519,56 @@ mod tests {
             .push(("Cookie".into(), "should-not-be-here".into()));
         assert!(!Route::portal_card().accepts(&card));
 
+        let search = portal::search_url("奖学金", "1155").unwrap();
+        let search_request = Request {
+            method: "GET",
+            url: search,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(Route::portal_search().accepts(&search_request));
+        assert!(!Route::portal_search().accepts(&portal_list_request(NoticeType::Notice)));
+
         let mut detail = portal_list_request(NoticeType::Notice);
         detail.url = "https://my.bupt.edu.cn/2026/a/page.htm".into();
         assert!(Route::portal_detail().accepts(&detail));
         detail.url = "https://example.invalid/2026/a/page.htm".into();
         assert!(!Route::portal_detail().accepts(&detail));
+
+        // An attachment is fetched only with the notice page as its referer.
+        let attachment = "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&owner=1664271694&wbfileid=3251628";
+        let mut download = Request {
+            method: "GET",
+            url: attachment.into(),
+            headers: vec![("Referer".into(), DETAIL_PAGE.into())],
+            body: Vec::new(),
+        };
+        assert!(Route::portal_download().accepts(&download));
+        // The same request without its referer is what the portal answers with
+        // a captcha page, so it must never be sent.
+        download.headers.clear();
+        assert!(!Route::portal_download().accepts(&download));
+        download
+            .headers
+            .push(("Referer".into(), "https://example.invalid/page".into()));
+        assert!(!Route::portal_download().accepts(&download));
+        download.headers = vec![("Referer".into(), DETAIL_PAGE.into())];
+        download
+            .headers
+            .push(("Cookie".into(), "should-not-be-here".into()));
+        assert!(!Route::portal_download().accepts(&download));
+        download.headers = vec![("Referer".into(), DETAIL_PAGE.into())];
+        download.url = "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&owner=1".into();
+        assert!(!Route::portal_download().accepts(&download));
+        // A notice page is not an attachment, and the detail route is not a
+        // download route: the two never overlap.
+        assert!(!Route::portal_download().accepts(&portal_list_request(NoticeType::Notice)));
+        assert!(!Route::portal_detail().accepts(&Request {
+            method: "GET",
+            url: attachment.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }));
     }
 
     #[cfg(unix)]

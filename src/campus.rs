@@ -1,5 +1,6 @@
 use crate::cli::{CliError, CliResult, Context, Outcome};
 use crate::identity;
+use clap::parser::ValueSource;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::path::Path;
 
@@ -95,6 +96,35 @@ pub(crate) fn commands() -> Vec<Command> {
                             .value_parser(non_negative_usize)
                             .default_value("0"),
                     ),
+            )
+            .subcommand(
+                Command::new("search")
+                    .about("Search notice titles")
+                    .arg(Arg::new("keyword").required(true).value_name("KEYWORD"))
+                    .arg(
+                        Arg::new("count")
+                            .long("count")
+                            .value_parser(non_negative_u64)
+                            .default_value("10"),
+                    ),
+            )
+            .subcommand(
+                Command::new("download")
+                    .about("Save the attachments of one notice")
+                    .arg(Arg::new("url").required(true).value_name("URL"))
+                    .arg(
+                        Arg::new("dir")
+                            .long("dir")
+                            .value_name("DIR")
+                            .default_value(".")
+                            .help("Output directory"),
+                    )
+                    .arg(
+                        Arg::new("force")
+                            .long("force")
+                            .action(ArgAction::SetTrue)
+                            .help("Overwrite existing files"),
+                    ),
             ),
         Command::new("card").about("Read campus card balance"),
     ]
@@ -112,9 +142,10 @@ pub(crate) fn run(
     }
     if matches!(name, "notices" | "card") {
         let config_dir = context.config_dir.clone();
+        let home_dir = context.home_dir.clone();
         let mut session = portal_session::PortalSession::new(context);
         return if name == "notices" {
-            run_notices(matches, &config_dir, &mut session)
+            run_notices(matches, &config_dir, &home_dir, &mut session)
         } else {
             run_card(&config_dir, &mut session)
         };
@@ -136,7 +167,7 @@ fn run_with_session(
     match name {
         "library" => run_library(matches, context),
         "electricity" => run_electricity(matches, &context.config_dir, session),
-        "notices" => run_notices(matches, &context.config_dir, session),
+        "notices" => run_notices(matches, &context.config_dir, &context.home_dir, session),
         "card" => run_card(&context.config_dir, session),
         _ => Err(CliError::usage("unknown campus command")),
     }
@@ -271,25 +302,90 @@ fn run_electricity(
     )?))
 }
 
+/// `--type` and `--count` shape a listing. A command that works on one notice
+/// takes neither, and silently ignoring them would look like they had an effect.
+fn reject_listing_flags(matches: &ArgMatches, command: &str) -> CliResult<()> {
+    for (flag, id) in [("--type", "type"), ("--count", "count")] {
+        if matches.value_source(id) == Some(ValueSource::CommandLine) {
+            return Err(CliError::new(
+                2,
+                "usage",
+                format!("notice {command} does not take {flag}"),
+                "`--type` and `--count` shape `bupt notices`; this command works on one notice URL",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn run_notices(
     matches: &ArgMatches,
     config_dir: &Path,
+    home_dir: &Path,
     session: &mut dyn SessionDriver,
 ) -> CliResult<Outcome> {
-    if let Some(("show", arguments)) = matches.subcommand() {
-        let url = arguments
-            .get_one::<String>("url")
-            .map(String::as_str)
-            .unwrap_or("");
-        // Reject other destinations before loading any credentials or session.
-        let url = portal::validate_notice_url(url)?;
-        let max_chars = *arguments
-            .get_one::<usize>("max-chars")
-            .expect("max-chars has a default");
-        require_session(config_dir, session, Service::Portal)?;
-        return Ok(outcome(portal::fetch_notice_detail_with_session(
-            session, &url, max_chars,
-        )?));
+    match matches.subcommand() {
+        Some(("show", arguments)) => {
+            reject_listing_flags(matches, "show")?;
+            let url = arguments
+                .get_one::<String>("url")
+                .map(String::as_str)
+                .unwrap_or("");
+            // Reject other destinations before loading any credentials or session.
+            let url = portal::validate_notice_url(url)?;
+            let max_chars = *arguments
+                .get_one::<usize>("max-chars")
+                .expect("max-chars has a default");
+            require_session(config_dir, session, Service::Portal)?;
+            return Ok(outcome(portal::fetch_notice_detail_with_session(
+                session, &url, max_chars,
+            )?));
+        }
+        Some(("search", arguments)) => {
+            if matches.get_one::<String>("type").is_some() {
+                return Err(CliError::new(
+                    2,
+                    "usage",
+                    "notice search does not take --type",
+                    "it searches 通知公告; choose notice, news, rules, or ways only when listing",
+                ));
+            }
+            let keyword = arguments
+                .get_one::<String>("keyword")
+                .map(String::as_str)
+                .unwrap_or("");
+            let keyword = portal::validate_keyword(keyword)?;
+            let count = *arguments
+                .get_one::<u64>("count")
+                .expect("count has a default");
+            require_session(config_dir, session, Service::Portal)?;
+            return Ok(outcome(portal::fetch_notice_search_with_session(
+                session, &keyword, count,
+            )?));
+        }
+        Some(("download", arguments)) => {
+            reject_listing_flags(matches, "download")?;
+            let url = arguments
+                .get_one::<String>("url")
+                .map(String::as_str)
+                .unwrap_or("");
+            // Reject other destinations before loading any credentials or session.
+            let url = portal::validate_notice_url(url)?;
+            let dir = crate::files::expand_dir(
+                arguments
+                    .get_one::<String>("dir")
+                    .map(String::as_str)
+                    .unwrap_or("."),
+                home_dir,
+            );
+            let force = arguments.get_flag("force");
+            require_session(config_dir, session, Service::Portal)?;
+            return Ok(outcome(portal::fetch_notice_download_with_session(
+                session, &url, &dir, force,
+            )?));
+        }
+        Some(_) => return Err(CliError::usage("unknown notices command")),
+        None => {}
     }
 
     let types = portal::resolve_types(matches.get_one::<String>("type").map(String::as_str))?;
@@ -385,13 +481,27 @@ mod tests {
         }
 
         fn queue(&mut self, method: &'static str, url: String, body: String) {
+            self.queue_response(method, url, 200, &[], body.into_bytes());
+        }
+
+        fn queue_response(
+            &mut self,
+            method: &'static str,
+            url: String,
+            status: u16,
+            headers: &[(&str, &str)],
+            body: Vec<u8>,
+        ) {
             self.transport.expected.push_back((
                 method,
                 url,
                 Ok(Response {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: body.into_bytes(),
+                    status,
+                    headers: headers
+                        .iter()
+                        .map(|(key, value)| ((*key).into(), (*value).into()))
+                        .collect(),
+                    body,
                 }),
             ));
         }
@@ -508,6 +618,37 @@ mod tests {
     }
 
     #[test]
+    fn notice_search_reads_the_notice_tree_then_the_first_result_page() {
+        let dirs = TestDirs::new("notice-search");
+        let before = dirs.credentials();
+        let list = "<input name='wbtreeids' value=1155,1158>";
+        let page = "<span class='p_t'>共1条</span><a href='xntz_content.jsp?urltype=news.NewsContentUrl&wbtreeid=2149&wbnewsid=143528'>奖学金通知</a><span>2026-11-20</span>";
+        let url = portal::search_url("奖学金", "1155,1158").unwrap();
+        let mut session = ScriptedSession::new();
+        session.queue(
+            "GET",
+            portal::list_url(portal::NoticeType::Notice),
+            list.into(),
+        );
+        session.queue("GET", url, page.into());
+        let mut transport = Scripted::default();
+        let mut context = context(&dirs, &mut transport);
+        let outcome = run_with_session(
+            "notices",
+            &matches("notices", &["search", "奖学金", "--count", "10"]),
+            &mut context,
+            &mut session,
+        )
+        .expect("notice search");
+        assert_eq!(outcome.data["keyword"], "奖学金");
+        assert_eq!(outcome.data["total"], 1);
+        assert_eq!(outcome.data["notices"][0]["title"], "奖学金通知");
+        assert_eq!(session.routes.len(), 2);
+        assert!(session.transport.expected.is_empty());
+        assert_no_state_writes(&dirs, &before);
+    }
+
+    #[test]
     fn notice_detail_success_runs_through_the_command_without_writing_state() {
         let dirs = TestDirs::new("notice-detail");
         let before = dirs.credentials();
@@ -537,6 +678,260 @@ mod tests {
         assert_eq!(session.routes.len(), 1);
         assert!(session.routes[0].accepts(&session.transport.calls[0]));
         assert_no_state_writes(&dirs, &before);
+    }
+
+    /// The attachment link the fixture notice page renders, in the shape the
+    /// portal itself uses.
+    const ATTACHMENT_URL: &str = "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&owner=1664271694&wbfileid=3251628";
+
+    fn download_dir(dirs: &TestDirs) -> PathBuf {
+        dirs.root.join("out")
+    }
+
+    fn saved_files(dirs: &TestDirs) -> Vec<String> {
+        let dir = download_dir(dirs);
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .expect("read download dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn notices_download_rejects_listing_flags() {
+        // Both flags shape a listing. Accepting one and silently dropping the
+        // other would look like it had an effect.
+        let dirs = TestDirs::new("notice-download-flags");
+        for (arguments, flag) in [
+            (vec!["--type", "rules", "download", DETAIL_URL], "--type"),
+            (vec!["--count", "5", "download", DETAIL_URL], "--count"),
+            (vec!["--count", "5", "show", DETAIL_URL], "--count"),
+        ] {
+            let mut transport = Scripted::default();
+            let mut ctx = context(&dirs, &mut transport);
+            let mut session = ScriptedSession::new();
+            let error = run_with_session(
+                "notices",
+                &matches("notices", &arguments),
+                &mut ctx,
+                &mut session,
+            )
+            .err()
+            .expect("listing flags are rejected");
+            assert_eq!((error.code, error.kind), (2, "usage"), "{arguments:?}");
+            assert!(
+                error.message.contains(flag),
+                "{arguments:?}: {:?}",
+                error.message
+            );
+            assert!(session.transport.calls.is_empty());
+            assert_eq!(session.renew_calls, 0);
+        }
+    }
+
+    #[test]
+    fn notices_download_saves_the_attachment_under_its_link_text() {
+        let dirs = TestDirs::new("notice-download");
+        let before = dirs.credentials();
+        let mut session = ScriptedSession::new();
+        session.queue(
+            "GET",
+            DETAIL_URL.into(),
+            fixture("portal_notice_detail.html"),
+        );
+        session.queue_response(
+            "GET",
+            ATTACHMENT_URL.into(),
+            200,
+            &[],
+            b"PK\x03\x04fixture".to_vec(),
+        );
+        let mut transport = Scripted::default();
+        let mut context = context(&dirs, &mut transport);
+        let dir = download_dir(&dirs);
+
+        let outcome = run_with_session(
+            "notices",
+            &matches(
+                "notices",
+                &["download", DETAIL_URL, "--dir", dir.to_str().unwrap()],
+            ),
+            &mut context,
+            &mut session,
+        )
+        .expect("notices download");
+
+        assert_eq!(outcome.code, 0);
+        assert_eq!(outcome.data["url"], DETAIL_URL);
+        assert_eq!(outcome.data["title"], "示例通知一");
+        assert_eq!(outcome.data["count_saved"], 1);
+        assert_eq!(outcome.data["count_skipped"], 0);
+        let saved = &outcome.data["saved"][0];
+        assert_eq!(saved["title"], "示例附件.pdf");
+        assert_eq!(saved["size"], 11);
+        assert_eq!(saved_files(&dirs), ["示例附件.pdf"]);
+        assert_eq!(
+            fs::read(dir.join("示例附件.pdf")).expect("saved file"),
+            b"PK\x03\x04fixture"
+        );
+        assert_eq!(session.routes.len(), 2);
+        assert!(session.routes.iter().all(|route| {
+            session
+                .transport
+                .calls
+                .iter()
+                .any(|call| route.accepts(call))
+        }));
+        // The attachment request carries the notice page as its referer; without
+        // one the portal answers with a captcha page instead of the file.
+        assert_eq!(
+            session.transport.calls[1].headers,
+            vec![("Referer".to_owned(), DETAIL_URL.to_owned())]
+        );
+        assert_no_state_writes(&dirs, &before);
+    }
+
+    #[test]
+    fn notices_download_skips_an_existing_file_and_replaces_it_with_force() {
+        let dirs = TestDirs::new("notice-download-force");
+        let dir = download_dir(&dirs);
+        fs::create_dir_all(&dir).expect("create download dir");
+        fs::write(dir.join("示例附件.pdf"), b"old").expect("seed existing file");
+        let page = fixture("portal_notice_detail.html");
+        let mut session = ScriptedSession::new();
+        session.queue("GET", DETAIL_URL.into(), page.clone());
+        // Deliberately no attachment response: the skip must be decided from the
+        // filesystem, before any transfer.
+        let mut transport = Scripted::default();
+        let mut first_ctx = context(&dirs, &mut transport);
+
+        let outcome = run_with_session(
+            "notices",
+            &matches(
+                "notices",
+                &["download", DETAIL_URL, "--dir", dir.to_str().unwrap()],
+            ),
+            &mut first_ctx,
+            &mut session,
+        )
+        .expect("notices download skip");
+
+        assert_eq!(outcome.data["count_saved"], 0);
+        assert_eq!(outcome.data["count_skipped"], 1);
+        assert_eq!(outcome.data["skipped"][0]["reason"], "exists");
+        assert_eq!(fs::read(dir.join("示例附件.pdf")).unwrap(), b"old");
+        // The page is read; the attachment is not requested at all.
+        let requested: Vec<&str> = session
+            .transport
+            .calls
+            .iter()
+            .map(|request| request.url.as_str())
+            .collect();
+        assert!(
+            !requested.contains(&ATTACHMENT_URL),
+            "an existing file must be skipped before the transfer; requests={requested:?}"
+        );
+
+        let mut session = ScriptedSession::new();
+        session.queue("GET", DETAIL_URL.into(), page);
+        session.queue_response("GET", ATTACHMENT_URL.into(), 200, &[], b"new".to_vec());
+        let mut transport = Scripted::default();
+        let mut second_ctx = context(&dirs, &mut transport);
+        let outcome = run_with_session(
+            "notices",
+            &matches(
+                "notices",
+                &[
+                    "download",
+                    DETAIL_URL,
+                    "--dir",
+                    dir.to_str().unwrap(),
+                    "--force",
+                ],
+            ),
+            &mut second_ctx,
+            &mut session,
+        )
+        .expect("notices download force");
+
+        assert_eq!(outcome.data["count_saved"], 1);
+        assert_eq!(fs::read(dir.join("示例附件.pdf")).unwrap(), b"new");
+        assert_eq!(saved_files(&dirs), ["示例附件.pdf"]);
+    }
+
+    #[test]
+    fn notices_download_refuses_a_captcha_page_without_writing_a_file() {
+        let dirs = TestDirs::new("notice-download-captcha");
+        let mut session = ScriptedSession::new();
+        session.queue(
+            "GET",
+            DETAIL_URL.into(),
+            fixture("portal_notice_detail.html"),
+        );
+        session.queue_response(
+            "GET",
+            ATTACHMENT_URL.into(),
+            200,
+            &[("Content-Type", "text/html;charset=UTF-8")],
+            "<html><title>附件下载</title><body>请输入验证码下载附件</body></html>".into(),
+        );
+        let mut transport = Scripted::default();
+        let mut context = context(&dirs, &mut transport);
+        let dir = download_dir(&dirs);
+
+        let error = run_with_session(
+            "notices",
+            &matches(
+                "notices",
+                &["download", DETAIL_URL, "--dir", dir.to_str().unwrap()],
+            ),
+            &mut context,
+            &mut session,
+        )
+        .err()
+        .expect("captcha page must not be saved");
+
+        assert_eq!((error.code, error.kind), (5, "upstream"));
+        assert!(error.message.contains("captcha"), "{}", error.message);
+        assert!(saved_files(&dirs).is_empty(), "no file may be written");
+    }
+
+    #[test]
+    fn notices_download_reports_an_unsupported_link_instead_of_failing() {
+        let dirs = TestDirs::new("notice-download-unsupported");
+        let page = "<title>混合附件</title><div id='vsb_content'><p>正文</p>
+<a href='/system/_content/download.jsp?urltype=news.DownloadAttachUrl&amp;owner=1664271694&amp;wbfileid=3251628'>可下载.pdf</a>
+<a href='/system/_content/download.jsp?id=FIXTURE-ATTACH-1'>旧式链接.pdf</a></div>";
+        let mut session = ScriptedSession::new();
+        session.queue("GET", DETAIL_URL.into(), page.into());
+        session.queue_response("GET", ATTACHMENT_URL.into(), 200, &[], b"data".to_vec());
+        let mut transport = Scripted::default();
+        let mut context = context(&dirs, &mut transport);
+        let dir = download_dir(&dirs);
+
+        let outcome = run_with_session(
+            "notices",
+            &matches(
+                "notices",
+                &["download", DETAIL_URL, "--dir", dir.to_str().unwrap()],
+            ),
+            &mut context,
+            &mut session,
+        )
+        .expect("unsupported link is reported, not fatal");
+
+        assert_eq!(outcome.data["count_saved"], 1);
+        assert_eq!(outcome.data["count_skipped"], 1);
+        assert_eq!(outcome.data["skipped"][0]["reason"], "unsupported_link");
+        assert_eq!(outcome.data["skipped"][0]["title"], "旧式链接.pdf");
+        assert_eq!(saved_files(&dirs), ["可下载.pdf"]);
     }
 
     #[test]

@@ -33,7 +33,7 @@ const NESTED_COMMANDS: &[(&str, &[&str])] = &[
     ("schedule", &["update", "calendar", "export"]),
     ("library", &["search", "hold", "ebook"]),
     ("electricity", &["buildings"]),
-    ("notices", &["show"]),
+    ("notices", &["show", "search", "download"]),
 ];
 
 const CREDENTIALS: &str =

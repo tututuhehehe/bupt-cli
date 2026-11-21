@@ -32,7 +32,7 @@ An unofficial, native-Rust single-file command line client for Beijing Universit
 | `electricity buildings --area xitucheng` | ✅ live | 12 dorm buildings |
 | `diagnose` | ✅ live | 14 endpoints: 13 ok, 1 skipped, 0 failed |
 | `update --check` / `uninstall --dry-run` / `logout` | ✅ live (isolated copies) | nothing installed or deleted |
-| portal `notices` / `card` | ⛔ environment | the test Mac cannot reach `my.bupt.edu.cn` over HTTPS |
+| portal `notices` / `notices search` / `notices download` / `card` | ✅ live (campus) | listing, site search, and an attachment (xlsx unpacked intact) verified; a captcha answer is refused without writing |
 | `electricity --area shahe` | ⛔ upstream | the endpoint returns business error `e=1` |
 | a real homework submission | ⏳ pending | wired and gated; awaiting an agreed target assignment |
 | Windows x64 | ⏳ pending | see Platform support |
@@ -102,7 +102,7 @@ Every command prints compact JSON to stdout (`--pretty` to indent). Errors go to
 | `bupt scores` / `bupt classrooms [--campus 01\|04]` | undergraduate scores / free classrooms |
 | `bupt library search KEYWORD` / `hold ID` / `ebook ID` | anonymous library lookups |
 | `bupt electricity [--building B] [--room R]` / `buildings [--area …]` | dorm balance / building list; `--building` requires `--room` |
-| `bupt notices [--type …] [--count N]` / `notices show URL` / `card` | portal notices and campus-card balance |
+| `bupt notices [--type …] [--count N]` / `notices show URL` / `notices search KEYWORD` / `notices download URL [--dir DIR] [--force]` / `card` | portal notices (search is notice titles, first page; download saves one notice's attachments) and campus-card balance |
 | `bupt update --check [--repo OWNER/REPO]` | read-only release check |
 | `bupt uninstall [--keep-data] [--dry-run]` | conservative uninstall with guardrails |
 
@@ -112,14 +112,15 @@ Retired aliases: `probe`→`diagnose`, `homework list`→`homework`, `schedule e
 
 - Credential and session files are `0600` (parent directory `0700`), written via temp-file + atomic rename; symlinks and loose permissions are refused
 - All HTTPS goes through the system `curl` with the request passed via stdin config — passwords, tickets, and cookies never appear in argv
-- Redirects are validated hop by hop; advertised HTTP destinations are upgraded to HTTPS and never followed in the clear
+- Redirects are validated hop by hop; advertised HTTP destinations are upgraded to HTTPS. The one exception is the portal `my.bupt.edu.cn`, which has no HTTPS: validated read paths there go over plain HTTP with no credentials attached (portal cookies go only to the portal itself, and CAS tickets stay on HTTPS)
 - Graduate academics run browserless: no site challenge scripts are executed
 - Homework submission is read-only by default; `--dry-run` performs zero writes, a confirmed run submits at most once, and unknown outcomes exit 6 pointing at `verify`
 - Uninstall only deletes files the tool itself owns and reports skipped items honestly
 
 ## Known limitations
 
-- Portal `notices`/`card` need a working campus route to `my.bupt.edu.cn`
+- Portal `notices`/`card` use `http://my.bupt.edu.cn` (that host has no HTTPS) and need a campus route
+- `notices download` saves the attachment itself; the saved name is the notice page's link text (the portal sends no usable `Content-Disposition`). An existing file is skipped unless `--force`. The portal serves a file only when the request names a portal page as `Referer`, so the command takes the notice page, not the attachment link. One response is capped at 8 MiB (a larger one exits network 4 and says so)
 - Shahe electricity currently answers with an upstream business error; Xitucheng works
 - A real submission and the Windows build remain to be validated on real targets
 

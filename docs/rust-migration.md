@@ -4,7 +4,7 @@ Python 对照：`d7c35ef`。该版本的代码和离线测试用来查语义，�
 
 ## 公开入口
 
-最多两级。`login` / `status` / `logout`；`courses`；`homework`（默认列表）/ `show` / `download` / `submit` / `verify`；`schedule`（默认本周）/ `update` / `calendar` / `export`；`exams`；`scores`；`classrooms`；`library search` / `hold` / `ebook`；`electricity` / `buildings`；`notices` / `show`；`card`；`diagnose`；`update`；`uninstall`；`help [命令]`。不提供 `homework list`、`schedule exams` 或 `probe` 作为旧别名。`help`、`--help`、`--version` 保持文本；非交互业务输出默认一个 JSON 文档，分别在 stdout（结果）和 stderr（错误），带 `schema: "bupt.v1"`；`--pretty` 不改变值。保留能沿用的字段、参数和退出码。非法参数在读写业务状态、联网或启动浏览器前拒绝。
+最多两级。`login` / `status` / `logout`；`courses`；`homework`（默认列表）/ `show` / `download` / `submit` / `verify`；`schedule`（默认本周）/ `update` / `calendar` / `export`；`exams`；`scores`；`classrooms`；`library search` / `hold` / `ebook`；`electricity` / `buildings`；`notices` / `show` / `search` / `download`；`card`；`diagnose`；`update`；`uninstall`；`help [命令]`。不提供 `homework list`、`schedule exams` 或 `probe` 作为旧别名。`help`、`--help`、`--version` 保持文本；非交互业务输出默认一个 JSON 文档，分别在 stdout（结果）和 stderr（错误），带 `schema: "bupt.v1"`；`--pretty` 不改变值。保留能沿用的字段、参数和退出码。非法参数在读写业务状态、联网或启动浏览器前拒绝。
 
 ## 行为验收
 
@@ -13,6 +13,7 @@ Python 对照：`d7c35ef`。该版本的代码和离线测试用来查语义，�
 - **课表**：查询、`schedule calendar` 和 `schedule export` 共用本地优先的取数规则。先确认快照属于当前学号和身份，再判断运行当天（本机日期）是否落在快照的学期日期区间内（含首尾）。没有可用快照或当天不在区间内，才按身份联网获取整个学期的课表和教学周日期。只维护当前学期。区间内不按缓存年龄自动刷新；学期中选退课后用 `schedule update` 主动更新。`--date` 只筛选当前学期，指定日期超出区间时报告范围，不切换学期或把它当作没课。缺失或跨学期时，每次命令最多发起一次自动刷新；失败、数据不完整或结果仍不覆盖运行当天时，保留上一份快照，但不把它当作本学期返回，不据此生成日历。无归属信息的旧快照不能当成当前账号的数据。导出先规范化上游能识别的日期和时间。任一上课场次无法生成有效事件时，指出课程和缺失信息，不生成半份日历或覆盖已有 `.ics`；教师或教室未定可以留空。导出写入成功不因打开文件管理器失败变成导出失败。
 - **教务来源**：`exams` 按身份选数据源，输出共同外壳，不伪造考试日期、场次、地点。研究生教务走实测验证的无浏览器 HTTPS 链路（两轮 CAS 票据与两个落地页，全部 HTTPS），不依赖已安装的浏览器，不执行站点脚本；macOS 已实测，Windows 待实测。
 - **作业**：没有 `--i-confirm-submit` 不上传、不提交，`--dry-run` 同样不写入。兼容 `6/7` 表示可能已提交但无法确认；先只读核验，绝不自动重发提交请求。`verify` 比对正文/附件时可建立访问会话，但不写校园作业数据。
+- **门户**：`my.bupt.edu.cn` 实测只有明文 HTTP（443 拒绝），所以只对该主机的已批准读取路径放行 HTTP，CAS 密码与票据仍只走 HTTPS；门户登记的 CAS 服务地址带 `:80`，换票与回调须保留该端口，否则回调是空白页。`notices search` 用门户自己的站内表单，只读第一页并回报门户总数。`download` 收通知页地址而非附件地址：门户只对携带门户页 `Referer` 的请求发文件，否则回验证码页；拿到 HTML 或验证码页时不写文件（响应开头的 BOM、空白、XML 声明或注释都不影响这个判定）。文件名取自页面上的链接文字，门户不回可用的 `Content-Disposition`；同名链接会覆盖，已存在的文件默认跳过，`--force` 才重新下载。续期按单个请求进行、整条命令至多一次，所以重试不会重复写盘，也不会把本次已写的文件报成 `exists`。单次响应上限沿用传输层的 8 MiB。
 - **分发**：macOS Apple Silicon 与 Windows x64 分别发布一个原生可执行文件。验证完成后切换到 Rust，不长期保留两套实现。按需保留已有数据字段与可兼容的文件格式；开发和验收用隔离目录，不碰正在使用的 Python 版及其状态。校园网实测等用户通知后进行。更新和卸载只作用于获准的目标；卸载可清理自己的课表，不扩大删除范围，不对跳过项报告为已删除。
 
 ## 离线测试边界

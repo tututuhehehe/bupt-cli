@@ -277,11 +277,10 @@ impl CasLogin {
     pub(super) fn portal_ticket(
         &mut self,
         transport: &mut dyn Transport,
-        service: &Url,
+        service: &str,
     ) -> CliResult<String> {
         use crate::transport::portal_scope;
-        if portal_scope::portal_url(service.as_str(), false).is_none() || !self.has_usable_cookies()
-        {
+        if portal_scope::portal_url(service, false).is_none() || !self.has_usable_cookies() {
             return Err(auth_error("no usable CAS session for the portal"));
         }
         let request = portal_scope::cas_url(service);

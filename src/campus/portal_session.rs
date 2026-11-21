@@ -1,5 +1,5 @@
-//! A per-command HTTPS portal session. CAS cookies never go to the portal,
-//! and portal cookies and tickets never go to a plaintext callback.
+//! A per-command portal session. The portal host is HTTP-only; CAS cookies
+//! still never go there, and a portal cookie never goes back to CAS.
 use super::{Route, Service, SessionDriver};
 use crate::cli::{CliError, CliResult, Context};
 use crate::identity::{self, OwnedCasSession};
@@ -75,20 +75,19 @@ impl SessionDriver for PortalSession<'_, '_> {
         if route.is_electricity() || !route.accepts(&request) {
             return Err(scope_error());
         }
-        let initial = portal_scope::to_tls(&request.url).ok_or_else(scope_error)?;
-        let mut headers = request.headers;
-        for (key, value) in &mut headers {
-            if key.eq_ignore_ascii_case("referer") {
-                *value = portal_scope::CARD_REFERER.into();
-            }
-        }
-        let mut url = initial.to_string();
+        let initial = portal_scope::canonical_request(&request.url).ok_or_else(scope_error)?;
+        // Headers are the caller's, already validated by `route.accepts`: the
+        // card route pins its own `Referer` and the attachment route pins the
+        // notice page it came from, so rewriting any of them here would send a
+        // request the route never approved.
+        let headers = request.headers;
+        let mut url = initial.clone();
         let mut used_ticket = false;
         let mut replayed = false;
         for _ in 0..6 {
             let response = self.portal_get(
                 &url,
-                if url == initial.as_str() {
+                if url == initial {
                     headers.clone()
                 } else {
                     vec![]
@@ -99,11 +98,11 @@ impl SessionDriver for PortalSession<'_, '_> {
                 // the original resource. Re-read the original route once.
                 if used_ticket
                     && !replayed
-                    && url != initial.as_str()
+                    && url != initial
                     && (200..300).contains(&response.status)
                 {
                     replayed = true;
-                    url = initial.to_string();
+                    url = initial.clone();
                     continue;
                 }
                 return Ok(response);
@@ -117,20 +116,18 @@ impl SessionDriver for PortalSession<'_, '_> {
                         "Run `bupt login` if the session has expired.",
                     ));
                 }
-                if !portal_scope::service_matches(&service, &initial) {
+                if !portal_scope::service_matches(&service) {
                     return Err(scope_error());
                 }
                 let cas = self.cas.as_mut().ok_or_else(scope_error)?;
                 let callback = cas.portal_ticket(self.context.transport, &service)?;
                 used_ticket = true;
-                url = callback;
+                url = portal_scope::canonical_request(&callback).ok_or_else(scope_error)?;
                 continue;
             }
             let base = Url::parse(&url).map_err(|_| scope_error())?;
             let next = base.join(location).map_err(|_| scope_error())?;
-            url = portal_scope::portal_url(next.as_str(), false)
-                .ok_or_else(scope_error)?
-                .into();
+            url = portal_scope::canonical_request(next.as_str()).ok_or_else(scope_error)?;
         }
         Err(CliError::new(
             5,
@@ -174,8 +171,8 @@ fn scope_error() -> CliError {
     CliError::new(
         5,
         "upstream",
-        "portal request or redirect is outside the verified HTTPS scope",
-        "Confirm the campus portal HTTPS address. No credentials were sent to an HTTP or unapproved destination.",
+        "portal request or redirect is outside the approved portal scope",
+        "Only my.bupt.edu.cn notice pages are requested. CAS stays on HTTPS.",
     )
 }
 
@@ -188,12 +185,11 @@ mod tests {
     fn card_reuses_bound_cas_cookies_only_at_cas_and_honors_portal_cookie_scope() {
         const CAS: &str = "https://auth.bupt.edu.cn/authserver/login";
         const VERIFY: &str = "https://auth.bupt.edu.cn/authserver/login?service=https%3A%2F%2Fucloud.bupt.edu.cn%2Fuclass";
-        const CARD: &str = "https://my.bupt.edu.cn/system/resource/app/cuser/getwxtsA.jsp";
+        const CARD: &str = "http://my.bupt.edu.cn/system/resource/app/cuser/getwxtsA.jsp";
         const CALLBACK: &str =
-            "https://my.bupt.edu.cn/system/resource/code/auth/clogin.jsp?ticket=ST-TEST-PORTAL";
-        let callback =
-            Url::parse("https://my.bupt.edu.cn/system/resource/code/auth/clogin.jsp").unwrap();
-        let login_redirect = portal_scope::cas_url(&callback);
+            "http://my.bupt.edu.cn/system/resource/code/auth/clogin.jsp?ticket=ST-TEST-PORTAL";
+        let callback = "http://my.bupt.edu.cn/system/resource/code/auth/clogin.jsp";
+        let login_redirect = portal_scope::cas_url(callback);
         let home = tempfile::tempdir().unwrap();
         let mut tr = Scripted::default();
         let mut queue = |method, url: &str, status, fields: &[(&str, &str)], body: &str| {
@@ -243,7 +239,7 @@ mod tests {
             "GET",
             CALLBACK,
             200,
-            &[("Set-Cookie", "portal=TEST-ONLY; Secure; Path=/")],
+            &[("Set-Cookie", "portal=TEST-ONLY; Path=/")],
             "landing",
         );
         queue(

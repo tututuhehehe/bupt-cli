@@ -23,7 +23,7 @@ Credentials come only from `~/.bupt-cli/credentials.json`, created by `bupt logi
 - `bupt library search KEYWORD` / `hold ID` / `ebook ID`: anonymous, no login needed.
 - `bupt electricity --building B --room R`: dorm balance; set the user's own dorm via flags, `BUPT_DORM_*`, or `~/.bupt-cli/config.json` — the built-in value is a placeholder. `electricity buildings --area shahe|xitucheng` lists buildings.
 - `bupt diagnose [--only public,cas,ucloud]`: availability matrix; never submits passwords or writes state.
-- `bupt notices` / `notices show URL` / `card`: portal, needs a campus route; off-campus they fail with network 4.
+- `bupt notices` / `notices show URL` / `notices search KEYWORD` / `notices download URL [--dir DIR] [--force]` / `card`: portal over HTTP (`my.bupt.edu.cn` has no HTTPS). Needs a campus route; off-campus they fail with network 4. `search` matches notice titles and returns the first page plus the portal total. `download` saves one notice's attachments into `--dir` (default `.`); it takes the notice page, because the portal serves a file only when the request names a portal page as `Referer`. The saved name is the page's link text, an existing file is skipped unless `--force`, and a captcha/HTML answer exits 5 without writing anything. An attachment link is refused. One response is capped at 8 MiB. `search` returns at most 10 results per page (the portal's page size).
 - `bupt update --check`: read-only release check.
 
 ## Submitting homework (only with the user's explicit consent)

@@ -32,7 +32,7 @@
 | `electricity buildings --area xitucheng` | ✅ 实测 | 12 栋宿舍楼 |
 | `diagnose` | ✅ 实测 | 14 个端点：13 成功、1 跳过、0 失败 |
 | `update --check` / `uninstall --dry-run` / `logout` | ✅ 实测（隔离副本） | 不安装、不误删 |
-| 门户 `notices` / `card` | ⛔ 环境受限 | 测试机到 `my.bupt.edu.cn` HTTPS 不通，未验收 |
+| 门户 `notices` / `notices search` / `notices download` / `card` | ✅ 实测（校园网） | 列表、站内搜索、附件下载（xlsx 完整可解压）、验证码页拒写盘均实测；`card` 接口返回零值，与本次改动无关 |
 | `electricity --area shahe` | ⛔ 上游异常 | 接口返回业务错误 `e=1`，非本机网络问题 |
 | 真实作业提交 | ⏳ 待验收 | 代码已接线且门禁开启，等待指定目标作业实测 |
 | Windows x64 | ⏳ 待验收 | 见下方「平台支持」 |
@@ -128,7 +128,7 @@ bupt electricity buildings --area shahe        # 或 xitucheng
 | `bupt library hold RECCTRLID` / `bupt library ebook RECCTRLID` | 馆藏位置 / 电子资源链接 |
 | `bupt electricity [--building B] [--room R] [--floor F] [--threshold N]` | 宿舍电费余额；传 `--building` 必须同时传 `--room` |
 | `bupt electricity buildings [--area shahe\|xitucheng]` | 宿舍楼列表 |
-| `bupt notices [--type notice,news,rules,ways] [--count N]` / `bupt notices show URL` | 门户通知（需校园网络路由） |
+| `bupt notices [--type notice,news,rules,ways] [--count N]` / `notices show URL` / `notices search KEYWORD [--count N]` / `notices download URL [--dir DIR] [--force]` | 门户通知。`search` 只搜通知公告标题，返回第一页并带总数；`download` 保存一篇通知的附件 |
 | `bupt card` | 饭卡余额 |
 | `bupt update --check [--repo OWNER/REPO]` | 只读检查新版本；安装只对带发布标记的 macOS 构建开放 |
 | `bupt uninstall [--keep-data] [--dry-run]` | 保守卸载：拒绝危险根目录、symlink、混合目录 |
@@ -139,14 +139,15 @@ bupt electricity buildings --area shahe        # 或 xitucheng
 
 - 凭据与会话文件全部 `0600`（所在目录 `0700`），写入走「临时文件 + 原子改名」，拒绝 symlink 与过宽权限
 - 所有请求走系统 `curl`（参数经 stdin 配置，命令行不出现密码/票据/Cookie）
-- 校外跳转逐个校验：CAS/教务/门户/电费各自只接受已验证的 HTTPS 主机；站点宣告的 HTTP 一律升级，绝不降级
+- 跳转逐个校验：CAS/教务/电费只接受已验证的 HTTPS 主机，站点宣告的 HTTP 一律升级；唯一例外是门户 `my.bupt.edu.cn`——该主机没有 HTTPS，只对已验证的读取路径走明文 HTTP，且不附带任何凭据（Cookie 只发给门户本身，CAS 票据仍走 HTTPS）
 - 研究生教务**不启动浏览器**、不执行站点脚本、不读取浏览器配置
 - 作业提交默认只读；`--dry-run` 零写入；确认后至多一次提交，结果不明时退出 6 并指向只读核验
 - 卸载有护栏：只删「bupt 自己的」数据，混合目录整目录跳过并如实报告
 
 ## 已知限制
 
-- 门户 `notices`/`card` 依赖校园网到 `my.bupt.edu.cn` 的路由，校外或路由不通时报 network 4
+- 门户 `notices`/`card` 走 `http://my.bupt.edu.cn`（该主机没有 HTTPS）。校外或路由不通时报 network 4
+- `notices download` 保存的是附件本体，文件名取自通知页上的链接文字（门户不返回可用的 `Content-Disposition`）；同名附件会覆盖，已存在的文件默认跳过，`--force` 才重下。门户只对“带门户页面 Referer”的请求发文件，所以命令收的是通知页地址而不是附件地址；单次响应上限 8 MiB，超限报 network 4 并在提示里点明上限
 - 沙河电费楼栋接口当前返回上游业务错误（`e=1`），西土城正常
 - 真实提交与 Windows 版本尚未完成实机验收（见实测状态表）
 

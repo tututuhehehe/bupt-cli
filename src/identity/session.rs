@@ -221,7 +221,7 @@ impl OwnedCasSession {
     pub(crate) fn portal_ticket(
         &mut self,
         transport: &mut dyn Transport,
-        service: &url::Url,
+        service: &str,
     ) -> CliResult<String> {
         self.cas.portal_ticket(transport, service)
     }

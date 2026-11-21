@@ -652,6 +652,24 @@ fn notices_show_rejects_blank_url_before_auth() {
 }
 
 #[test]
+fn notices_search_rejects_a_blank_keyword_before_auth() {
+    let sandbox = Sandbox::new();
+    for keyword in ["", " ", "\t"] {
+        let payload = assert_error_with_context(
+            sandbox.run(&["notices", "search", keyword]),
+            2,
+            "usage",
+            &format!("blank notice keyword {keyword:?}"),
+        );
+        assert!(
+            error_hint(&payload).contains("notices search"),
+            "blank keyword hint should show the search command; stderr={payload}"
+        );
+    }
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
 fn notices_show_rejects_external_and_credential_bearing_urls_before_auth() {
     let sandbox = Sandbox::new();
     for url in [
@@ -661,6 +679,56 @@ fn notices_show_rejects_external_and_credential_bearing_urls_before_auth() {
     ] {
         assert_error(sandbox.run(&["notices", "show", url]), 2, "usage");
     }
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
+fn notices_download_rejects_an_attachment_link_before_auth() {
+    let sandbox = Sandbox::new();
+    // The attachment link is a file, not a page: `show` and `download` both take
+    // the notice page, and this must fail before any session or network use.
+    let attachment = "http://my.bupt.edu.cn/system/_content/download.jsp?urltype=news.DownloadAttachUrl&owner=1664271694&wbfileid=3251628";
+    for command in ["show", "download"] {
+        let payload = assert_error_with_context(
+            sandbox.run(&["notices", command, attachment]),
+            2,
+            "usage",
+            &format!("attachment link passed to {command}"),
+        );
+        assert!(
+            error_hint(&payload).contains("notice page"),
+            "attachment hint should ask for the notice page; stderr={payload}"
+        );
+    }
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
+fn notices_download_rejects_external_urls_before_auth() {
+    let sandbox = Sandbox::new();
+    for url in [
+        "",
+        "https://example.invalid/notice/1",
+        "https://my.bupt.edu.cn@foreign.example/info/1.htm",
+    ] {
+        assert_error(sandbox.run(&["notices", "download", url]), 2, "usage");
+    }
+    assert_no_session_file(&sandbox);
+}
+
+#[test]
+fn notices_download_requires_credentials_without_creating_session() {
+    let sandbox = Sandbox::new();
+
+    let payload = assert_error(
+        sandbox.run(&["notices", "download", "http://my.bupt.edu.cn/info/1.htm"]),
+        3,
+        "auth",
+    );
+    assert!(
+        error_hint(&payload).contains("login"),
+        "notice download auth hint should mention login; stderr={payload}"
+    );
     assert_no_session_file(&sandbox);
 }
 
