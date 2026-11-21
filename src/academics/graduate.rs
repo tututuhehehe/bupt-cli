@@ -7,6 +7,7 @@
 //! and is selected by the production command wrappers only.
 
 use crate::cli::{CliError, CliResult};
+use crate::html::{decode_entities, strip_tags};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 
@@ -196,31 +197,6 @@ fn attribute(attrs: &str, name: &str) -> Option<String> {
         return tail.find(quote).map(|end| tail[..end].to_string());
     }
     None
-}
-
-fn strip_tags(value: &str) -> String {
-    let mut output = String::new();
-    let mut in_tag = false;
-    for character in value.chars() {
-        match character {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            _ if !in_tag => output.push(character),
-            _ => {}
-        }
-    }
-    output
-}
-
-fn decode_entities(value: &str) -> String {
-    value
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
 }
 
 fn clean_text(value: &str) -> String {

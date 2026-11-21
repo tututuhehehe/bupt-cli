@@ -1,4 +1,5 @@
 use crate::cli::{CliError, CliResult, Context};
+use crate::html::{decode_entities, strip_tags};
 use crate::transport::{Request, Response};
 use serde_json::{Value, json};
 
@@ -376,62 +377,6 @@ fn clean_text(value: &str) -> String {
     let without_tags = strip_tags(value);
     let decoded = decode_entities(&without_tags);
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn strip_tags(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    let mut copied = 0;
-    while cursor < text.len() {
-        if text.as_bytes()[cursor] == b'<' {
-            if let Some(end) = text[cursor..].find('>') {
-                output.push_str(&text[copied..cursor]);
-                cursor += end + 1;
-                copied = cursor;
-                continue;
-            }
-        }
-        cursor += 1;
-    }
-    output.push_str(&text[copied..]);
-    output
-}
-
-fn decode_entities(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(index) = rest.find('&') {
-        output.push_str(&rest[..index]);
-        let tail = &rest[index..];
-        if let Some(end) = tail.find(';') {
-            let entity = &tail[1..end];
-            if let Some(character) = decode_entity(entity) {
-                output.push(character);
-                rest = &tail[end + 1..];
-                continue;
-            }
-        }
-        output.push('&');
-        rest = &tail[1..];
-    }
-    output.push_str(rest);
-    output
-}
-
-fn decode_entity(entity: &str) -> Option<char> {
-    match entity {
-        "amp" => Some('&'),
-        "lt" => Some('<'),
-        "gt" => Some('>'),
-        "quot" => Some('"'),
-        "apos" => Some('\''),
-        "nbsp" => Some('\u{a0}'),
-        hex if hex.starts_with("#x") || hex.starts_with("#X") => {
-            char::from_u32(u32::from_str_radix(&hex[2..], 16).ok()?)
-        }
-        decimal if decimal.starts_with('#') => char::from_u32(decimal[1..].parse::<u32>().ok()?),
-        _ => None,
-    }
 }
 
 fn extract_tag_blocks<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
