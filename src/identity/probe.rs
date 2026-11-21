@@ -55,8 +55,8 @@ const MOBILE_PATHS: &[(&str, &str, &str)] = &[
     ("score report (termGPA)", "POST", "/bjyddx/student/termGPA"),
 ];
 
-struct ProbeRun<'a> {
-    groups: &'a [String],
+struct ProbeRun {
+    groups: Vec<String>,
     rows: Vec<Value>,
     session: Option<super::OwnedCasSession>,
     cached_cas_cookies: bool,
@@ -67,6 +67,105 @@ struct ProbeRun<'a> {
     role: Option<Role>,
     started: Instant,
 }
+
+/// One probe phase. Phases that depend on an earlier response read the state
+/// the earlier phase left on `ProbeRun`, so the table only carries the order.
+type ProbeStep = fn(&mut ProbeRun, &mut dyn Transport);
+
+/// Wire order of the diagnostic phases, mirroring probe.py. `execute` walks
+/// this table top to bottom and nothing else decides when a phase runs.
+const PROBE_SEQUENCE: &[ProbeStep] = &[
+    ProbeRun::probe_public_endpoints,
+    ProbeRun::probe_cas_ticket,
+    ProbeRun::probe_ucloud_token,
+    ProbeRun::probe_portal,
+    ProbeRun::probe_electricity,
+    ProbeRun::probe_ucloud_apis,
+    ProbeRun::probe_mobile_jwgl,
+];
+
+/// One anonymous reachability row. An empty `expected` accepts any status
+/// below 400.
+struct PublicProbe {
+    group: &'static str,
+    name: &'static str,
+    url: &'static str,
+    expected: &'static [u16],
+    note: &'static str,
+}
+
+const PUBLIC_PROBES: &[PublicProbe] = &[
+    PublicProbe {
+        group: "public",
+        name: "CAS login page",
+        url: CAS_LOGIN_PAGE_URL,
+        expected: &[200],
+        note: "",
+    },
+    PublicProbe {
+        group: "other",
+        name: "UC status API",
+        url: UC_STATUS_URL,
+        expected: &[200],
+        note: "",
+    },
+    PublicProbe {
+        group: "public",
+        name: "UCloud OAuth token endpoint",
+        url: UCLOUD_TOKEN_URL,
+        expected: &[401, 405],
+        note: "GET without credentials should be rejected (401/405)",
+    },
+    PublicProbe {
+        group: "public",
+        name: "electricity landing page",
+        url: ELECTRICITY_LANDING,
+        expected: &[200, 302],
+        note: "302 redirects to CAS without a session",
+    },
+    PublicProbe {
+        group: "portal",
+        name: "portal notice list (unauthed)",
+        url: PORTAL_NOTICE_URL,
+        expected: &[],
+        note: "my.bupt.edu.cn is expected to redirect to CAS",
+    },
+    PublicProbe {
+        group: "other",
+        name: "innovation platform notices",
+        url: WIN_NOTICE,
+        expected: &[200, 302, 412],
+        note: "412 is anti-bot protection; reachability only",
+    },
+    PublicProbe {
+        group: "jwgl_dom",
+        name: "DOM JWGL login page",
+        url: JWGL_DOM_SCHEDULE,
+        expected: &[200, 302],
+        note: "",
+    },
+    PublicProbe {
+        group: "jwgl_dom",
+        name: "DOM JWGL personal page",
+        url: JWGL_DOM_PERSON,
+        expected: &[200, 302],
+        note: "",
+    },
+    PublicProbe {
+        group: "jwgl_dom",
+        name: "legacy jwxt login page",
+        url: JWXT_LOGIN,
+        expected: &[200, 302],
+        note: "",
+    },
+    PublicProbe {
+        group: "mobile_jwgl",
+        name: "mobile JWGL login endpoint",
+        url: MOBILE_JWGL_LOGIN,
+        expected: &[200, 302, 400, 401, 405, 500],
+        note: "POST-only in practice; GET 500 still proves reachability. Reachability only: this is the undergraduate academic system, so a graduate-student account has no data here even when the endpoint answers.",
+    },
+];
 
 pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<Outcome> {
     let groups = super::requested_groups(matches)?;
@@ -88,7 +187,7 @@ pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<
         .as_ref()
         .and_then(super::OwnedCasSession::cached_ucloud_credentials);
     let mut probe = ProbeRun {
-        groups: &groups,
+        groups,
         rows: Vec::new(),
         session,
         cached_cas_cookies,
@@ -107,117 +206,35 @@ pub(super) fn run(matches: &ArgMatches, context: &mut Context<'_>) -> CliResult<
     })
 }
 
-impl ProbeRun<'_> {
+impl ProbeRun {
     fn execute(&mut self, transport: &mut dyn Transport) {
-        // This sequence mirrors probe.py. Rows are sorted at the end, while
-        // request order remains deterministic for the injected transport.
-        self.run_public_checks(transport);
-        self.run_cas(transport);
-        self.prepare_ucloud(transport);
-        self.run_portal(transport);
-        self.run_electricity(transport);
-        self.run_ucloud_rows(transport);
-        self.run_mobile(transport);
+        // Rows are sorted for the report at the end, while request order stays
+        // deterministic for the injected transport: it is exactly this table,
+        // top to bottom.
+        for probe in PROBE_SEQUENCE {
+            probe(self, transport);
+        }
     }
 
     fn wants(&self, group: &str) -> bool {
         self.groups.iter().any(|value| value == group)
     }
 
-    fn run_public_checks(&mut self, transport: &mut dyn Transport) {
-        // Public reachability, including rows that belong to other groups.
-        if self.wants("public") {
+    /// Public reachability, including rows that belong to other groups. The
+    /// table is the request order; each row only runs for its own `--only`
+    /// group.
+    fn probe_public_endpoints(&mut self, transport: &mut dyn Transport) {
+        for probe in PUBLIC_PROBES {
+            if !self.wants(probe.group) {
+                continue;
+            }
             self.public_get(
                 transport,
-                "public",
-                "CAS login page",
-                CAS_LOGIN_PAGE_URL,
-                &[200],
-                "",
-            );
-        }
-        if self.wants("other") {
-            self.public_get(
-                transport,
-                "other",
-                "UC status API",
-                UC_STATUS_URL,
-                &[200],
-                "",
-            );
-        }
-        if self.wants("public") {
-            self.public_get(
-                transport,
-                "public",
-                "UCloud OAuth token endpoint",
-                UCLOUD_TOKEN_URL,
-                &[401, 405],
-                "GET without credentials should be rejected (401/405)",
-            );
-            self.public_get(
-                transport,
-                "public",
-                "electricity landing page",
-                ELECTRICITY_LANDING,
-                &[200, 302],
-                "302 redirects to CAS without a session",
-            );
-        }
-        if self.wants("portal") {
-            self.public_get(
-                transport,
-                "portal",
-                "portal notice list (unauthed)",
-                PORTAL_NOTICE_URL,
-                &[],
-                "my.bupt.edu.cn is expected to redirect to CAS",
-            );
-        }
-        if self.wants("other") {
-            self.public_get(
-                transport,
-                "other",
-                "innovation platform notices",
-                WIN_NOTICE,
-                &[200, 302, 412],
-                "412 is anti-bot protection; reachability only",
-            );
-        }
-        if self.wants("jwgl_dom") {
-            self.public_get(
-                transport,
-                "jwgl_dom",
-                "DOM JWGL login page",
-                JWGL_DOM_SCHEDULE,
-                &[200, 302],
-                "",
-            );
-            self.public_get(
-                transport,
-                "jwgl_dom",
-                "DOM JWGL personal page",
-                JWGL_DOM_PERSON,
-                &[200, 302],
-                "",
-            );
-            self.public_get(
-                transport,
-                "jwgl_dom",
-                "legacy jwxt login page",
-                JWXT_LOGIN,
-                &[200, 302],
-                "",
-            );
-        }
-        if self.wants("mobile_jwgl") {
-            self.public_get(
-                transport,
-                "mobile_jwgl",
-                "mobile JWGL login endpoint",
-                MOBILE_JWGL_LOGIN,
-                &[200, 302, 400, 401, 405, 500],
-                "POST-only in practice; GET 500 still proves reachability. Reachability only: this is the undergraduate academic system, so a graduate-student account has no data here even when the endpoint answers.",
+                probe.group,
+                probe.name,
+                probe.url,
+                probe.expected,
+                probe.note,
             );
         }
     }
@@ -279,38 +296,18 @@ impl ProbeRun<'_> {
         }
     }
 
-    fn run_cas(&mut self, transport: &mut dyn Transport) {
+    /// Issues one ordinary service ticket from the owned session. This never
+    /// authenticates again: no password, no login form.
+    fn probe_cas_ticket(&mut self, transport: &mut dyn Transport) {
         if !self.wants("cas") {
             return;
         }
         if !self.cached_cas_cookies {
-            self.add(
-                "cas",
-                "CAS service ticket",
-                "GET",
-                CAS_SERVICE_URL,
-                "skipped",
-                None,
-                None,
-                NO_SESSION,
-                "",
-                "",
-            );
+            self.skip_cas_ticket();
             return;
         }
         let Some(session) = self.session.as_mut() else {
-            self.add(
-                "cas",
-                "CAS service ticket",
-                "GET",
-                CAS_SERVICE_URL,
-                "skipped",
-                None,
-                None,
-                NO_SESSION,
-                "",
-                "",
-            );
+            self.skip_cas_ticket();
             return;
         };
         match session.ticket_for(transport, super::CasService::UCloud) {
@@ -344,7 +341,48 @@ impl ProbeRun<'_> {
         }
     }
 
-    fn prepare_ucloud(&mut self, transport: &mut dyn Transport) {
+    fn skip_cas_ticket(&mut self) {
+        self.add(
+            "cas",
+            "CAS service ticket",
+            "GET",
+            CAS_SERVICE_URL,
+            "skipped",
+            None,
+            None,
+            NO_SESSION,
+            "",
+            "",
+        );
+    }
+
+    /// The token exchange is one fixed POST probe under a fixed name.
+    fn ucloud_token_row(
+        &mut self,
+        status: &str,
+        http_code: Option<u16>,
+        latency_ms: Option<u64>,
+        evidence: &str,
+        error: &str,
+    ) {
+        self.add(
+            "ucloud",
+            "UCloud OAuth token exchange",
+            "POST",
+            UCLOUD_TOKEN_URL,
+            status,
+            http_code,
+            latency_ms,
+            evidence,
+            error,
+            "",
+        );
+    }
+
+    /// Lazy UCloud token exchange. A fresh cached token is already a verified,
+    /// bound read credential, so it is reused instead of spending a short-lived
+    /// CAS ticket; only a missing or expired token reaches the token endpoint.
+    fn probe_ucloud_token(&mut self, transport: &mut dyn Transport) {
         if !self.wants("ucloud") {
             return;
         }
@@ -353,21 +391,13 @@ impl ProbeRun<'_> {
             .as_ref()
             .and_then(super::OwnedCasSession::cached_ucloud_credentials);
 
-        // A fresh token is already a verified, bound read credential. Reuse it
-        // instead of spending a short-lived CAS ticket; only a missing or
-        // expired token triggers the lazy exchange below.
         if let Some(pair) = cached.clone() {
             self.ucloud = Some(pair);
-            self.add(
-                "ucloud",
-                "UCloud OAuth token exchange",
-                "POST",
-                UCLOUD_TOKEN_URL,
+            self.ucloud_token_row(
                 "skipped",
                 None,
                 None,
                 "cached UCloud token is fresh; not exchanged",
-                "",
                 "",
             );
             return;
@@ -375,82 +405,68 @@ impl ProbeRun<'_> {
 
         if !self.cached_cas_cookies {
             self.ucloud = cached;
-            self.add(
-                "ucloud",
-                "UCloud OAuth token exchange",
-                "POST",
-                UCLOUD_TOKEN_URL,
+            self.ucloud_token_row(
                 "skipped",
                 None,
                 None,
                 "no cached CAS session; run `bupt login`",
                 "",
-                "",
             );
             return;
         }
 
-        let ticket = match self.cas_ticket.take() {
-            Some(ticket) => ticket,
-            None => {
-                let Some(session) = self.session.as_mut() else {
-                    self.ucloud = cached;
-                    self.add(
-                        "ucloud",
-                        "UCloud OAuth token exchange",
-                        "POST",
-                        UCLOUD_TOKEN_URL,
-                        "skipped",
-                        None,
-                        None,
-                        NO_SESSION,
-                        "",
-                        "",
-                    );
-                    return;
-                };
-                match session.ticket_for(transport, super::CasService::UCloud) {
-                    Ok(ticket) => ticket,
-                    Err(_error) => {
-                        // This is a local diagnostic fallback, not a login
-                        // attempt. Keep the row skipped, matching probe.py: no
-                        // ticket means no token exchange happened.
-                        self.ucloud = cached;
-                        self.add(
-                            "ucloud",
-                            "UCloud OAuth token exchange",
-                            "POST",
-                            UCLOUD_TOKEN_URL,
-                            "skipped",
-                            None,
-                            None,
-                            "CAS session did not issue a ticket",
-                            "",
-                            "",
-                        );
-                        return;
-                    }
-                }
-            }
-        };
-
-        let Some(session) = self.session.as_mut() else {
-            self.ucloud = cached;
-            self.add(
-                "ucloud",
-                "UCloud OAuth token exchange",
-                "POST",
-                UCLOUD_TOKEN_URL,
-                "fail",
-                None,
-                None,
-                "",
-                "auth: no owned CAS session",
-                "",
-            );
+        let Some(ticket) = self.ucloud_ticket(transport, &cached) else {
             return;
         };
-        match session.exchange_ucloud_ticket(transport, &ticket) {
+        self.exchange_ucloud_ticket(transport, &ticket, cached);
+    }
+
+    /// Reuses the ticket this run already holds; otherwise asks the owned
+    /// session for one. Without a ticket the row stays skipped, matching
+    /// probe.py: no login is attempted to get one.
+    fn ucloud_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        cached: &Option<(String, String)>,
+    ) -> Option<String> {
+        if let Some(ticket) = self.cas_ticket.take() {
+            return Some(ticket);
+        }
+        let Some(session) = self.session.as_mut() else {
+            self.ucloud = cached.clone();
+            self.ucloud_token_row("skipped", None, None, NO_SESSION, "");
+            return None;
+        };
+        match session.ticket_for(transport, super::CasService::UCloud) {
+            Ok(ticket) => Some(ticket),
+            Err(_error) => {
+                self.ucloud = cached.clone();
+                self.ucloud_token_row(
+                    "skipped",
+                    None,
+                    None,
+                    "CAS session did not issue a ticket",
+                    "",
+                );
+                None
+            }
+        }
+    }
+
+    /// Spends the ticket on an in-memory token. The refreshed token and cookies
+    /// stay inside this run: nothing is written back to the session file.
+    fn exchange_ucloud_ticket(
+        &mut self,
+        transport: &mut dyn Transport,
+        ticket: &str,
+        cached: Option<(String, String)>,
+    ) {
+        let Some(session) = self.session.as_mut() else {
+            self.ucloud = cached;
+            self.ucloud_token_row("fail", None, None, "", "auth: no owned CAS session");
+            return;
+        };
+        match session.exchange_ucloud_ticket(transport, ticket) {
             Ok(()) => {
                 let pair = self
                     .session
@@ -459,53 +475,26 @@ impl ProbeRun<'_> {
                 if let Some(pair) = pair {
                     self.ucloud = Some(pair);
                     self.ucloud_refreshed = true;
-                    self.add(
-                        "ucloud",
-                        "UCloud OAuth token exchange",
-                        "POST",
-                        UCLOUD_TOKEN_URL,
-                        "ok",
-                        Some(200),
-                        None,
-                        "HTTP 200",
-                        "",
-                        "",
-                    );
+                    self.ucloud_token_row("ok", Some(200), None, "HTTP 200", "");
                 } else {
                     self.ucloud = cached;
-                    self.add(
-                        "ucloud",
-                        "UCloud OAuth token exchange",
-                        "POST",
-                        UCLOUD_TOKEN_URL,
+                    self.ucloud_token_row(
                         "fail",
                         Some(200),
                         None,
                         "",
                         "auth: UCloud token did not identify a user",
-                        "",
                     );
                 }
             }
             Err(error) => {
                 self.ucloud = cached;
-                self.add(
-                    "ucloud",
-                    "UCloud OAuth token exchange",
-                    "POST",
-                    UCLOUD_TOKEN_URL,
-                    "fail",
-                    None,
-                    None,
-                    "",
-                    &transport_error(&error),
-                    "",
-                );
+                self.ucloud_token_row("fail", None, None, "", &transport_error(&error));
             }
         }
     }
 
-    fn run_portal(&mut self, _transport: &mut dyn Transport) {
+    fn probe_portal(&mut self, _transport: &mut dyn Transport) {
         if !self.wants("portal") {
             return;
         }
@@ -528,27 +517,50 @@ impl ProbeRun<'_> {
         }
     }
 
-    fn run_electricity(&mut self, transport: &mut dyn Transport) {
+    /// Electricity is a dependent chain: the landing cookie and each identifier
+    /// feed the next POST, and a step that fails marks the remaining steps
+    /// skipped. The calls below are the wire order.
+    fn probe_electricity(&mut self, transport: &mut dyn Transport) {
         if !self.wants("electricity") {
             return;
         }
         if !self.cached_cas_cookies {
-            self.skip_electricity("no cached CAS session; run `bupt login`");
+            self.skip_electricity(NO_SESSION);
             return;
         }
-
-        let landing_cookie = self
-            .session
-            .as_ref()
-            .and_then(|session| session.cookie_header_for(ELECTRICITY_LANDING));
-        let Some(landing_cookie) = landing_cookie else {
+        let Some(cookie) = self.electricity_cookie() else {
             self.skip_electricity("no usable CAS cookies for this endpoint; run `bupt login`");
             return;
         };
+        self.electricity_prime(transport, &cookie);
+        let Some(partment_id) = self.electricity_buildings(transport, &cookie) else {
+            return;
+        };
+        let Some(floor_id) = self.electricity_floors(transport, &cookie, &partment_id) else {
+            return;
+        };
+        let Some(room_number) = self.electricity_rooms(transport, &cookie, &partment_id, &floor_id)
+        else {
+            return;
+        };
+        self.electricity_search(transport, &cookie, &partment_id, &floor_id, &room_number);
+    }
+
+    /// The persisted jar cannot change during this run, so its landing cookie is
+    /// read once and reused for every `/part`-style POST.
+    fn electricity_cookie(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.cookie_header_for(ELECTRICITY_LANDING))
+    }
+
+    /// `GET /chong` establishes the `app.bupt.edu.cn` cookies. The row is
+    /// recorded either way and the chain still continues, as in probe.py.
+    fn electricity_prime(&mut self, transport: &mut dyn Transport, cookie: &str) {
         let request = Request {
             method: "GET",
             url: ELECTRICITY_LANDING.to_owned(),
-            headers: headers_with_cookie(landing_cookie.clone()),
+            headers: headers_with_cookie(cookie.to_owned()),
             body: Vec::new(),
         };
         let (result, latency) = timed_send(transport, request);
@@ -586,39 +598,41 @@ impl ProbeRun<'_> {
                 );
             }
         }
+    }
 
-        // The persisted jar cannot change during this run, so reuse the
-        // landing cookie instead of fetching the same value again.
-        let cookie = landing_cookie;
-        let mut partment_id = String::new();
+    /// `/part` publishes the building identifier that `/floor` needs. Records
+    /// the dependent rows itself, so the chain stops here on failure.
+    fn electricity_buildings(
+        &mut self,
+        transport: &mut dyn Transport,
+        cookie: &str,
+    ) -> Option<String> {
+        let dependents = [
+            ("electricity floors (/floor)", "/floor"),
+            ("electricity rooms (/drom)", "/drom"),
+            ("electricity search (/search)", "/search"),
+        ];
         let Some(part) = self.electricity_post(
             transport,
             "electricity buildings (/part)",
             "/part",
             &[("areaid", "2".to_owned())],
-            &cookie,
+            cookie,
         ) else {
-            self.skip_electricity_dependents(
-                &[
-                    ("electricity floors (/floor)", "/floor"),
-                    ("electricity rooms (/drom)", "/drom"),
-                    ("electricity search (/search)", "/search"),
-                ],
-                "/part failed",
-            );
-            return;
+            self.skip_electricity_dependents(&dependents, "/part failed");
+            return None;
         };
         let part_data = part
             .get("d")
             .and_then(|d| d.get("data"))
             .and_then(Value::as_array);
-        if let Some(first) = part_data
+        let partment_id = part_data
             .and_then(|data| data.first())
             .and_then(Value::as_object)
-        {
-            partment_id = value_string(first.get("partmentId").or_else(|| first.get("partmentid")))
-                .unwrap_or_default();
-        }
+            .and_then(|first| {
+                value_string(first.get("partmentId").or_else(|| first.get("partmentid")))
+            })
+            .unwrap_or_default();
         if part_data.is_none() || partment_id.is_empty() {
             let reason = if part_data.is_none() {
                 "/part did not return building data"
@@ -630,35 +644,35 @@ impl ProbeRun<'_> {
                 reason,
                 "upstream: electricity /part did not return building data",
             );
-            self.skip_electricity_dependents(
-                &[
-                    ("electricity floors (/floor)", "/floor"),
-                    ("electricity rooms (/drom)", "/drom"),
-                    ("electricity search (/search)", "/search"),
-                ],
-                reason,
-            );
-            return;
+            self.skip_electricity_dependents(&dependents, reason);
+            return None;
         }
+        Some(partment_id)
+    }
 
+    /// `/floor` publishes the floor identifier that `/drom` needs.
+    fn electricity_floors(
+        &mut self,
+        transport: &mut dyn Transport,
+        cookie: &str,
+        partment_id: &str,
+    ) -> Option<String> {
+        let dependents = [
+            ("electricity rooms (/drom)", "/drom"),
+            ("electricity search (/search)", "/search"),
+        ];
         let Some(floor) = self.electricity_post(
             transport,
             "electricity floors (/floor)",
             "/floor",
             &[
-                ("partmentId", partment_id.clone()),
+                ("partmentId", partment_id.to_owned()),
                 ("areaid", "2".to_owned()),
             ],
-            &cookie,
+            cookie,
         ) else {
-            self.skip_electricity_dependents(
-                &[
-                    ("electricity rooms (/drom)", "/drom"),
-                    ("electricity search (/search)", "/search"),
-                ],
-                "/floor failed",
-            );
-            return;
+            self.skip_electricity_dependents(&dependents, "/floor failed");
+            return None;
         };
         let floor_data = floor
             .get("d")
@@ -680,32 +694,34 @@ impl ProbeRun<'_> {
                 reason,
                 "upstream: electricity /floor did not return floor data",
             );
-            self.skip_electricity_dependents(
-                &[
-                    ("electricity rooms (/drom)", "/drom"),
-                    ("electricity search (/search)", "/search"),
-                ],
-                reason,
-            );
-            return;
+            self.skip_electricity_dependents(&dependents, reason);
+            return None;
         }
+        Some(floor_id)
+    }
 
+    /// `/drom` publishes the room number that `/search` needs.
+    fn electricity_rooms(
+        &mut self,
+        transport: &mut dyn Transport,
+        cookie: &str,
+        partment_id: &str,
+        floor_id: &str,
+    ) -> Option<String> {
+        let dependents = [("electricity search (/search)", "/search")];
         let Some(drom) = self.electricity_post(
             transport,
             "electricity rooms (/drom)",
             "/drom",
             &[
-                ("partmentId", partment_id.clone()),
-                ("floorId", floor_id.clone()),
+                ("partmentId", partment_id.to_owned()),
+                ("floorId", floor_id.to_owned()),
                 ("areaid", "2".to_owned()),
             ],
-            &cookie,
+            cookie,
         ) else {
-            self.skip_electricity_dependents(
-                &[("electricity search (/search)", "/search")],
-                "/drom failed",
-            );
-            return;
+            self.skip_electricity_dependents(&dependents, "/drom failed");
+            return None;
         };
         let drom_data = drom
             .get("d")
@@ -717,29 +733,37 @@ impl ProbeRun<'_> {
                 "/drom did not return room data",
                 "upstream: electricity /drom did not return room data",
             );
-            self.skip_electricity_dependents(
-                &[("electricity search (/search)", "/search")],
-                "/drom did not return room data",
-            );
-            return;
+            self.skip_electricity_dependents(&dependents, "/drom did not return room data");
+            return None;
         }
         let room_number = drom_data
             .and_then(|data| data.first())
             .and_then(Value::as_object)
             .and_then(|first| value_string(first.get("dromNum").or_else(|| first.get("dromName"))))
             .unwrap_or_default();
+        Some(room_number)
+    }
 
+    /// Last step of the chain: its own row is the only thing it reports.
+    fn electricity_search(
+        &mut self,
+        transport: &mut dyn Transport,
+        cookie: &str,
+        partment_id: &str,
+        floor_id: &str,
+        room_number: &str,
+    ) {
         let _ = self.electricity_post(
             transport,
             "electricity search (/search)",
             "/search",
             &[
                 ("areaid", "2".to_owned()),
-                ("partmentId", partment_id),
-                ("floorId", floor_id),
-                ("dromNumber", room_number),
+                ("partmentId", partment_id.to_owned()),
+                ("floorId", floor_id.to_owned()),
+                ("dromNumber", room_number.to_owned()),
             ],
-            &cookie,
+            cookie,
         );
     }
 
@@ -767,7 +791,7 @@ impl ProbeRun<'_> {
             body,
         };
         let (result, latency) = timed_send(transport, request);
-        match result {
+        let response = match result {
             Err(error) => {
                 self.add(
                     "electricity",
@@ -781,94 +805,93 @@ impl ProbeRun<'_> {
                     &transport_error(&error),
                     "",
                 );
-                None
+                return None;
             }
-            Ok(response) => {
-                if matches!(response.status, 401 | 403) {
-                    self.add(
-                        "electricity",
-                        name,
-                        "POST",
-                        &url,
-                        "fail",
-                        Some(response.status),
-                        Some(latency),
-                        &format!("HTTP {}", response.status),
-                        "auth: electricity endpoint rejected the session",
-                        "",
-                    );
-                    return None;
-                }
-                if !(200..300).contains(&response.status) {
-                    self.add(
-                        "electricity",
-                        name,
-                        "POST",
-                        &url,
-                        "fail",
-                        Some(response.status),
-                        Some(latency),
-                        &format!("HTTP {}", response.status),
-                        &status_error(response.status),
-                        "",
-                    );
-                    return None;
-                }
-                let Ok(payload) = serde_json::from_slice::<Value>(&response.body) else {
-                    self.add(
-                        "electricity",
-                        name,
-                        "POST",
-                        &url,
-                        "fail",
-                        Some(response.status),
-                        Some(latency),
-                        &format!("HTTP {}", response.status),
-                        "upstream: electricity response was not valid JSON",
-                        "",
-                    );
-                    return None;
-                };
-                let code = payload.get("e").and_then(number_or_string);
-                if code.as_deref() != Some("0") {
-                    let error = if matches!(code.as_deref(), Some("10013" | "401" | "403")) {
-                        "auth: electricity session is no longer valid"
-                    } else {
-                        "upstream: electricity API rejected the request"
-                    };
-                    self.add(
-                        "electricity",
-                        name,
-                        "POST",
-                        &url,
-                        "fail",
-                        Some(response.status),
-                        Some(latency),
-                        &format!(
-                            "HTTP {}, api_code={}",
-                            response.status,
-                            code.as_deref().unwrap_or("?")
-                        ),
-                        error,
-                        "",
-                    );
-                    return None;
-                }
-                self.add(
-                    "electricity",
-                    name,
-                    "POST",
-                    &url,
-                    "ok",
-                    Some(response.status),
-                    Some(latency),
-                    &format!("HTTP {}", response.status),
-                    "",
-                    "",
-                );
-                Some(payload)
-            }
+            Ok(response) => response,
+        };
+        if matches!(response.status, 401 | 403) {
+            self.add(
+                "electricity",
+                name,
+                "POST",
+                &url,
+                "fail",
+                Some(response.status),
+                Some(latency),
+                &format!("HTTP {}", response.status),
+                "auth: electricity endpoint rejected the session",
+                "",
+            );
+            return None;
         }
+        if !(200..300).contains(&response.status) {
+            self.add(
+                "electricity",
+                name,
+                "POST",
+                &url,
+                "fail",
+                Some(response.status),
+                Some(latency),
+                &format!("HTTP {}", response.status),
+                &status_error(response.status),
+                "",
+            );
+            return None;
+        }
+        let Ok(payload) = serde_json::from_slice::<Value>(&response.body) else {
+            self.add(
+                "electricity",
+                name,
+                "POST",
+                &url,
+                "fail",
+                Some(response.status),
+                Some(latency),
+                &format!("HTTP {}", response.status),
+                "upstream: electricity response was not valid JSON",
+                "",
+            );
+            return None;
+        };
+        let code = payload.get("e").and_then(number_or_string);
+        if code.as_deref() != Some("0") {
+            let error = if matches!(code.as_deref(), Some("10013" | "401" | "403")) {
+                "auth: electricity session is no longer valid"
+            } else {
+                "upstream: electricity API rejected the request"
+            };
+            self.add(
+                "electricity",
+                name,
+                "POST",
+                &url,
+                "fail",
+                Some(response.status),
+                Some(latency),
+                &format!(
+                    "HTTP {}, api_code={}",
+                    response.status,
+                    code.as_deref().unwrap_or("?")
+                ),
+                error,
+                "",
+            );
+            return None;
+        }
+        self.add(
+            "electricity",
+            name,
+            "POST",
+            &url,
+            "ok",
+            Some(response.status),
+            Some(latency),
+            &format!("HTTP {}", response.status),
+            "",
+            "",
+        );
+        Some(payload)
     }
 
     fn mark_electricity_failure(&mut self, name: &str, evidence: &str, error: &str) {
@@ -906,29 +929,21 @@ impl ProbeRun<'_> {
     }
 
     fn skip_electricity(&mut self, reason: &str) {
-        for (name, path) in [
-            ("electricity buildings (/part)", "/part"),
-            ("electricity floors (/floor)", "/floor"),
-            ("electricity rooms (/drom)", "/drom"),
-            ("electricity search (/search)", "/search"),
-        ] {
-            let url = format!("{ELECTRICITY_API}{path}");
-            self.add(
-                "electricity",
-                name,
-                "POST",
-                &url,
-                "skipped",
-                None,
-                None,
-                reason,
-                "",
-                "",
-            );
-        }
+        self.skip_electricity_dependents(
+            &[
+                ("electricity buildings (/part)", "/part"),
+                ("electricity floors (/floor)", "/floor"),
+                ("electricity rooms (/drom)", "/drom"),
+                ("electricity search (/search)", "/search"),
+            ],
+            reason,
+        );
     }
 
-    fn run_ucloud_rows(&mut self, transport: &mut dyn Transport) {
+    /// UCloud API rows. Each item records its own skip decision, and the
+    /// identifiers derived from the first two responses feed the later rows, so
+    /// the calls below read as the wire order.
+    fn probe_ucloud_apis(&mut self, transport: &mut dyn Transport) {
         if !self.wants("ucloud") {
             return;
         }
@@ -937,14 +952,7 @@ impl ProbeRun<'_> {
             return;
         };
 
-        let undone = self.ucloud_get(
-            transport,
-            "undone homework",
-            &format!("{UCLOUD_API}/ykt-site/site/student/undone"),
-            &[("userId", user_id.clone())],
-            &token,
-            "",
-        );
+        let undone = self.ucloud_undone_homework(transport, &token, &user_id);
         let mut assignment_id = undone
             .as_ref()
             .and_then(|undone| undone.get("data"))
@@ -955,14 +963,7 @@ impl ProbeRun<'_> {
             .and_then(|first| value_string(first.get("activityId").or_else(|| first.get("id"))))
             .unwrap_or_default();
 
-        let courses = self.ucloud_get(
-            transport,
-            "current course sites",
-            &format!("{UCLOUD_API}/ykt-site/site/list/student/current"),
-            &[("size", "20".to_owned()), ("current", "1".to_owned())],
-            &token,
-            "",
-        );
+        let courses = self.ucloud_current_courses(transport, &token);
         let (site_id, activity_id) = courses
             .as_ref()
             .and_then(|courses| courses.get("data"))
@@ -982,113 +983,189 @@ impl ProbeRun<'_> {
             assignment_id = activity_id;
         }
 
+        self.ucloud_course_homework_list(transport, &token, &user_id, &site_id);
+        self.ucloud_homework_detail(transport, &token, &assignment_id);
+        self.ucloud_user_info(transport, &token);
+        self.ucloud_current_term(transport, &token);
+        self.ucloud_user_role(transport, &token, &user_id);
+        self.ucloud_examinations(transport, &token, &site_id);
+        self.ucloud_surveys(transport, &token, &user_id, &site_id);
+    }
+
+    fn ucloud_undone_homework(
+        &mut self,
+        transport: &mut dyn Transport,
+        token: &str,
+        user_id: &str,
+    ) -> Option<Value> {
+        self.ucloud_get(
+            transport,
+            "undone homework",
+            &format!("{UCLOUD_API}/ykt-site/site/student/undone"),
+            &[("userId", user_id.to_owned())],
+            token,
+            "",
+        )
+    }
+
+    fn ucloud_current_courses(
+        &mut self,
+        transport: &mut dyn Transport,
+        token: &str,
+    ) -> Option<Value> {
+        self.ucloud_get(
+            transport,
+            "current course sites",
+            &format!("{UCLOUD_API}/ykt-site/site/list/student/current"),
+            &[("size", "20".to_owned()), ("current", "1".to_owned())],
+            token,
+            "",
+        )
+    }
+
+    fn ucloud_course_homework_list(
+        &mut self,
+        transport: &mut dyn Transport,
+        token: &str,
+        user_id: &str,
+        site_id: &str,
+    ) {
+        let base = format!("{UCLOUD_API}/ykt-site/work/student/list");
         if site_id.is_empty() {
             self.skip_ucloud_row(
                 "course homework list",
                 "POST",
-                &format!("{UCLOUD_API}/ykt-site/work/student/list"),
+                &base,
                 "no course id available",
             );
-        } else {
-            let body = serde_json::to_vec(&json!({
-                "siteId": site_id,
-                "userId": user_id,
-                "current": 1,
-                "size": 20,
-            }))
-            .unwrap_or_default();
-            self.ucloud_post(
-                transport,
-                "course homework list",
-                &format!("{UCLOUD_API}/ykt-site/work/student/list"),
-                &token,
-                body,
-                "",
-            );
+            return;
         }
+        let body = serde_json::to_vec(&json!({
+            "siteId": site_id,
+            "userId": user_id,
+            "current": 1,
+            "size": 20,
+        }))
+        .unwrap_or_default();
+        self.ucloud_post(transport, "course homework list", &base, token, body, "");
+    }
+
+    fn ucloud_homework_detail(
+        &mut self,
+        transport: &mut dyn Transport,
+        token: &str,
+        assignment_id: &str,
+    ) {
+        let base = format!("{UCLOUD_API}/ykt-site/work/detail");
         if assignment_id.is_empty() {
             self.skip_ucloud_row(
                 "homework detail",
                 "GET",
-                &format!("{UCLOUD_API}/ykt-site/work/detail"),
+                &base,
                 "no assignment id available",
             );
-        } else {
-            self.ucloud_get(
-                transport,
-                "homework detail",
-                &format!("{UCLOUD_API}/ykt-site/work/detail"),
-                &[("assignmentId", assignment_id)],
-                &token,
-                "",
-            );
+            return;
         }
+        self.ucloud_get(
+            transport,
+            "homework detail",
+            &base,
+            &[("assignmentId", assignment_id.to_owned())],
+            token,
+            "",
+        );
+    }
+
+    fn ucloud_user_info(&mut self, transport: &mut dyn Transport, token: &str) {
         self.ucloud_get(
             transport,
             "user info",
             &format!("{UCLOUD_API}/ykt-basics/info"),
             &[],
-            &token,
+            token,
             "",
         );
+    }
+
+    fn ucloud_current_term(&mut self, transport: &mut dyn Transport, token: &str) {
         self.ucloud_get(
             transport,
             "current term",
             &format!("{UCLOUD_API}/ykt-site/base-term/current"),
             &[],
-            &token,
+            token,
             "",
         );
+    }
+
+    fn ucloud_user_role(&mut self, transport: &mut dyn Transport, token: &str, user_id: &str) {
         self.ucloud_get(
             transport,
             "user role/domain/department",
             &format!("{UCLOUD_API}/ykt-basics/userroledomaindept/listByUserId"),
-            &[("userId", user_id.clone())],
-            &token,
+            &[("userId", user_id.to_owned())],
+            token,
             "",
         );
+    }
+
+    fn ucloud_examinations(&mut self, transport: &mut dyn Transport, token: &str, site_id: &str) {
+        let base = format!("{UCLOUD_API}/ykt-site/examination/list-stu");
         if site_id.is_empty() {
             self.skip_ucloud_row(
                 "course examinations",
                 "GET",
-                &format!("{UCLOUD_API}/ykt-site/examination/list-stu"),
+                &base,
                 "no course id available",
             );
+            return;
+        }
+        self.ucloud_get(
+            transport,
+            "course examinations",
+            &base,
+            &[
+                ("current", "1".to_owned()),
+                ("size", "1".to_owned()),
+                ("status", "-1".to_owned()),
+                ("siteId", site_id.to_owned()),
+                ("state", "-1".to_owned()),
+            ],
+            token,
+            "",
+        );
+    }
+
+    fn ucloud_surveys(
+        &mut self,
+        transport: &mut dyn Transport,
+        token: &str,
+        user_id: &str,
+        site_id: &str,
+    ) {
+        let base = format!("{UCLOUD_API}/ykt-activity/survey/page/todo");
+        if site_id.is_empty() {
             self.skip_ucloud_row(
                 "course surveys/todos",
                 "GET",
-                &format!("{UCLOUD_API}/ykt-activity/survey/page/todo"),
+                &base,
                 "no course id available",
             );
-        } else {
-            self.ucloud_get(
-                transport,
-                "course examinations",
-                &format!("{UCLOUD_API}/ykt-site/examination/list-stu"),
-                &[
-                    ("current", "1".to_owned()),
-                    ("size", "1".to_owned()),
-                    ("status", "-1".to_owned()),
-                    ("siteId", site_id.clone()),
-                    ("state", "-1".to_owned()),
-                ],
-                &token,
-                "",
-            );
-            self.ucloud_get(
-                transport,
-                "course surveys/todos",
-                &format!("{UCLOUD_API}/ykt-activity/survey/page/todo"),
-                &[
-                    ("level", "1".to_owned()),
-                    ("size", "1".to_owned()),
-                    ("userId", user_id),
-                    ("siteId", site_id),
-                ],
-                &token,
-                "",
-            );
+            return;
         }
+        self.ucloud_get(
+            transport,
+            "course surveys/todos",
+            &base,
+            &[
+                ("level", "1".to_owned()),
+                ("size", "1".to_owned()),
+                ("userId", user_id.to_owned()),
+                ("siteId", site_id.to_owned()),
+            ],
+            token,
+            "",
+        );
     }
 
     fn ucloud_get(
@@ -1279,7 +1356,7 @@ impl ProbeRun<'_> {
         );
     }
 
-    fn run_mobile(&mut self, transport: &mut dyn Transport) {
+    fn probe_mobile_jwgl(&mut self, transport: &mut dyn Transport) {
         if !self.wants("mobile_jwgl") {
             return;
         }
